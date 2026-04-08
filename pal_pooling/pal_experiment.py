@@ -1,4 +1,4 @@
-"""PAL (Patch-quality Adaptive Lookup) experiment runner.
+"""PAL (Pseudo Attention Label) experiment runner.
 
 Evaluates iterative multi-scale quality-weighted patch pooling against mean-pool and
 CLS-token baselines, with optional attention-pooling and patch-quality visualisations.

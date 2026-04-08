@@ -1,6 +1,6 @@
-# Adaptive Patch Pooling
+# PALPooling — Pseudo Attention Label Pooling
 
-Runs PAL (Patch-quality Adaptive Lookup) experiments: iterative multi-scale quality-weighted
+Runs PAL (Pseudo Attention Label) experiments: iterative multi-scale quality-weighted
 patch pooling evaluated against mean-pool and CLS-token baselines, with optional
 attention-pooling upper bound and patch-quality visualisations.
 
