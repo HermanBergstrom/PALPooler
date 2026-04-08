@@ -14,6 +14,7 @@ from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 from pal_pooling.config import RefinementConfig
+from pal_pooling.tabicl_gpu_adapter import TabICLGPUAdapter
 from tabicl import TabICLClassifier
 from tqdm import tqdm
 
@@ -58,12 +59,23 @@ class RidgeGPU:
             dev = torch.device("cpu")
         return dev
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "RidgeGPU":
-        """Fit Ridge on GPU.  X: [N, D], y: [N]."""
+    def fit(self, X: "Union[np.ndarray, torch.Tensor]", y: "Union[np.ndarray, torch.Tensor]") -> "RidgeGPU":
+        """Fit Ridge on GPU.  X: [N, D], y: [N].
+
+        Accepts either numpy arrays or torch tensors.  Tensors already on the
+        target device are used in-place (no copy); tensors on a different device
+        are moved with ``.to()``.
+        """
         import torch
         dev = self._get_device()
-        Xt = torch.from_numpy(np.asarray(X, dtype=np.float32)).to(dev)  # [N, D]
-        yt = torch.from_numpy(np.asarray(y, dtype=np.float32)).to(dev)  # [N]
+        if isinstance(X, torch.Tensor):
+            Xt = X.to(dev).float()
+        else:
+            Xt = torch.from_numpy(np.asarray(X, dtype=np.float32)).to(dev)
+        if isinstance(y, torch.Tensor):
+            yt = y.to(dev).float()
+        else:
+            yt = torch.from_numpy(np.asarray(y, dtype=np.float32)).to(dev)
 
         # Mean-centre to absorb the intercept
         X_mean = Xt.mean(0)   # [D]
@@ -93,11 +105,16 @@ class RidgeGPU:
         out = Xt @ self._w + self._b
         return out.cpu().numpy()
 
-    def score(self, X: np.ndarray, y: np.ndarray) -> float:
-        """R² on CPU (matches sklearn Ridge.score)."""
-        y_pred  = self.predict(X)
-        ss_res  = float(((y - y_pred) ** 2).sum())
-        ss_tot  = float(((y - y.mean()) ** 2).sum())
+    def score(self, X: "Union[np.ndarray, torch.Tensor]", y: "Union[np.ndarray, torch.Tensor]") -> float:
+        """R² on CPU (matches sklearn Ridge.score).  Accepts tensors."""
+        import torch
+        y_pred = self.predict(X)
+        if isinstance(y, torch.Tensor):
+            y_np = y.cpu().float().numpy()
+        else:
+            y_np = np.asarray(y, dtype=np.float32)
+        ss_res = float(((y_np - y_pred) ** 2).sum())
+        ss_tot = float(((y_np - y_np.mean()) ** 2).sum())
         return 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 0.0
 
 
@@ -336,6 +353,73 @@ def compute_patch_quality_logits(
     return (np.log(p) / temperature).astype(np.float32)
 
 
+def compute_patch_quality_logits_gpu(
+    patch_probs:   "torch.Tensor",             # [P, n_classes]  on GPU
+    true_label:    int,
+    temperature:   float = 1.0,
+    weight_method: str   = "correct_class_prob",
+    class_prior:   Optional["torch.Tensor"] = None,  # [n_classes]  on GPU
+) -> "torch.Tensor":                           # [P]  on GPU
+    """GPU-native analogue of ``compute_patch_quality_logits``.
+
+    Accepts and returns ``torch.Tensor`` objects on the same device as
+    *patch_probs*.  All operations mirror the numpy version exactly.
+    Requires *class_prior* to be a tensor on the same device for the
+    ``kl_div``, ``wasserstein``, and ``js_div`` methods.
+    """
+    import torch
+
+    eps_prob = 1e-9
+    eps_clip = 1e-7
+
+    if weight_method == "entropy":
+        C = patch_probs.shape[1]
+        q = patch_probs.clamp(eps_prob, 1.0)
+        raw_entropy = -(q * q.log()).sum(dim=1)                         # [P]
+        scores = (1.0 - raw_entropy / math.log(C)).clamp(eps_clip, 1.0)
+        return (scores.log() / temperature).float()
+
+    if weight_method == "kl_div":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='kl_div'")
+        prior = class_prior.double().clamp(eps_prob, 1.0)
+        prior = prior / prior.sum()
+        q = patch_probs.double().clamp(eps_prob, 1.0)
+        kl = (q * (q / prior.unsqueeze(0)).log()).sum(dim=1)            # [P]
+        max_kl = -prior.min().log()
+        scores = (kl / max_kl).clamp(eps_clip, 1.0)
+        return (scores.log() / temperature).float()
+
+    if weight_method == "wasserstein":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='wasserstein'")
+        prior = class_prior.double().clamp(eps_prob, 1.0)
+        prior = prior / prior.sum()
+        q = patch_probs.double()
+        cdf_q = q.cumsum(dim=1)
+        cdf_p = prior.cumsum(dim=0)
+        w1 = (cdf_q - cdf_p.unsqueeze(0)).abs().sum(dim=1)             # [P]
+        C = patch_probs.shape[1]
+        scores = (w1 / (C - 1)).clamp(eps_clip, 1.0)
+        return (scores.log() / temperature).float()
+
+    if weight_method == "js_div":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='js_div'")
+        prior = class_prior.double().clamp(eps_prob, 1.0)
+        prior = prior / prior.sum()
+        q = patch_probs.double().clamp(eps_prob, 1.0)
+        m = 0.5 * (q + prior.unsqueeze(0))
+        jsd = (0.5 * (q * (q / m).log()).sum(dim=1)
+               + 0.5 * (prior * (prior / m).log()).sum(dim=1))          # [P]
+        scores = (jsd / math.log(2)).clamp(eps_clip, 1.0)
+        return (scores.log() / temperature).float()
+
+    # --- default: correct_class_prob ---
+    p = patch_probs[:, true_label].clamp(eps_clip, 1.0 - eps_clip)
+    return (p.log() / temperature).float()
+
+
 # ---------------------------------------------------------------------------
 # Patch grouping
 # ---------------------------------------------------------------------------
@@ -556,6 +640,15 @@ def refine_dataset_features(
         
     clf.fit(support_features, train_labels)
 
+    # GPU path: skip D2H/H2D round-trip for probs and quality-logit targets.
+    use_gpu = isinstance(clf, TabICLGPUAdapter)
+    if use_gpu:
+        import torch as _torch
+        _dev = clf.device_
+        class_prior_t = (
+            _torch.from_numpy(class_prior).to(_dev) if class_prior is not None else None
+        )
+
     # Decide forward-pass strategy:
     #   one_pass=True  → forward a contiguous block of rows in a single predict_proba call
     #                    (either all active rows, or a random subset when subsampling)
@@ -584,25 +677,40 @@ def refine_dataset_features(
             img_boundaries = np.arange(N_active + 1) * P     # [0, P, 2P, ..., N_active*P]
 
         query_features = pca.transform(query_raw) if pca is not None else query_raw
-        probs_flat     = clf.predict_proba(query_features)   # [n_fwd, n_classes]
+        all_features   = query_raw
 
-        all_features = query_raw
-        all_targets  = np.empty(n_fwd, dtype=np.float32)
-
-        for idx in range(N_active):
-            start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
-            if start == end:
-                continue
-            all_targets[start:end] = compute_patch_quality_logits(
-                probs_flat[start:end], int(active_labels[idx]),
-                refinement_cfg.temperature, _eff_method(idx), class_prior,
-            )
+        if use_gpu:
+            probs_flat_t = clf.predict_proba_tensor(query_features)     # [n_fwd, n_classes] GPU
+            all_targets_t = _torch.empty(n_fwd, dtype=_torch.float32, device=_dev)
+            for idx in range(N_active):
+                start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
+                if start == end:
+                    continue
+                all_targets_t[start:end] = compute_patch_quality_logits_gpu(
+                    probs_flat_t[start:end], int(active_labels[idx]),
+                    refinement_cfg.temperature, _eff_method(idx), class_prior_t,
+                )
+            all_targets = all_targets_t
+        else:
+            probs_flat  = clf.predict_proba(query_features)             # [n_fwd, n_classes] CPU
+            all_targets = np.empty(n_fwd, dtype=np.float32)
+            for idx in range(N_active):
+                start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
+                if start == end:
+                    continue
+                all_targets[start:end] = compute_patch_quality_logits(
+                    probs_flat[start:end], int(active_labels[idx]),
+                    refinement_cfg.temperature, _eff_method(idx), class_prior,
+                )
 
     else:
         # Batched loop: used when max_query_rows is None, or when cap is exceeded
         # but --use-random-subsampling was not requested.
         all_features = np.empty((active_total_rows, D), dtype=np.float32)
-        all_targets  = np.empty(active_total_rows,      dtype=np.float32)
+        if use_gpu:
+            all_targets = _torch.empty(active_total_rows, dtype=_torch.float32, device=_dev)
+        else:
+            all_targets = np.empty(active_total_rows, dtype=np.float32)
         row_ptr      = 0
 
         for batch_start in tqdm(range(0, N, refinement_cfg.batch_size),
@@ -626,18 +734,33 @@ def refine_dataset_features(
             B_a = len(batch_patches_arr)
             query_raw      = batch_patches_arr.reshape(B_a * P, D)
             query_features = pca.transform(query_raw) if pca is not None else query_raw
+            base           = row_ptr * P
 
-            probs = clf.predict_proba(query_features).reshape(B_a, P, -1)   # [B_a, P, n_classes]
-
-            for j in range(B_a):
-                eff = ("entropy"
-                       if batch_is_aoe is not None and batch_is_aoe[j]
-                       else refinement_cfg.weight_method)
-                all_features[row_ptr * P:(row_ptr + 1) * P] = batch_patches_arr[j]
-                all_targets [row_ptr * P:(row_ptr + 1) * P] = compute_patch_quality_logits(
-                    probs[j], int(batch_labels_arr[j]), refinement_cfg.temperature, eff, class_prior,
-                )
-                row_ptr += 1
+            if use_gpu:
+                probs_t = clf.predict_proba_tensor(query_features).reshape(B_a, P, -1)  # GPU
+                for j in range(B_a):
+                    eff = ("entropy"
+                           if batch_is_aoe is not None and batch_is_aoe[j]
+                           else refinement_cfg.weight_method)
+                    s, e = base + j * P, base + (j + 1) * P
+                    all_features[s:e] = batch_patches_arr[j]
+                    all_targets[s:e]  = compute_patch_quality_logits_gpu(
+                        probs_t[j], int(batch_labels_arr[j]),
+                        refinement_cfg.temperature, eff, class_prior_t,
+                    )
+            else:
+                probs = clf.predict_proba(query_features).reshape(B_a, P, -1)           # CPU
+                for j in range(B_a):
+                    eff = ("entropy"
+                           if batch_is_aoe is not None and batch_is_aoe[j]
+                           else refinement_cfg.weight_method)
+                    s, e = base + j * P, base + (j + 1) * P
+                    all_features[s:e] = batch_patches_arr[j]
+                    all_targets[s:e]  = compute_patch_quality_logits(
+                        probs[j], int(batch_labels_arr[j]),
+                        refinement_cfg.temperature, eff, class_prior,
+                    )
+            row_ptr += B_a
 
     # --- Fit Ridge on collected (patch_feature, quality_logit) pairs ---
     feature_scaler: Optional[StandardScaler] = None

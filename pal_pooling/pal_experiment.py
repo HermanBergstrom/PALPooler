@@ -35,6 +35,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from tabicl import TabICLClassifier
 from tqdm import tqdm
+from pal_pooling.tabicl_gpu_adapter import TabICLGPUAdapter
 from pal_pooling.patch_pooling import (
     _ridge_pool_weights,
     group_patches,
@@ -795,8 +796,18 @@ def run_pal_experiment(
         all_results=all_results,
     )
 
-    tabicl_clf = TabICLClassifier(n_estimators=cfg.refinement.tabicl_n_estimators, random_state=cfg.seed)
-    pal_pooler = IterativePALPooler(tabicl=tabicl_clf, refinement_cfg=cfg.refinement, seed=cfg.seed)
+    _refine_dev = cfg.device if cfg.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+    if _refine_dev.startswith("cuda") and torch.cuda.is_available():
+        tabicl_clf = TabICLGPUAdapter(n_estimators=cfg.refinement.tabicl_n_estimators, random_state=cfg.seed)
+        print(f"[refinement] Using TabICLGPUAdapter + RidgeGPU on {_refine_dev}")
+    else:
+        tabicl_clf = TabICLClassifier(n_estimators=cfg.refinement.tabicl_n_estimators, random_state=cfg.seed)
+        _refine_dev = ""   # signal to PALPooler/RidgeGPU to use CPU sklearn Ridge
+        print("[refinement] Using TabICLClassifier + sklearn Ridge (CPU)")
+    pal_pooler = IterativePALPooler(
+        tabicl=tabicl_clf, refinement_cfg=cfg.refinement, seed=cfg.seed,
+        gpu_ridge_device=_refine_dev,
+    )
     pal_pooler.fit(train_patches, train_labels, stage_callback=stage_callback)
 
     # -- Final post-all-refinement visualisation (only when --post-refinement-viz is off) --

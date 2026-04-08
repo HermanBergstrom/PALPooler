@@ -64,6 +64,7 @@ class ExperimentConfig:
     attention: AttentionPoolConfig
     run: RunConfig
     seed: int
+    device: str = "auto"
     cli_args: Optional[Dict[str, Any]] = field(default=None)
 
 def parse_args() -> ExperimentConfig:
@@ -221,4 +222,5 @@ def parse_args() -> ExperimentConfig:
         attention=attention_cfg,
         run=run_cfg,
         seed=args.seed,
+        device=args.device,
     )
