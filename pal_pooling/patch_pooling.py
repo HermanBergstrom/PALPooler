@@ -130,7 +130,7 @@ def compute_patch_pooling_weights(
 ) -> np.ndarray:                           # [P]  sums to 1
     """Derive per-patch pooling weights from TabICL softmax predictions.
 
-    Three methods are supported, selected by *weight_method*:
+    Four methods are supported, selected by *weight_method*:
 
     ``"correct_class_prob"`` (default)
         1. Extract the true-class probability for each patch  →  p_i in (0, 1).
@@ -167,6 +167,30 @@ def compute_patch_pooling_weights(
         base rates, making it sensitive to class imbalance: a patch that confidently
         predicts a rare class receives a higher score than one equally confident about
         a common class.  Note: *true_label* is not used by this method.
+
+    ``"wasserstein"``
+        1. Compute the Wasserstein-1 (Earth Mover's) distance between Q_i and
+           P_prior for each patch: W_i = Σ_k |CDF_Q_i(k) - CDF_P(k)|, where the
+           CDF is taken over classes ordered 0 … C-1.  High W → patch prediction
+           is far from the base-rate distribution → discriminative.
+        2. Normalise by C - 1 (the maximum W1 distance for C classes)
+           →  score_i in [0, 1].
+        3. Apply log to get a logit: logit_i = ln(score_i)  (in (-∞, 0]).
+        4. Apply temperature-scaled softmax across patches  →  weights w_i.
+
+        Requires *class_prior* (empirical class frequencies, shape [n_classes]).
+        Note: *true_label* is not used by this method.
+
+    ``"js_div"``
+        1. Compute the Jensen-Shannon divergence JSD(Q_i || P_prior) for each
+           patch: JSD = 0.5·KL(Q||M) + 0.5·KL(P||M) where M = (Q + P) / 2.
+           JSD is symmetric and bounded in [0, ln 2].
+        2. Normalise by ln 2  →  score_i in [0, 1].
+        3. Apply log to get a logit: logit_i = ln(score_i)  (in (-∞, 0]).
+        4. Apply temperature-scaled softmax across patches  →  weights w_i.
+
+        Requires *class_prior* (empirical class frequencies, shape [n_classes]).
+        Note: *true_label* is not used by this method.
     """
     if weight_method == "entropy":
         n_classes = patch_probs.shape[1]
@@ -188,6 +212,41 @@ def compute_patch_pooling_weights(
         kl = (q * np.log(q / prior[None, :])).sum(axis=1)         # [P] KL(Q_i || P_prior)
         max_kl = -np.log(prior.min())                              # theoretical maximum
         scores = (kl / max_kl).clip(1e-7, 1.0)                    # [P] in (0, 1]
+        logits = np.log(scores)                                    # [P] in (-inf, 0]
+        logits_scaled = logits / temperature
+        logits_scaled -= logits_scaled.max()                       # numerical stability
+        weights = np.exp(logits_scaled)
+        weights /= weights.sum()
+        return weights.astype(np.float32)
+
+    if weight_method == "wasserstein":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='wasserstein'")
+        prior = np.asarray(class_prior, dtype=np.float64).clip(1e-9, 1.0)
+        prior /= prior.sum()
+        q = patch_probs.astype(np.float64)                         # [P, n_classes]
+        cdf_q = np.cumsum(q, axis=1)                               # [P, n_classes]
+        cdf_p = np.cumsum(prior)                                   # [n_classes]
+        w1 = np.abs(cdf_q - cdf_p[None, :]).sum(axis=1)           # [P] W1 distance
+        n_classes = patch_probs.shape[1]
+        scores = (w1 / (n_classes - 1)).clip(1e-7, 1.0)           # [P] normalised to (0, 1]
+        logits = np.log(scores)                                    # [P] in (-inf, 0]
+        logits_scaled = logits / temperature
+        logits_scaled -= logits_scaled.max()                       # numerical stability
+        weights = np.exp(logits_scaled)
+        weights /= weights.sum()
+        return weights.astype(np.float32)
+
+    if weight_method == "js_div":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='js_div'")
+        prior = np.asarray(class_prior, dtype=np.float64).clip(1e-9, 1.0)
+        prior /= prior.sum()
+        q = patch_probs.astype(np.float64).clip(1e-9, 1.0)        # [P, n_classes]
+        m = 0.5 * (q + prior[None, :])                            # [P, n_classes] mixture
+        jsd = 0.5 * (q * np.log(q / m)).sum(axis=1) \
+            + 0.5 * (prior * np.log(prior / m)).sum(axis=1)       # [P] in [0, ln2]
+        scores = (jsd / np.log(2)).clip(1e-7, 1.0)                # [P] normalised to (0, 1]
         logits = np.log(scores)                                    # [P] in (-inf, 0]
         logits_scaled = logits / temperature
         logits_scaled -= logits_scaled.max()                       # numerical stability
@@ -225,6 +284,10 @@ def compute_patch_quality_logits(
     ``"entropy"``            → log(1 - H/ln(C)) / temperature
     ``"kl_div"``             → log(KL(Q||P_prior) / max_KL) / temperature
                                Requires *class_prior* [n_classes].
+    ``"wasserstein"``        → log(W1(Q, P_prior) / (C-1)) / temperature
+                               Requires *class_prior* [n_classes].
+    ``"js_div"``             → log(JSD(Q, P_prior) / ln2) / temperature
+                               Requires *class_prior* [n_classes].
     """
     if weight_method == "entropy":
         n_classes = patch_probs.shape[1]
@@ -241,6 +304,31 @@ def compute_patch_quality_logits(
         kl = (q * np.log(q / prior[None, :])).sum(axis=1)             # [P]
         max_kl = -np.log(prior.min())
         scores = (kl / max_kl).clip(1e-7, 1.0)
+        return (np.log(scores) / temperature).astype(np.float32)
+
+    if weight_method == "wasserstein":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='wasserstein'")
+        prior = np.asarray(class_prior, dtype=np.float64).clip(1e-9, 1.0)
+        prior /= prior.sum()
+        q = patch_probs.astype(np.float64)                             # [P, n_classes]
+        cdf_q = np.cumsum(q, axis=1)                                   # [P, n_classes]
+        cdf_p = np.cumsum(prior)                                       # [n_classes]
+        w1 = np.abs(cdf_q - cdf_p[None, :]).sum(axis=1)               # [P] W1 distance
+        n_classes = patch_probs.shape[1]
+        scores = (w1 / (n_classes - 1)).clip(1e-7, 1.0)               # [P] normalised to (0, 1]
+        return (np.log(scores) / temperature).astype(np.float32)
+
+    if weight_method == "js_div":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='js_div'")
+        prior = np.asarray(class_prior, dtype=np.float64).clip(1e-9, 1.0)
+        prior /= prior.sum()
+        q = patch_probs.astype(np.float64).clip(1e-9, 1.0)            # [P, n_classes]
+        m = 0.5 * (q + prior[None, :])                                # [P, n_classes] mixture
+        jsd = 0.5 * (q * np.log(q / m)).sum(axis=1) \
+            + 0.5 * (prior * np.log(prior / m)).sum(axis=1)           # [P] in [0, ln2]
+        scores = (jsd / np.log(2)).clip(1e-7, 1.0)                    # [P] normalised to (0, 1]
         return (np.log(scores) / temperature).astype(np.float32)
 
     # --- default: correct_class_prob method ---
@@ -429,8 +517,8 @@ def refine_dataset_features(
     t_start = time.perf_counter()
     N, P, D = train_patches.shape
 
-    # Precompute empirical class prior (used by kl_div weight method).
-    if refinement_cfg.weight_method == "kl_div":
+    # Precompute empirical class prior (used by kl_div, wasserstein and js_div weight methods).
+    if refinement_cfg.weight_method in ("kl_div", "wasserstein", "js_div"):
         n_cls_local = int(train_labels.max()) + 1
         counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls_local)
         class_prior: Optional[np.ndarray] = (counts / counts.sum()).astype(np.float32)

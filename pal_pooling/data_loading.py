@@ -23,6 +23,7 @@ from torch.utils.data import Dataset
 from pal_pooling.config import (
     BUTTERFLY_DATASET_PATH,
     FEATURES_DIR,
+    PETFINDER_DATASET_PATH,
     RSNA_DATASET_PATH,
     DatasetConfig,
 )
@@ -136,6 +137,71 @@ def _dicom_to_pil(path: Path) -> Image.Image:
     if pmax > pmin:
         pixels = (pixels - pmin) / (pmax - pmin) * 255.0
     return Image.fromarray(pixels.astype(np.uint8)).convert("RGB")
+
+
+# Cache: images_dir → {pet_id: Path}.  Populated once per directory per process.
+_PETFINDER_IMAGE_INDEX: dict[Path, dict[str, Path]] = {}
+
+
+def _build_petfinder_image_index(images_dir: Path) -> dict[str, Path]:
+    """Scan *images_dir* once and return a {pet_id: best_path} dict.
+
+    For each pet, the image with the lowest numeric suffix is chosen
+    (i.e. ``{pet_id}-1.jpg`` when it exists).  The result is cached at
+    module level so subsequent calls for the same directory are O(1).
+    """
+    if images_dir in _PETFINDER_IMAGE_INDEX:
+        return _PETFINDER_IMAGE_INDEX[images_dir]
+
+    print(f"[info] Building petfinder image index from {images_dir} ...")
+    index: dict[str, Path] = {}
+    for p in images_dir.glob("*.jpg"):
+        # Filename format: {pet_id}-{img_num}.jpg
+        stem = p.stem                          # e.g. "000aa306a-3"
+        dash  = stem.rfind("-")
+        if dash == -1:
+            continue
+        pet_id  = stem[:dash]
+        try:
+            img_num = int(stem[dash + 1:])
+        except ValueError:
+            continue
+        # Keep the entry with the smallest image number (prefer -1).
+        if pet_id not in index or img_num < int(index[pet_id].stem.rsplit("-", 1)[1]):
+            index[pet_id] = p
+
+    _PETFINDER_IMAGE_INDEX[images_dir] = index
+    print(f"[info] Petfinder image index built: {len(index)} pets.")
+    return index
+
+
+def _get_petfinder_image_paths(
+    dataset_path: Path,
+) -> tuple[list[Path], list[Path]]:
+    """Return (train_paths, test_paths) aligned with _load_features petfinder output.
+
+    Train paths correspond to the merged train+val splits (in that order), test paths
+    to the test split — exactly matching the arrays returned by ``_load_features``.
+    Each path points to the lowest-numbered image for the pet (typically ``-1.jpg``).
+    """
+    petfinder_dir = Path(dataset_path)
+    processed_dir = petfinder_dir / "extracted_features" / "preprocessed_dinov3_local"
+    images_dir    = petfinder_dir / "petfinder-adoption-prediction" / "train_images"
+
+    index = _build_petfinder_image_index(images_dir)
+
+    def _pet_to_path(pet_id: str) -> Path:
+        if pet_id in index:
+            return index[pet_id]
+        return images_dir / f"{pet_id}-1.jpg"   # missing image; path kept for alignment
+
+    train_data = torch.load(processed_dir / "train.pt", map_location="cpu", weights_only=False)
+    val_data   = torch.load(processed_dir / "val.pt",   map_location="cpu", weights_only=False)
+    test_data  = torch.load(processed_dir / "test.pt",  map_location="cpu", weights_only=False)
+
+    train_paths = [_pet_to_path(pid) for pid in train_data["pet_ids"] + val_data["pet_ids"]]
+    test_paths  = [_pet_to_path(pid) for pid in test_data["pet_ids"]]
+    return train_paths, test_paths
 
 
 def _get_rsna_image_paths(
@@ -280,8 +346,53 @@ def _load_features(
         # n_train subsampling already applied above — skip the general block below.
         n_train = None
 
+    elif dataset_cfg.dataset == "petfinder":
+        petfinder_dir = Path(dataset_cfg.dataset_path)
+        if str(petfinder_dir) not in sys.path:
+            sys.path.insert(0, str(petfinder_dir))
+        from petfinder_dataset_with_dinov3 import load_petfinder_dataset  # type: ignore
+
+        train_loader, val_loader, test_loader, metadata = load_petfinder_dataset(
+            feature_source="dinov3_local",
+            use_patches=True,
+            use_images=True,
+            num_workers=0,
+        )
+
+        # Access Dataset objects directly to avoid DataLoader iteration overhead.
+        train_ds = train_loader.dataset
+        val_ds   = val_loader.dataset
+        test_ds  = test_loader.dataset
+
+        # Merge train + val as the support set (petfinder split: 50% / 10% / 40%).
+        train_patches = np.concatenate([
+            train_ds.patch_embeddings.float().numpy(),
+            val_ds.patch_embeddings.float().numpy(),
+        ], axis=0)
+        train_labels = np.concatenate([
+            train_ds.targets.numpy(),
+            val_ds.targets.numpy(),
+        ], axis=0).astype(np.int64)
+        cls_train = np.concatenate([
+            train_ds.image_embeddings.float().numpy(),
+            val_ds.image_embeddings.float().numpy(),
+        ], axis=0)
+
+        test_patches = test_ds.patch_embeddings.float().numpy()
+        test_labels  = test_ds.targets.numpy().astype(np.int64)
+        cls_test     = test_ds.image_embeddings.float().numpy()
+
+        target_encoder = metadata["target_encoder"]
+        idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
+
+        print(
+            f"[info] PetFinder (train+val): N={len(train_labels)}  "
+            f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}"
+        )
+        print(f"[info] PetFinder (test):  N={len(test_labels)}")
+
     else:
-        raise ValueError(f"Unknown dataset '{dataset_cfg.dataset}'. Choices: butterfly, rsna")
+        raise ValueError(f"Unknown dataset '{dataset_cfg.dataset}'. Choices: butterfly, rsna, petfinder")
 
     # --- Optional n_train subsampling for non-RSNA datasets ---
     if dataset_cfg.n_train is not None and dataset_cfg.n_train < len(train_labels):

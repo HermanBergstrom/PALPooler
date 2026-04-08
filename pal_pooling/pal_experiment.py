@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+import random
 import sys
 import time
 from dataclasses import asdict
@@ -44,12 +45,36 @@ from pal_pooling.config import DatasetConfig, RefinementConfig, AttentionPoolCon
 from pal_pooling.data_loading import (
     _get_image_paths,
     _dicom_to_pil,
+    _get_petfinder_image_paths,
     _get_rsna_image_paths,
     _load_features,
     _balance_classes,
 )
 
 from pal_pooling.pal_pooler import IterativePALPooler, pooler_factory
+
+# ---------------------------------------------------------------------------
+# Seed helpers
+# ---------------------------------------------------------------------------
+
+def _set_global_seeds(seed: int) -> None:
+    """Seed all relevant RNGs for reproducibility across runs on the same machine.
+
+    Sets Python's ``random``, NumPy's global state, and PyTorch (CPU + all CUDA
+    devices).  Also enables CuDNN deterministic mode so GPU convolution kernels
+    produce identical results.
+
+    Note: floating-point results may still differ across *machines* that use
+    different BLAS implementations (OpenBLAS vs MKL) for PCA/Ridge, because
+    those libraries may choose different factorisation paths.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 # ---------------------------------------------------------------------------
 # Accuracy helpers
@@ -120,7 +145,9 @@ def _run_visual_eval(
     feature_scaler:   Optional[StandardScaler] = None,
     open_image:       Optional[Callable[[Path], Image.Image]] = None,
     class_prior:      Optional[np.ndarray] = None,   # [n_classes] empirical class frequencies
-    weight_method:    str   = "correct_class_prob",
+    weight_method:     str  = "correct_class_prob",
+    show_pred_label:   bool = False,
+    show_minority_prob: bool = False,
 ) -> dict[str, float]:
     """Run the patch-quality visual evaluation for one support set variant.
 
@@ -184,6 +211,8 @@ def _run_visual_eval(
                 ridge_pred_logits=ridge_pred_logits,
                 class_prior=class_prior,
                 weight_method=weight_method,
+                show_pred_label=show_pred_label,
+                show_minority_prob=show_minority_prob,
             )
             out_path = (
                 split_out_dir
@@ -466,6 +495,8 @@ def _make_stage_callback(
                 temperature=stage.refinement_cfg.temperature,
                 ridge_model=None, feature_scaler=None, open_image=open_image,
                 class_prior=class_prior, weight_method=cfg.refinement.weight_method,
+                show_pred_label=cfg.run.show_pred_label,
+                show_minority_prob=cfg.run.show_minority_prob,
             )
         else:
             iter_mean_probs = {}
@@ -488,6 +519,8 @@ def _make_stage_callback(
                 temperature=stage.refinement_cfg.temperature,
                 ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
                 class_prior=class_prior, weight_method=cfg.refinement.weight_method,
+                show_pred_label=cfg.run.show_pred_label,
+                show_minority_prob=cfg.run.show_minority_prob,
             )
 
         # Pool test queries with Ridge and evaluate accuracy.
@@ -524,6 +557,8 @@ def _make_stage_callback(
 def run_pal_experiment(
     cfg: ExperimentConfig,
 ) -> None:
+    _set_global_seeds(cfg.seed)
+
     output_dir = Path(cfg.run.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -556,6 +591,13 @@ def run_pal_experiment(
     # Empirical class prior (used by kl_div weight method and visualisation panels).
     _counts      = np.bincount(train_labels.astype(np.int64), minlength=n_classes)
     class_prior  = (_counts / _counts.sum()).astype(np.float32)
+
+    _test_counts = np.bincount(test_labels.astype(np.int64), minlength=n_classes)
+    print("[class balance]")
+    print(f"  {'class':<8} {'train':>8} {'train %':>9} {'test':>8} {'test %':>9}")
+    for _i, (_cls_name, _tr, _te) in enumerate(zip(idx_to_class, _counts, _test_counts)):
+        print(f"  {str(_cls_name):<8} {_tr:>8d} {100*_tr/_counts.sum():>8.1f}% {_te:>8d} {100*_te/_test_counts.sum():>8.1f}%")
+    print(f"  {'TOTAL':<8} {_counts.sum():>8d} {'100.0%':>9} {_test_counts.sum():>8d} {'100.0%':>9}")
 
     # --- Resolve absence-of-evidence class ---
     aoe_mask: Optional[np.ndarray] = None
@@ -656,6 +698,8 @@ def run_pal_experiment(
             train_image_paths, _, _ = _get_rsna_image_paths(cfg.dataset.dataset_path, cfg.dataset.features_dir, split="train", backbone=cfg.dataset.backbone)
             test_image_paths,  _, _ = _get_rsna_image_paths(cfg.dataset.dataset_path, cfg.dataset.features_dir, split="test",  backbone=cfg.dataset.backbone)
             open_image = _dicom_to_pil
+        elif cfg.dataset.dataset == "petfinder":
+            train_image_paths, test_image_paths = _get_petfinder_image_paths(cfg.dataset.dataset_path)
 
         # Keep train_image_paths aligned with train_patches by applying the same
         # index selections that _load_features and _balance_classes applied.
@@ -701,6 +745,8 @@ def run_pal_experiment(
             temperature=temperatures[0],
             ridge_model=None, feature_scaler=None, open_image=open_image,
             class_prior=class_prior, weight_method=cfg.refinement.weight_method,
+            show_pred_label=cfg.run.show_pred_label,
+            show_minority_prob=cfg.run.show_minority_prob,
         )
     else:
         baseline_mean_probs = {}
@@ -771,6 +817,8 @@ def run_pal_experiment(
             temperature=_last_stage_data["temperature"],
             ridge_model=_last_stage_data["ridge_model"], feature_scaler=_last_stage_data["feature_scaler"],
             open_image=open_image, class_prior=class_prior, weight_method=cfg.refinement.weight_method,
+            show_pred_label=cfg.run.show_pred_label,
+            show_minority_prob=cfg.run.show_minority_prob,
         )
 
     total_time_s = time.perf_counter() - experiment_start

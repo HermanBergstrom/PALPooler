@@ -226,6 +226,10 @@ def train_attention_pooling_head(
     tabicl_backbone = tabicl_backbone.to(device)
     tabicl_backbone.eval()
 
+    # Seed PyTorch before weight initialisation so the head starts from the
+    # same state regardless of what ran before this call.
+    torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
     head = AttentionPoolingHead(
         embed_dim=embed_dim,
         out_dim=out_dim,

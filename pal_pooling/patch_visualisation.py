@@ -33,16 +33,17 @@ def _add_prob_overlay(
     cmap: str = "RdYlGn",
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
-) -> None:
+) -> "plt.colorbar.Colorbar":
     """Overlay a heatmap on top of the image with a colourbar.
 
     vmin/vmax: if provided, use these for color scale; otherwise auto-scale.
+    Returns the colorbar object so callers can set custom ticks.
     """
     ax.imshow(img_rgb)
     im = ax.imshow(pixel_grid, cmap=cmap, vmin=vmin, vmax=vmax, alpha=alpha)
     ax.set_title(title)
     ax.axis("off")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    return fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
 
 # ---------------------------------------------------------------------------
@@ -61,11 +62,14 @@ def visualise_image(
     ridge_pred_logits: Optional[np.ndarray] = None,   # [P]  Ridge-predicted quality logits
     class_prior:       Optional[np.ndarray] = None,   # [n_classes]  empirical class frequencies
     weight_method:     str   = "correct_class_prob",  # method used for refinement (highlighted)
+    show_pred_label:   bool  = False,                 # add a discrete per-patch predicted-class panel
+    show_minority_prob: bool = False,                 # add a P(minority class) panel with image-local scale
 ) -> plt.Figure:
     """Figure with overlay panels showing per-patch softmax quality scores.
 
-    Panels: original | P(true) | ccp weights | entropy weights | kl_div weights
+    Panels: original | P(true) | ccp weights | entropy weights | kl_div weights | wasserstein weights | js_div weights
             [+ Ridge weights when ridge_pred_logits is provided]
+    kl_div, wasserstein, and js_div panels are only shown when class_prior is provided.
     The panel corresponding to weight_method is marked with ★ in its title.
     """
     P      = len(patch_probs)
@@ -92,9 +96,9 @@ def visualise_image(
     def _dist_panels(dist: np.ndarray, label: str) -> list[tuple[str, Optional[np.ndarray], dict]]:
         """Build overlay panels for a [P, n_classes] distribution.
 
-        Panels: original | P(true) | ccp weights | entropy weights | kl_div weights.
+        Panels: original | P(true) | ccp weights | entropy weights | kl_div weights | wasserstein weights | js_div weights.
         The panel whose method matches weight_method is marked with ★.
-        kl_div panel is always shown (class_prior is always provided by the runner).
+        kl_div, wasserstein, and js_div panels are shown when class_prior is provided.
         """
         p_true    = dist[:, true_label]
         w_ccp     = compute_patch_pooling_weights(dist, true_label, temperature, "correct_class_prob")
@@ -114,6 +118,34 @@ def visualise_image(
             )
             panels.append((_mark("KL-div weights", "kl_div"),
                            w_kl, {"vmin": w_kl.min(), "vmax": w_kl.max()}))
+            w_wass = compute_patch_pooling_weights(
+                dist, true_label, temperature, "wasserstein", class_prior
+            )
+            panels.append((_mark("Wasserstein weights", "wasserstein"),
+                           w_wass, {"vmin": w_wass.min(), "vmax": w_wass.max()}))
+            w_js = compute_patch_pooling_weights(
+                dist, true_label, temperature, "js_div", class_prior
+            )
+            panels.append((_mark("JS-div weights", "js_div"),
+                           w_js, {"vmin": w_js.min(), "vmax": w_js.max()}))
+        if show_pred_label:
+            pred_vals = dist.argmax(axis=1).astype(float)
+            class_names = [idx_to_class[i] for i in range(n_classes)]
+            panels.append((
+                "Predicted label",
+                pred_vals,
+                {"cmap": "tab10", "vmin": -0.5, "vmax": n_classes - 0.5,
+                 "tick_labels": class_names},
+            ))
+        if show_minority_prob and class_prior is not None:
+            minority_idx  = int(np.argmin(class_prior))
+            minority_name = idx_to_class[minority_idx]
+            p_minority    = dist[:, minority_idx]
+            panels.append((
+                f"P(minority: {minority_name!r})",
+                p_minority,
+                {"vmin": float(p_minority.min()), "vmax": float(p_minority.max())},
+            ))
         return panels
 
     all_rows = [_dist_panels(patch_probs, "Softmax")]
@@ -149,7 +181,11 @@ def visualise_image(
                 ax.set_title(title)
                 ax.axis("off")
             else:
-                _add_prob_overlay(ax, fig, img_rgb, _up(vals), title, alpha, **kwargs)
+                tick_labels = kwargs.pop("tick_labels", None)
+                cbar = _add_prob_overlay(ax, fig, img_rgb, _up(vals), title, alpha, **kwargs)
+                if tick_labels is not None:
+                    cbar.set_ticks(range(len(tick_labels)))
+                    cbar.set_ticklabels(tick_labels)
         for col_idx in range(len(row_panels), n_cols):
             axes[row_idx, col_idx].axis("off")
 

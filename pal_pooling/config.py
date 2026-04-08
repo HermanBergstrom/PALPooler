@@ -5,6 +5,7 @@ from typing import Optional, List, Dict, Any
 
 BUTTERFLY_DATASET_PATH = Path("/project/aip-rahulgk/hermanb/datasets/butterfly-image-classification")
 RSNA_DATASET_PATH      = Path("/project/aip-rahulgk/hermanb/datasets/rsna-pneumonia")
+PETFINDER_DATASET_PATH = Path("/project/aip-rahulgk/image_icl_project/petfinder")
 FEATURES_DIR           = Path("/scratch/hermanb/temp_datasets/extracted_features")
 
 @dataclass
@@ -52,6 +53,8 @@ class AttentionPoolConfig:
 class RunConfig:
     output_dir: Path
     post_refinement_viz: bool
+    show_pred_label: bool
+    show_minority_prob: bool
     n_train_sweep: Optional[List[int]]
 
 @dataclass
@@ -66,7 +69,7 @@ class ExperimentConfig:
 def parse_args() -> ExperimentConfig:
     p = argparse.ArgumentParser(description="Patch quality evaluation with TabICL")
     p.add_argument("--dataset",       type=str,   default="butterfly",
-                   choices=["butterfly", "rsna"],
+                   choices=["butterfly", "rsna", "petfinder"],
                    help="Which dataset to run on (default: butterfly)")
     p.add_argument("--backbone",      type=str,   default="rad-dino",
                    choices=["rad-dino", "dinov3"],
@@ -85,7 +88,7 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--no-pca",        action="store_true",
                    help="Disable PCA (use full 768-D embeddings)")
     p.add_argument("--seed",          type=int,   default=42)
-    p.add_argument("--output-dir",    type=Path,  default=Path("patch_quality_results"))
+    p.add_argument("--output-dir",    type=Path,  default=Path("results/pal_pooling"))
     p.add_argument("--patch-size",    type=int,   default=16)
     p.add_argument("--patch-group-sizes", type=int,   nargs="+",  default=[1],
                    help="Ordered list of patch group sizes for iterative refinement "
@@ -98,7 +101,7 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--batch-size",     type=int,   default=1000,
                    help="Number of images per TabICL call during refinement")
     p.add_argument("--weight-method",  type=str,   default="correct_class_prob",
-                   choices=["correct_class_prob", "entropy", "kl_div"],
+                   choices=["correct_class_prob", "entropy", "kl_div", "wasserstein", "js_div"],
                    help="How to derive patch pooling weights from TabICL probabilities.")
     p.add_argument("--ridge-alpha",  type=float, nargs="+",  default=[1.0],
                    help="Regularisation strength for the Ridge quality model.")
@@ -140,6 +143,10 @@ def parse_args() -> ExperimentConfig:
                    help="Solve Ridge regression on the GPU (requires PyTorch + CUDA).")
     p.add_argument("--post-refinement-viz", action="store_true",
                    help="Skip pre-refinement visualisations; only produce post-refinement figures.")
+    p.add_argument("--pred-label-viz", action="store_true",
+                   help="Add a discrete per-patch predicted-label panel to visualisation figures.")
+    p.add_argument("--minority-prob-viz", action="store_true",
+                   help="Add a P(minority class) panel with image-local colour scale to visualisation figures.")
     p.add_argument("--n-train-sweep", type=int, nargs="+", default=None,
                    metavar="N",
                    help="Run one experiment per value and collect results into a single sweep_results.json. Mutually exclusive with --n-train.")
@@ -149,7 +156,11 @@ def parse_args() -> ExperimentConfig:
     if args.n_train_sweep is not None and args.n_train is not None:
         p.error("--n-train and --n-train-sweep are mutually exclusive.")
 
-    _dataset_defaults = {"butterfly": BUTTERFLY_DATASET_PATH, "rsna": RSNA_DATASET_PATH}
+    _dataset_defaults = {
+        "butterfly": BUTTERFLY_DATASET_PATH,
+        "rsna":      RSNA_DATASET_PATH,
+        "petfinder": PETFINDER_DATASET_PATH,
+    }
     dataset_path = args.dataset_path or _dataset_defaults[args.dataset]
     
     pca_dim = None if args.no_pca else args.pca_dim
@@ -199,6 +210,8 @@ def parse_args() -> ExperimentConfig:
     run_cfg = RunConfig(
         output_dir=args.output_dir,
         post_refinement_viz=args.post_refinement_viz,
+        show_pred_label=args.pred_label_viz,
+        show_minority_prob=args.minority_prob_viz,
         n_train_sweep=args.n_train_sweep
     )
     
