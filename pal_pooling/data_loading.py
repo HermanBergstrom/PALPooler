@@ -204,6 +204,64 @@ def _get_petfinder_image_paths(
     return train_paths, test_paths
 
 
+def _get_petfinder_image_paths(
+    dataset_path: Path,
+) -> tuple[list[Path], list[Path]]:
+    """Return (train_paths, test_paths) aligned with _load_features petfinder output.
+
+    Train paths correspond to the merged train+val splits (in that order), test paths
+    to the test split — exactly matching the arrays returned by ``_load_features``.
+    Each path points to the lowest-numbered image for the pet (typically ``-1.jpg``).
+    """
+    petfinder_dir = Path(dataset_path)
+    processed_dir = petfinder_dir / "extracted_features" / "preprocessed_dinov3_local"
+    images_dir    = petfinder_dir / "petfinder-adoption-prediction" / "train_images"
+
+    index = _build_petfinder_image_index(images_dir)
+
+    def _pet_to_path(pet_id: str) -> Path:
+        if pet_id in index:
+            return index[pet_id]
+        return images_dir / f"{pet_id}-1.jpg"   # missing image; path kept for alignment
+
+    train_data = torch.load(processed_dir / "train.pt", map_location="cpu", weights_only=False)
+    val_data   = torch.load(processed_dir / "val.pt",   map_location="cpu", weights_only=False)
+    test_data  = torch.load(processed_dir / "test.pt",  map_location="cpu", weights_only=False)
+
+    train_paths = [_pet_to_path(pid) for pid in train_data["pet_ids"] + val_data["pet_ids"]]
+    test_paths  = [_pet_to_path(pid) for pid in test_data["pet_ids"]]
+    return train_paths, test_paths
+
+
+def _get_dvm_image_paths(
+    dataset_path: Path,
+) -> tuple[list[Path], list[Path]]:
+    """Return (train_paths, test_paths) for DVM dataset."""
+    dvm_dir = Path(dataset_path)
+    if str(dvm_dir) not in sys.path:
+        sys.path.insert(0, str(dvm_dir))
+    from dvm_dataset_with_dinov3 import load_dvm_dataset
+
+    train_loader, val_loader, test_loader, _ = load_dvm_dataset(
+        feature_source="dinov3_local",
+        use_patches=False,
+        use_images=False,
+        num_workers=0,
+        data_dir=dvm_dir
+    )
+
+    # Note: Like petfinder, we merge train and val
+    train_ds = train_loader.dataset
+    val_ds   = val_loader.dataset
+    test_ds  = test_loader.dataset
+
+    train_paths = [train_ds.get_image_path(i) for i in range(len(train_ds))]
+    train_paths += [val_ds.get_image_path(i) for i in range(len(val_ds))]
+    test_paths = [test_ds.get_image_path(i) for i in range(len(test_ds))]
+    
+    return train_paths, test_paths
+
+
 def _get_rsna_image_paths(
     dataset_path: Path,
     features_dir: Path,
@@ -239,8 +297,8 @@ def _load_features(
     seed: int,
     dtype:        torch.dtype = torch.float32,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-           Optional[np.ndarray], Optional[np.ndarray], dict[int, str],
-           Optional[np.ndarray]]:
+           Optional[np.ndarray], dict[int, str],
+           Optional[np.ndarray], Optional[np.ndarray]]:
     """Load patch and CLS features for the requested dataset.
 
     Returns:
@@ -251,13 +309,12 @@ def _load_features(
         cls_train:       [N_train, D] or None
         cls_test:        [N_test,  D] or None
         idx_to_class:    {int → class_name}
-        train_sub_idx:   [N_train] int64 or None — indices into the original full training set
-                         that were selected; None when no subsampling was applied.  Callers
-                         that maintain a parallel list of training image paths must apply
-                         the same selection to keep alignment with train_patches.
+        train_sub_idx:   [N_train] int64 or None
+        test_sub_idx:    [N_test]  int64 or None
     """
     features_dir = Path(dataset_cfg.features_dir)
     train_sub_idx: Optional[np.ndarray] = None
+    test_sub_idx:  Optional[np.ndarray] = None
     n_train = dataset_cfg.n_train
 
     if dataset_cfg.dataset == "butterfly":
@@ -391,8 +448,70 @@ def _load_features(
         )
         print(f"[info] PetFinder (test):  N={len(test_labels)}")
 
+    elif dataset_cfg.dataset == "dvm":
+        dvm_dir = Path(dataset_cfg.dataset_path)
+        if str(dvm_dir) not in sys.path:
+            sys.path.insert(0, str(dvm_dir))
+        from dvm_dataset_with_dinov3 import load_dvm_dataset
+
+        train_loader, val_loader, test_loader, metadata = load_dvm_dataset(
+            feature_source="dinov3_local",
+            use_patches=True,
+            use_images=True,
+            num_workers=0,
+            data_dir=dvm_dir
+        )
+
+        train_ds = train_loader.dataset
+        val_ds   = val_loader.dataset
+        test_ds  = test_loader.dataset
+
+        def get_dvm_subset(ds_list, n_limit):
+            # Combine multiple datasets (like train + val)
+            lengths = [len(ds) for ds in ds_list]
+            total_n = sum(lengths)
+            
+            if n_limit is not None and n_limit < total_n:
+                rng = np.random.RandomState(seed)
+                sub_idx = rng.choice(total_n, size=n_limit, replace=False)
+                sub_idx.sort()
+            else:
+                sub_idx = np.arange(total_n)
+            
+            patches, cls_emb, labels = [], [], []
+            for i in sub_idx:
+                # Find which dataset this index belongs to
+                offset = 0
+                ds_idx = i
+                for l, ds in zip(lengths, ds_list):
+                    if ds_idx < l:
+                        sample = ds[ds_idx]
+                        break
+                    ds_idx -= l
+                patches.append(sample["patch_embedding"].numpy())
+                cls_emb.append(sample["image_embedding"].numpy())
+                labels.append(sample["target"])
+            
+            return np.stack(patches, axis=0), np.stack(cls_emb, axis=0), np.array(labels, dtype=np.int64), sub_idx
+
+        # We merge train + val for support set, similar to Petfinder
+        train_patches, cls_train, train_labels, train_sub_idx = get_dvm_subset([train_ds, val_ds], n_train)
+
+        # Test set
+        test_patches, cls_test, test_labels, test_sub_idx = get_dvm_subset([test_ds], dataset_cfg.n_test)
+
+        target_encoder = metadata["target_encoder"]
+        idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
+
+        print(f"[info] DVM (train+val): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] DVM (test): N={len(test_labels)}")
+        
+        # we mark n_train as None so that generic subsampling is skipped
+        n_train = None
+
     else:
-        raise ValueError(f"Unknown dataset '{dataset_cfg.dataset}'. Choices: butterfly, rsna, petfinder")
+        raise ValueError(f"Unknown dataset '{dataset_cfg.dataset}'. Choices: butterfly, rsna, petfinder, dvm")
 
     # --- Optional n_train subsampling for non-RSNA datasets ---
     if dataset_cfg.n_train is not None and dataset_cfg.n_train < len(train_labels):
@@ -407,7 +526,7 @@ def _load_features(
             cls_train = cls_train[sub_idx]
         print(f"[info] Training set subsampled: {n_train} / {n_orig} images")
 
-    return train_patches, train_labels, test_patches, test_labels, cls_train, cls_test, idx_to_class, train_sub_idx
+    return train_patches, train_labels, test_patches, test_labels, cls_train, cls_test, idx_to_class, train_sub_idx, test_sub_idx
 
 
 def _balance_classes(

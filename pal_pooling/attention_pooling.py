@@ -32,6 +32,8 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.decomposition import PCA
+from tabicl import TabICLClassifier
 
 from pal_pooling.frozen_tabicl import (
     FrozenTabICLConfig,
@@ -170,6 +172,7 @@ def train_attention_pooling_head(
     tabicl_config: Optional[FrozenTabICLConfig] = None,
     tabicl_backbone: Optional[FrozenTabICLBackbone] = None,
     config: Optional[EpisodicTrainingConfig] = None,
+    val_pca_dim: Optional[int] = None,
     verbose: bool = True,
 ) -> tuple[AttentionPoolingHead, dict]:
     """Train an attention pooling head on patch features with frozen TabICL.
@@ -193,6 +196,10 @@ def train_attention_pooling_head(
         num_queries:   number of learnable attention query vectors.
         num_heads:     number of attention heads.
         config:        ``EpisodicTrainingConfig`` (uses defaults if None).
+        val_pca_dim:   if set, PCA is fit on the full training projections each
+                       validation step and applied to both support and query
+                       before scoring with a fresh ``TabICLClassifier``.  This
+                       avoids GPU OOM when the validation set is large.
 
     Returns:
         ``(head, history)`` — head restored to best val checkpoint if available.
@@ -266,17 +273,25 @@ def train_attention_pooling_head(
 
     def _run_validation(step_for_eval: int) -> tuple[float, float]:
         assert X_val_t is not None and y_val_t is not None
-        head.eval()
-        with torch.no_grad():
-            X_support_proj = head(X_t)            # [N_train, out_dim]
-            X_query_proj = head(X_val_t)          # [N_val,   out_dim]
-            y_sup_local, y_q_local = _remap_labels_from_support(y_t, y_val_t)
-            logits_val = tabicl_backbone(
-                X_support_proj, y_sup_local, X_query_proj,
-                step_index=step_for_eval - 1,
-            )
-            val_loss = float(criterion(logits_val, y_q_local).item())
-            val_acc = float((logits_val.argmax(dim=1) == y_q_local).float().mean().item())
+        # Use batched head inference to avoid OOM on large train/val sets.
+        X_support_np = _pool_with_head(head, X_t, device)       # [N_train, out_dim]
+        X_query_np   = _pool_with_head(head, X_val_t, device)   # [N_val,   out_dim]
+        y_sup_np = y_t.cpu().numpy()
+        y_q_np   = y_val_t.cpu().numpy()
+
+        # Optional PCA: fit on support, project both — mirrors pal_pooler.score_tabicl.
+        if val_pca_dim is not None:
+            n_comp = min(val_pca_dim, X_support_np.shape[0], X_support_np.shape[1])
+            pca = PCA(n_components=n_comp, random_state=config.seed)
+            X_support_np = pca.fit_transform(X_support_np).astype(np.float32)
+            X_query_np   = pca.transform(X_query_np).astype(np.float32)
+
+        val_clf = TabICLClassifier(n_estimators=1, random_state=config.seed)
+        val_clf.fit(X_support_np, y_sup_np)
+        proba = val_clf.predict_proba(X_query_np)
+
+        val_acc  = float((np.argmax(proba, axis=1) == y_q_np).mean())
+        val_loss = float(-np.log(np.clip(proba[np.arange(len(y_q_np)), y_q_np], 1e-15, 1.0)).mean())
         return val_loss, val_acc
 
     for step in range(1, config.num_steps + 1):

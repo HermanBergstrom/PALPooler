@@ -6,6 +6,7 @@ from typing import Optional, List, Dict, Any
 BUTTERFLY_DATASET_PATH = Path("/project/aip-rahulgk/hermanb/datasets/butterfly-image-classification")
 RSNA_DATASET_PATH      = Path("/project/aip-rahulgk/hermanb/datasets/rsna-pneumonia")
 PETFINDER_DATASET_PATH = Path("/project/aip-rahulgk/image_icl_project/petfinder")
+DVM_DATASET_PATH       = Path("/project/6101781/image_icl_project/DVM_Dataset")
 FEATURES_DIR           = Path("/scratch/hermanb/temp_datasets/extracted_features")
 
 @dataclass
@@ -15,6 +16,8 @@ class DatasetConfig:
     features_dir: Path
     dataset_path: Path
     n_train: Optional[int]
+    n_test: Optional[int]
+    n_val: Optional[int]
     n_sample: int
     balance_train: bool
     balance_test: bool
@@ -56,6 +59,7 @@ class RunConfig:
     show_pred_label: bool
     show_minority_prob: bool
     n_train_sweep: Optional[List[int]]
+    seeds: Optional[List[int]] = None
 
 @dataclass
 class ExperimentConfig:
@@ -70,8 +74,8 @@ class ExperimentConfig:
 def parse_args() -> ExperimentConfig:
     p = argparse.ArgumentParser(description="Patch quality evaluation with TabICL")
     p.add_argument("--dataset",       type=str,   default="butterfly",
-                   choices=["butterfly", "rsna", "petfinder"],
-                   help="Which dataset to run on (default: butterfly)")
+                   choices=["butterfly", "rsna", "petfinder", "dvm"],
+                   help="Which dataset to run on")
     p.add_argument("--backbone",      type=str,   default="rad-dino",
                    choices=["rad-dino", "dinov3"],
                    help="Which backbone's features to load for RSNA "
@@ -80,10 +84,14 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--dataset-path",  type=Path,  default=None,
                    help="Root path of the raw dataset (images + labels). "
                         "Defaults: butterfly → butterfly-image-classification, "
-                        "rsna → rsna-pneumonia")
+                        "rsna → rsna-pneumonia, petfinder → petfinder, dvm → DVM_Dataset")
     p.add_argument("--n-sample",      type=int,   default=0)
     p.add_argument("--n-train",       type=int,   default=None,
                    help="Limit the support set to this many training images (random subsample)")
+    p.add_argument("--n-test",        type=int,   default=None,
+                   help="Limit the test set to this many testing images (random subsample, only DVM)")
+    p.add_argument("--n-val",         type=int,   default=None,
+                   help="Limit the val set to this many validation images (random subsample, only DVM)")
     p.add_argument("--n-estimators",  type=int,   default=1)
     p.add_argument("--pca-dim",       type=int,   default=128)
     p.add_argument("--no-pca",        action="store_true",
@@ -130,8 +138,8 @@ def parse_args() -> ExperimentConfig:
                    help="Max training rows forwarded per step (default: 512)")
     p.add_argument("--attn-num-queries",      type=int,   default=1,
                    help="Learnable query vectors (1 = CLS-like; default: 1)")
-    p.add_argument("--attn-num-heads",        type=int,   default=8,
-                   help="Attention heads (must divide embed_dim=768; default: 8)")
+    p.add_argument("--attn-num-heads",        type=int,   default=1,
+                   help="Attention heads (must divide embed_dim=768; default: 1)")
     p.add_argument("--device", type=str, default="auto",
                    help="Torch device for attention pooling training: 'auto', 'cuda', 'cpu' (default: auto)")
     
@@ -151,16 +159,22 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--n-train-sweep", type=int, nargs="+", default=None,
                    metavar="N",
                    help="Run one experiment per value and collect results into a single sweep_results.json. Mutually exclusive with --n-train.")
+    p.add_argument("--seeds", type=int, nargs="+", default=None,
+                   metavar="S",
+                   help="Run the experiment once per seed and save results continuously. Mutually exclusive with --seed.")
 
     args = p.parse_args()
 
     if args.n_train_sweep is not None and args.n_train is not None:
         p.error("--n-train and --n-train-sweep are mutually exclusive.")
+    if args.seeds is not None and args.seed != 42:
+        p.error("--seeds and --seed are mutually exclusive.")
 
     _dataset_defaults = {
         "butterfly": BUTTERFLY_DATASET_PATH,
         "rsna":      RSNA_DATASET_PATH,
         "petfinder": PETFINDER_DATASET_PATH,
+        "dvm":       DVM_DATASET_PATH,
     }
     dataset_path = args.dataset_path or _dataset_defaults[args.dataset]
     
@@ -172,6 +186,8 @@ def parse_args() -> ExperimentConfig:
         features_dir=args.features_dir,
         dataset_path=dataset_path,
         n_train=args.n_train,
+        n_test=args.n_test,
+        n_val=args.n_val,
         n_sample=args.n_sample,
         balance_train=args.balance_train,
         balance_test=args.balance_test
@@ -213,7 +229,8 @@ def parse_args() -> ExperimentConfig:
         post_refinement_viz=args.post_refinement_viz,
         show_pred_label=args.pred_label_viz,
         show_minority_prob=args.minority_prob_viz,
-        n_train_sweep=args.n_train_sweep
+        n_train_sweep=args.n_train_sweep,
+        seeds=args.seeds,
     )
     
     return ExperimentConfig(

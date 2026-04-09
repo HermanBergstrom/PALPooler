@@ -47,6 +47,7 @@ from pal_pooling.data_loading import (
     _get_image_paths,
     _dicom_to_pil,
     _get_petfinder_image_paths,
+    _get_dvm_image_paths,
     _get_rsna_image_paths,
     _load_features,
     _balance_classes,
@@ -352,7 +353,8 @@ def _run_attn_only(
         learning_rate=attn_cfg.attn_lr,
         max_step_samples=attn_cfg.attn_max_step_samples,
         seed=seed,
-        log_every=max(1, attn_cfg.attn_steps // 10),
+        #log_every=max(1, attn_cfg.attn_steps // 10),
+        log_every=50
     )
     print(f"\n[attn-pool]  Training attention head  "
           f"(steps={attn_cfg.attn_steps}  lr={attn_cfg.attn_lr}  device={_device}  "
@@ -492,7 +494,7 @@ def _make_stage_callback(
             iter_mean_probs = _run_visual_eval(
                 tag, pre_refine_support, train_labels, split_configs_iter, idx_to_class,
                 pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators,
-                patch_size=eff_patch_sz, seed=cfg.seed, output_dir=cfg.run.output_dir,
+                patch_size=eff_patch_sz, seed=cfg.seed, output_dir=output_dir,
                 temperature=stage.refinement_cfg.temperature,
                 ridge_model=None, feature_scaler=None, open_image=open_image,
                 class_prior=class_prior, weight_method=cfg.refinement.weight_method,
@@ -516,7 +518,7 @@ def _make_stage_callback(
             iter_mean_probs = _run_visual_eval(
                 f"{tag}_post", pre_refine_support, train_labels, split_configs_post, idx_to_class,
                 pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators,
-                patch_size=eff_patch_sz, seed=cfg.seed, output_dir=cfg.run.output_dir,
+                patch_size=eff_patch_sz, seed=cfg.seed, output_dir=output_dir,
                 temperature=stage.refinement_cfg.temperature,
                 ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
                 class_prior=class_prior, weight_method=cfg.refinement.weight_method,
@@ -570,7 +572,7 @@ def run_pal_experiment(
     (train_patches, train_labels,
      test_patches,  test_labels,
      cls_train_feats, cls_test_feats,
-     idx_to_class, train_sub_idx) = _load_features(
+     idx_to_class, train_sub_idx, test_sub_idx) = _load_features(
         dataset_cfg=cfg.dataset,
         seed=cfg.seed,
     )
@@ -581,8 +583,9 @@ def run_pal_experiment(
         train_patches, train_labels, cls_train_feats, bal_train_keep_idx = _balance_classes(
             train_patches, train_labels, cls_train_feats, bal_rng
         )
+    bal_test_keep_idx: Optional[np.ndarray] = None
     if cfg.dataset.balance_test:
-        test_patches, test_labels, cls_test_feats, _ = _balance_classes(
+        test_patches, test_labels, cls_test_feats, bal_test_keep_idx = _balance_classes(
             test_patches, test_labels, cls_test_feats, bal_rng
         )
 
@@ -701,6 +704,8 @@ def run_pal_experiment(
             open_image = _dicom_to_pil
         elif cfg.dataset.dataset == "petfinder":
             train_image_paths, test_image_paths = _get_petfinder_image_paths(cfg.dataset.dataset_path)
+        elif cfg.dataset.dataset == "dvm":
+            train_image_paths, test_image_paths = _get_dvm_image_paths(cfg.dataset.dataset_path)
 
         # Keep train_image_paths aligned with train_patches by applying the same
         # index selections that _load_features and _balance_classes applied.
@@ -708,6 +713,11 @@ def run_pal_experiment(
             train_image_paths = [train_image_paths[i] for i in train_sub_idx]
         if bal_train_keep_idx is not None:
             train_image_paths = [train_image_paths[i] for i in bal_train_keep_idx]
+        
+        if test_sub_idx is not None:
+            test_image_paths = [test_image_paths[i] for i in test_sub_idx]
+        if bal_test_keep_idx is not None:
+            test_image_paths = [test_image_paths[i] for i in bal_test_keep_idx]
 
     rng              = np.random.RandomState(cfg.seed)
     train_sample_idx = rng.choice(len(train_labels), size=min(cfg.dataset.n_sample, len(train_labels)), replace=False)
@@ -742,7 +752,7 @@ def run_pal_experiment(
         baseline_mean_probs = _run_visual_eval(
             "baseline", baseline_support, train_labels, split_configs_orig, idx_to_class,
             pca=pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=cfg.refinement.patch_size,
-            seed=cfg.seed, output_dir=cfg.run.output_dir,
+            seed=cfg.seed, output_dir=output_dir,
             temperature=temperatures[0],
             ridge_model=None, feature_scaler=None, open_image=open_image,
             class_prior=class_prior, weight_method=cfg.refinement.weight_method,
@@ -754,7 +764,7 @@ def run_pal_experiment(
 
     if not cfg.refinement.refine:
         _save_results(
-            output_dir=cfg.run.output_dir, run_ts=run_ts,
+            output_dir=output_dir, run_ts=run_ts,
             total_time_s=time.perf_counter() - experiment_start,
             train_patches=train_patches, test_labels=test_labels, D=D,
             n_classes=n_classes, pca=pca,
@@ -824,7 +834,7 @@ def run_pal_experiment(
             split_configs_final, idx_to_class,
             pca=_last_stage_data["pre_refine_pca"], n_estimators=cfg.refinement.tabicl_n_estimators,
             patch_size=_last_stage_data["eff_patch_sz"],
-            seed=cfg.seed, output_dir=cfg.run.output_dir,
+            seed=cfg.seed, output_dir=output_dir,
             temperature=_last_stage_data["temperature"],
             ridge_model=_last_stage_data["ridge_model"], feature_scaler=_last_stage_data["feature_scaler"],
             open_image=open_image, class_prior=class_prior, weight_method=cfg.refinement.weight_method,
@@ -858,7 +868,7 @@ def run_pal_experiment(
     print(f"  Total wall time: {total_time_s:.1f}s")
 
     _save_results(
-        output_dir=cfg.run.output_dir, run_ts=run_ts,
+        output_dir=output_dir, run_ts=run_ts,
         total_time_s=total_time_s,
         train_patches=train_patches, test_labels=test_labels, D=D,
         n_classes=n_classes, pca=pca,
@@ -946,18 +956,105 @@ def run_n_train_sweep(
     print(f"\n[sweep] Done — {len(cfg.run.n_train_sweep)} runs in {sweep_total:.1f}s")
     print(f"[sweep] Results → {sweep_path}")
 
+def run_seed_sweep(cfg: ExperimentConfig) -> None:
+    """Run the experiment for each seed in ``cfg.run.seeds``, saving results continuously.
+
+    After each seed completes the consolidated ``seed_sweep_results.json`` is written
+    to ``cfg.run.output_dir`` so partial results survive an interrupted run.  On the
+    next invocation with the same output directory any already-completed seeds are
+    skipped automatically.
+
+    If ``cfg.run.n_train_sweep`` is also set, each seed runs a full n_train sweep
+    (one sub-directory per training-set size, nested under the seed directory).
+    """
+    base_output_dir = Path(cfg.run.output_dir)
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+
+    sweep_path  = base_output_dir / "seed_sweep_results.json"
+    sweep_ts    = datetime.now(timezone.utc).isoformat()
+    sweep_start = time.perf_counter()
+
+    # Resume support: load any already-finished seeds from a prior run.
+    seed_results: list[dict] = []
+    if sweep_path.exists():
+        with sweep_path.open() as f:
+            prior = json.load(f)
+        seed_results = prior.get("runs", [])
+        completed_seeds = {r["seed"] for r in seed_results}
+        print(f"[seed-sweep] Resuming — {len(completed_seeds)} seed(s) already done: "
+              f"{sorted(completed_seeds)}")
+    else:
+        completed_seeds: set = set()
+
+    for seed in cfg.run.seeds:
+        if seed in completed_seeds:
+            print(f"\n[seed-sweep] Skipping seed={seed} (already completed)")
+            continue
+
+        seed_dir = base_output_dir / f"seed_{seed}"
+        print(f"\n{'='*60}")
+        print(f"  SEED SWEEP  seed={seed}  →  {seed_dir}")
+        print(f"{'='*60}")
+
+        run_cfg = copy.deepcopy(cfg)
+        run_cfg.seed = seed
+        run_cfg.run.output_dir = seed_dir
+
+        t0 = time.perf_counter()
+        if cfg.run.n_train_sweep is not None:
+            run_n_train_sweep(run_cfg)
+        else:
+            run_pal_experiment(run_cfg)
+        elapsed = time.perf_counter() - t0
+
+        # Collect a compact per-seed summary from the saved result files.
+        run_summary: dict = {
+            "seed":       seed,
+            "output_dir": str(seed_dir),
+            "time_s":     round(elapsed, 2),
+        }
+        if cfg.run.n_train_sweep is not None:
+            ntrain_sweep_path = seed_dir / "sweep_results.json"
+            if ntrain_sweep_path.exists():
+                with ntrain_sweep_path.open() as f:
+                    run_summary["n_train_sweep"] = json.load(f).get("runs", [])
+        else:
+            results_path = seed_dir / "results.json"
+            if results_path.exists():
+                with results_path.open() as f:
+                    data = json.load(f)
+                run_summary["baselines"] = data.get("baselines", {})
+                run_summary["stages"]    = data.get("stages", [])
+
+        seed_results.append(run_summary)
+
+        # Write continuously so a crash after seed K leaves K seeds intact.
+        sweep_record = {
+            "sweep_timestamp":    sweep_ts,
+            "seeds":              cfg.run.seeds,
+            "total_sweep_time_s": round(time.perf_counter() - sweep_start, 2),
+            "runs":               seed_results,
+        }
+        with sweep_path.open("w") as f:
+            json.dump(sweep_record, f, indent=2)
+        print(f"[seed-sweep] seed={seed} done ({elapsed:.1f}s) — "
+              f"{len(seed_results)}/{len(cfg.run.seeds)} seeds saved → {sweep_path}")
+
+    total = time.perf_counter() - sweep_start
+    print(f"\n[seed-sweep] All {len(cfg.run.seeds)} seed(s) finished in {total:.1f}s")
+    print(f"[seed-sweep] Results → {sweep_path}")
+
+
 if __name__ == "__main__":
     sys.stdout.reconfigure(line_buffering=True)
     cfg = parse_args()
 
-    if cfg.run.n_train_sweep is not None and cfg.run.n_train is not None:
+    if cfg.run.n_train_sweep is not None and cfg.dataset.n_train is not None:
         raise SystemExit("error: --n-train-sweep and --n-train are mutually exclusive")
 
-    if cfg.run.n_train_sweep is not None:
-        run_n_train_sweep(
-            cfg=cfg,
-        )
+    if cfg.run.seeds is not None:
+        run_seed_sweep(cfg)
+    elif cfg.run.n_train_sweep is not None:
+        run_n_train_sweep(cfg=cfg)
     else:
-        run_pal_experiment(
-            cfg,
-        )
+        run_pal_experiment(cfg)
