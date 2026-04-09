@@ -38,6 +38,7 @@ class RefinementConfig:
     gpu_ridge: bool
     tabicl_n_estimators: int
     tabicl_pca_dim: Optional[int]
+    append_cls: bool = False
 
 @dataclass
 class AttentionPoolConfig:
@@ -143,6 +144,8 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--device", type=str, default="auto",
                    help="Torch device for attention pooling training: 'auto', 'cuda', 'cpu' (default: auto)")
     
+    p.add_argument("--append-cls", action="store_true",
+                   help="Append the CLS token as an extra (ungrouped) patch for Ridge fitting and pooling.")
     p.add_argument("--aoe-class", type=str, default=None,
                    help="Absence-of-evidence class.")
     p.add_argument("--aoe-handling", type=str, default="filter",
@@ -209,6 +212,7 @@ def parse_args() -> ExperimentConfig:
         gpu_ridge=args.gpu_ridge,
         tabicl_n_estimators=args.n_estimators,
         tabicl_pca_dim=pca_dim,
+        append_cls=args.append_cls,
     )
     
     attention_cfg = AttentionPoolConfig(

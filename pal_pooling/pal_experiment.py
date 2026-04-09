@@ -453,6 +453,7 @@ def _make_stage_callback(
     class_prior: np.ndarray,
     output_dir: Path,
     all_results: list,
+    cls_test_feats: Optional[np.ndarray] = None,
 ) -> tuple:
     """Build the per-stage callback for :class:`IterativePALPooler`.
 
@@ -527,8 +528,14 @@ def _make_stage_callback(
             )
 
         # Pool test queries with Ridge and evaluate accuracy.
-        w_ridge       = _ridge_pool_weights(test_grouped, ridge_model, feature_scaler)
-        test_repooled = (w_ridge[:, :, None] * test_grouped).sum(axis=1)  # [N_test, D]
+        # Append CLS token to test patches before pooling when append_cls is enabled.
+        test_tokens = test_grouped
+        if cls_test_feats is not None:
+            test_tokens = np.concatenate(
+                [test_grouped, cls_test_feats.astype(np.float32)[:, None, :]], axis=1
+            )
+        w_ridge       = _ridge_pool_weights(test_tokens, ridge_model, feature_scaler)
+        test_repooled = (w_ridge[:, :, None] * test_tokens).sum(axis=1)  # [N_test, D]
         test_query    = (
             new_pca.transform(test_repooled).astype(np.float32)
             if new_pca is not None else test_repooled
@@ -662,7 +669,14 @@ def run_pal_experiment(
 
     # --- Baseline support: mean-pool original patches → optional PCA ---
     # Cast to float32 before mean to avoid float16 accumulation errors.
-    baseline_support_raw = train_patches.astype(np.float32).mean(axis=1)   # [N_train, D]
+    # When append_cls is enabled the CLS token is treated as one extra patch
+    # in the mean pool so the baseline is comparable to the PAL stages.
+    if cfg.refinement.append_cls and cls_train_feats is not None:
+        baseline_support_raw = np.concatenate(
+            [train_patches.astype(np.float32), cls_train_feats[:, None, :]], axis=1
+        ).mean(axis=1)
+    else:
+        baseline_support_raw = train_patches.astype(np.float32).mean(axis=1)   # [N_train, D]
     pca: Optional[PCA] = None
     if cfg.refinement.tabicl_pca_dim is not None:
         n_comp = min(cfg.refinement.tabicl_pca_dim, N_train, D)
@@ -795,6 +809,7 @@ def run_pal_experiment(
         test_patches=test_patches,
         train_labels=train_labels,
         test_labels=test_labels,
+        cls_test_feats=cls_test_feats if cfg.refinement.append_cls else None,
         train_image_paths=train_image_paths,
         test_image_paths=test_image_paths,
         train_sample_idx=train_sample_idx,
@@ -818,7 +833,8 @@ def run_pal_experiment(
         tabicl=tabicl_clf, refinement_cfg=cfg.refinement, seed=cfg.seed,
         gpu_ridge_device=_refine_dev,
     )
-    pal_pooler.fit(train_patches, train_labels, stage_callback=stage_callback)
+    train_cls = cls_train_feats if cfg.refinement.append_cls else None
+    pal_pooler.fit(train_patches, train_labels, cls_tokens=train_cls, stage_callback=stage_callback)
 
     # -- Final post-all-refinement visualisation (only when --post-refinement-viz is off) --
     # Produces Ridge-weight figures for the last refinement stage, giving you the quality

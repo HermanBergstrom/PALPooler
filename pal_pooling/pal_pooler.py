@@ -62,6 +62,26 @@ from pal_pooling.patch_pooling import (
 )
 
 
+def _append_cls(grouped: np.ndarray, cls_tokens: Optional[np.ndarray]) -> np.ndarray:
+    """Append a CLS token as one extra patch per image.
+
+    Parameters
+    ----------
+    grouped : np.ndarray, shape [N, P', D]
+        Spatially grouped patch embeddings.
+    cls_tokens : np.ndarray or None, shape [N, D]
+        Per-image CLS tokens.  When ``None`` the input is returned unchanged.
+
+    Returns
+    -------
+    np.ndarray, shape [N, P'+1, D]  (or [N, P', D] when cls_tokens is None)
+    """
+    if cls_tokens is None:
+        return grouped
+    cls = np.asarray(cls_tokens, dtype=np.float32)[:, None, :]  # [N, 1, D]
+    return np.concatenate([grouped, cls], axis=1)
+
+
 class PALPooler:
     """Pseudo-Attention Label Pooler.
 
@@ -143,6 +163,7 @@ class PALPooler:
         self,
         patches: np.ndarray,
         labels: np.ndarray,
+        cls_tokens: Optional[np.ndarray] = None,
         initial_support: Optional[np.ndarray] = None,
         initial_pca: Optional[PCA] = None,
     ) -> "PALPooler":
@@ -159,6 +180,10 @@ class PALPooler:
             Raw patch embeddings for the training set.
         labels : np.ndarray, shape [N]
             Integer class labels.
+        cls_tokens : np.ndarray or None, shape [N, D]
+            Per-image CLS tokens.  When provided the CLS token is appended to
+            the grouped patch tensor as one extra (ungrouped) patch before
+            Ridge fitting and pooling.  Not affected by ``patch_group_size``.
         initial_support : np.ndarray or None
             Pre-built support (in the PCA-projected space of the previous
             stage) to use instead of the mean-pool baseline.  Pass
@@ -177,13 +202,19 @@ class PALPooler:
         self.embed_dim_ = D
 
         grouped = group_patches(patches, self.refinement_cfg.patch_group_sizes)  # [N, P', D]
+        grouped = _append_cls(grouped, cls_tokens)                               # [N, P'+1, D] or unchanged
         self.n_patches_grouped_ = grouped.shape[1]
 
         if initial_support is not None:
             support = initial_support
             current_pca = initial_pca
         else:
-            support_raw = patches.mean(axis=1)  # [N, D]
+            # ── Initial mean pool ─────────────────────────────────────────────
+            # By default the CLS token (if present) is included in the average.
+            # To pool spatial patches only, replace `grouped` with:
+            #   spatial = group_patches(patches, self.refinement_cfg.patch_group_sizes)
+            #   support_raw = spatial.mean(axis=1)
+            support_raw = grouped.mean(axis=1)  # [N, D]
             if self.pca_dim is not None:
                 n_comp = min(self.pca_dim, N, D)
                 current_pca = PCA(n_components=n_comp, random_state=self.seed)
@@ -232,16 +263,20 @@ class PALPooler:
     def transform(
         self,
         patches: np.ndarray,
+        cls_tokens: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Pool patches using the fitted Ridge model.
 
-        Groups patches spatially at ``patch_group_size``, computes softmax
-        pooling weights from the Ridge model, and returns the weighted sum
-        in the original DINO feature space.
+        Groups patches spatially at ``patch_group_size``, optionally appends
+        the CLS token, computes softmax pooling weights from the Ridge model,
+        and returns the weighted sum in the original DINO feature space.
 
         Parameters
         ----------
         patches : np.ndarray, shape [N, P, D]
+        cls_tokens : np.ndarray or None, shape [N, D]
+            Per-image CLS tokens.  Must be provided at transform time if they
+            were provided at fit time (the Ridge model was trained with them).
 
         Returns
         -------
@@ -253,32 +288,35 @@ class PALPooler:
         self._check_fitted()
         patches = np.asarray(patches, dtype=np.float32)
         grouped = group_patches(patches, self.refinement_cfg.patch_group_sizes)      # [N, P', D]
-        weights = _ridge_pool_weights(grouped, self.ridge_model_, self.feature_scaler_)  # [N, P']
+        grouped = _append_cls(grouped, cls_tokens)                                   # [N, P'+1, D] or unchanged
+        weights = _ridge_pool_weights(grouped, self.ridge_model_, self.feature_scaler_)  # [N, P'(+1)]
         return (weights[:, :, None] * grouped).sum(axis=1)           # [N, D]
 
     def fit_transform(
         self,
         patches: np.ndarray,
         labels: np.ndarray,
+        cls_tokens: Optional[np.ndarray] = None,
         initial_support: Optional[np.ndarray] = None,
         initial_pca: Optional[PCA] = None,
     ) -> np.ndarray:
         """Fit and transform in one call.
 
-        Equivalent to ``fit(...).transform(patches)``.  Returns ``[N, D]``
-        raw pooled embeddings in the original DINO feature space.
+        Equivalent to ``fit(...).transform(patches, cls_tokens)``.  Returns
+        ``[N, D]`` raw pooled embeddings in the original DINO feature space.
 
         Parameters
         ----------
         patches : np.ndarray, shape [N, P, D]
         labels : np.ndarray, shape [N]
+        cls_tokens : np.ndarray or None, shape [N, D]
         initial_support, initial_pca : optional, see ``fit``
 
         Returns
         -------
         np.ndarray, shape [N, D]
         """
-        return self.fit(patches, labels, initial_support, initial_pca).transform(patches)
+        return self.fit(patches, labels, cls_tokens, initial_support, initial_pca).transform(patches, cls_tokens)
 
     # ------------------------------------------------------------------
     # Visualisation support
@@ -287,34 +325,43 @@ class PALPooler:
     def patch_weights(
         self,
         patches: np.ndarray,
+        cls_tokens: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Per-patch Ridge softmax weights.
 
         Useful for heatmap overlays: the returned array directly describes
-        how much each (grouped) patch contributes to the pooled embedding.
+        how much each (grouped) patch (and the CLS token, if present)
+        contributes to the pooled embedding.
 
         Parameters
         ----------
         patches : np.ndarray, shape [N, P, D] or [P, D]
+        cls_tokens : np.ndarray or None, shape [N, D] or [D] for a single image
 
         Returns
         -------
-        np.ndarray, shape [N, P'] or [P']
-            Softmax weights summing to 1 per image.  ``P'`` is the number of
-            patch groups (``P / patch_group_size``).
+        np.ndarray, shape [N, P'(+1)] or [P'(+1)]
+            Softmax weights summing to 1 per image.  The last entry is the
+            CLS-token weight when *cls_tokens* is provided.
         """
         self._check_fitted()
         single = patches.ndim == 2
         if single:
             patches = patches[None]
+            if cls_tokens is not None:
+                cls_tokens = np.asarray(cls_tokens, dtype=np.float32)
+                if cls_tokens.ndim == 1:
+                    cls_tokens = cls_tokens[None]   # [1, D]
         patches = np.asarray(patches, dtype=np.float32)
         grouped = group_patches(patches, self.refinement_cfg.patch_group_sizes)
+        grouped = _append_cls(grouped, cls_tokens)
         weights = _ridge_pool_weights(grouped, self.ridge_model_, self.feature_scaler_)
         return weights[0] if single else weights
 
     def patch_quality_logits(
         self,
         patches: np.ndarray,
+        cls_tokens: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Raw Ridge quality predictions before softmax normalisation.
 
@@ -326,19 +373,26 @@ class PALPooler:
         Parameters
         ----------
         patches : np.ndarray, shape [N, P, D] or [P, D]
+        cls_tokens : np.ndarray or None, shape [N, D] or [D] for a single image
 
         Returns
         -------
-        np.ndarray, shape [N, P'] or [P']
-            Raw Ridge logits before softmax.
+        np.ndarray, shape [N, P'(+1)] or [P'(+1)]
+            Raw Ridge logits before softmax.  The last entry is the CLS-token
+            logit when *cls_tokens* is provided.
         """
         self._check_fitted()
         single = patches.ndim == 2
         if single:
             patches = patches[None]
+            if cls_tokens is not None:
+                cls_tokens = np.asarray(cls_tokens, dtype=np.float32)
+                if cls_tokens.ndim == 1:
+                    cls_tokens = cls_tokens[None]   # [1, D]
         patches = np.asarray(patches, dtype=np.float32)
         N, P, D = patches.shape
         grouped = group_patches(patches, self.refinement_cfg.patch_group_sizes)   # [N, P', D]
+        grouped = _append_cls(grouped, cls_tokens)                                # [N, P'+1, D] or unchanged
         _, P_prime, _ = grouped.shape
         flat = grouped.reshape(N * P_prime, D)
         if self.feature_scaler_ is not None:
@@ -351,6 +405,7 @@ class PALPooler:
         query_patches: np.ndarray,
         query_labels: np.ndarray,
         n_estimators: Optional[int] = None,
+        query_cls_tokens: Optional[np.ndarray] = None,
     ) -> tuple[float, float]:
         """Evaluate test-set accuracy and AUROC using the fitted support.
 
@@ -368,6 +423,9 @@ class PALPooler:
         query_labels : np.ndarray, shape [N_test]
         n_estimators : int or None
             TabICL ensemble size.  Defaults to ``self.tabicl.n_estimators``.
+        query_cls_tokens : np.ndarray or None, shape [N_test, D]
+            CLS tokens for the query set.  Required when the model was fitted
+            with ``cls_tokens``.
 
         Returns
         -------
@@ -379,7 +437,7 @@ class PALPooler:
 
         self._check_fitted()
         n_est = n_estimators or getattr(self.tabicl, "n_estimators", 1)
-        query_raw = self.transform(query_patches)  # [N, D]
+        query_raw = self.transform(query_patches, cls_tokens=query_cls_tokens)  # [N, D]
         if self._pca_ is not None:
             query_features = self._pca_.transform(query_raw).astype(np.float32)
         else:
@@ -502,6 +560,7 @@ class IterativePALPooler:
         self,
         patches: np.ndarray,
         labels: np.ndarray,
+        cls_tokens: Optional[np.ndarray] = None,
         stage_callback: Optional[Callable] = None,
     ) -> "IterativePALPooler":
         """Fit all stages sequentially, passing the refined support forward.
@@ -512,6 +571,10 @@ class IterativePALPooler:
             Raw patch embeddings for the training set.
         labels : np.ndarray, shape [N]
             Integer class labels.
+        cls_tokens : np.ndarray or None, shape [N, D]
+            Per-image CLS tokens.  When provided the CLS token is appended to
+            the grouped patch tensor as one extra (ungrouped) patch at every
+            stage.  The same tokens are forwarded unchanged to each stage.
         stage_callback : callable or None
             Optional hook called after each stage is fitted.  Signature::
 
@@ -527,7 +590,7 @@ class IterativePALPooler:
             ``pre_refine_support`` / ``pre_refine_pca`` are the support and PCA
             *before* this stage's refinement (i.e. the input to the stage).
             ``train_grouped`` is the spatially-grouped training patch tensor
-            ``[N, P', D]`` used internally by this stage.
+            ``[N, P', D]`` used internally by this stage (CLS token excluded).
 
         Returns
         -------
@@ -546,7 +609,14 @@ class IterativePALPooler:
         # receives it as pre_refine_support rather than None.
         patches = np.asarray(patches, dtype=np.float32)
         N, _P, D = patches.shape
-        support_raw = patches.mean(axis=1)  # [N, D]
+        if cls_tokens is not None:
+            cls_tokens = np.asarray(cls_tokens, dtype=np.float32)
+            # Include CLS token in initial mean pool alongside spatial patches.
+            # To exclude CLS from the initial mean pool, replace this with:
+            #   support_raw = patches.mean(axis=1)
+            support_raw = np.concatenate([patches, cls_tokens[:, None, :]], axis=1).mean(axis=1)
+        else:
+            support_raw = patches.mean(axis=1)  # [N, D]
         if self.pca_dim is not None:
             n_comp = min(self.pca_dim, N, D)
             initial_pca: Optional[PCA] = PCA(n_components=n_comp, random_state=self.seed)
@@ -571,8 +641,8 @@ class IterativePALPooler:
             pre_refine_support = initial_support
             pre_refine_pca = initial_pca
 
-            # Compute grouped patches here so the callback receives them without
-            # requiring a second call inside PALPooler (minor duplication accepted).
+            # Compute grouped patches here (spatial only, without CLS) so the
+            # callback receives them for visualisation purposes.
             train_grouped = group_patches(patches, group_size)  # [N, P', D]
 
             stage = PALPooler(
@@ -581,7 +651,8 @@ class IterativePALPooler:
                 seed=self.seed,
                 gpu_ridge_device=self.gpu_ridge_device,
             )
-            stage.fit(patches, labels, initial_support=initial_support, initial_pca=initial_pca)
+            stage.fit(patches, labels, cls_tokens=cls_tokens,
+                      initial_support=initial_support, initial_pca=initial_pca)
             stages.append(stage)
 
             if stage_callback is not None:
@@ -601,12 +672,17 @@ class IterativePALPooler:
         self.stages_ = stages
         return self
 
-    def transform(self, patches: np.ndarray) -> np.ndarray:
+    def transform(
+        self,
+        patches: np.ndarray,
+        cls_tokens: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """Pool patches using the final fitted stage.
 
         Parameters
         ----------
         patches : np.ndarray, shape [N, P, D]
+        cls_tokens : np.ndarray or None, shape [N, D]
 
         Returns
         -------
@@ -614,12 +690,13 @@ class IterativePALPooler:
             Quality-weighted pooled embeddings in the original DINO feature space.
         """
         self._check_fitted()
-        return self.stages_[-1].transform(patches)
+        return self.stages_[-1].transform(patches, cls_tokens=cls_tokens)
 
     def fit_transform(
         self,
         patches: np.ndarray,
         labels: np.ndarray,
+        cls_tokens: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Fit all stages then transform *patches* with the final stage.
 
@@ -627,7 +704,7 @@ class IterativePALPooler:
         -------
         np.ndarray, shape [N, D]
         """
-        return self.fit(patches, labels).transform(patches)
+        return self.fit(patches, labels, cls_tokens=cls_tokens).transform(patches, cls_tokens=cls_tokens)
 
     # ------------------------------------------------------------------
     # Convenience delegations to final stage
@@ -644,28 +721,40 @@ class IterativePALPooler:
         self._check_fitted()
         return self.stages_[-1].support_labels_
 
-    def patch_weights(self, patches: np.ndarray) -> np.ndarray:
+    def patch_weights(
+        self,
+        patches: np.ndarray,
+        cls_tokens: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """Per-patch Ridge softmax weights from the final stage."""
         self._check_fitted()
-        return self.stages_[-1].patch_weights(patches)
+        return self.stages_[-1].patch_weights(patches, cls_tokens=cls_tokens)
 
-    def patch_quality_logits(self, patches: np.ndarray) -> np.ndarray:
+    def patch_quality_logits(
+        self,
+        patches: np.ndarray,
+        cls_tokens: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """Raw Ridge quality logits from the final stage."""
         self._check_fitted()
-        return self.stages_[-1].patch_quality_logits(patches)
+        return self.stages_[-1].patch_quality_logits(patches, cls_tokens=cls_tokens)
 
     def score_tabicl(
         self,
         query_patches: np.ndarray,
         query_labels: np.ndarray,
         n_estimators: Optional[int] = None,
+        query_cls_tokens: Optional[np.ndarray] = None,
     ) -> tuple[float, float]:
         """Evaluate accuracy and AUROC using the final stage's support.
 
         See :meth:`PALPooler.score_tabicl` for full documentation.
         """
         self._check_fitted()
-        return self.stages_[-1].score_tabicl(query_patches, query_labels, n_estimators)
+        return self.stages_[-1].score_tabicl(
+            query_patches, query_labels, n_estimators,
+            query_cls_tokens=query_cls_tokens,
+        )
 
     # ------------------------------------------------------------------
     # Persistence
