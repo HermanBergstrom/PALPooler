@@ -198,6 +198,17 @@ def compute_patch_pooling_weights(
         Requires *class_prior* (empirical class frequencies, shape [n_classes]).
         Note: *true_label* is not used by this method.
 
+    ``"tvd"``
+        1. Compute the Total Variation Distance (TVD) between Q_i and P_prior
+           for each patch: TVD = 0.5 * Σ_k |Q_i(k) - P_prior(k)|.
+           High TVD → discriminative.
+        2. TVD is naturally bounded in [0, 1]. score_i = TVD_i.
+        3. Apply log to get a logit: logit_i = ln(score_i)  (in (-∞, 0]).
+        4. Apply temperature-scaled softmax across patches  →  weights w_i.
+
+        Requires *class_prior* (empirical class frequencies, shape [n_classes]).
+        Note: *true_label* is not used by this method.
+
     ``"js_div"``
         1. Compute the Jensen-Shannon divergence JSD(Q_i || P_prior) for each
            patch: JSD = 0.5·KL(Q||M) + 0.5·KL(P||M) where M = (Q + P) / 2.
@@ -254,6 +265,21 @@ def compute_patch_pooling_weights(
         weights /= weights.sum()
         return weights.astype(np.float32)
 
+    if weight_method == "tvd":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='tvd'")
+        prior = np.asarray(class_prior, dtype=np.float64).clip(1e-9, 1.0)
+        prior /= prior.sum()
+        q = patch_probs.astype(np.float64)                         # [P, n_classes]
+        tvd = 0.5 * np.abs(q - prior[None, :]).sum(axis=1)         # [P] TVD
+        scores = tvd.clip(1e-7, 1.0)                               # [P] bounds
+        logits = np.log(scores)                                    # [P] in (-inf, 0]
+        logits_scaled = logits / temperature
+        logits_scaled -= logits_scaled.max()                       # numerical stability
+        weights = np.exp(logits_scaled)
+        weights /= weights.sum()
+        return weights.astype(np.float32)
+
     if weight_method == "js_div":
         if class_prior is None:
             raise ValueError("class_prior must be provided for weight_method='js_div'")
@@ -303,6 +329,8 @@ def compute_patch_quality_logits(
                                Requires *class_prior* [n_classes].
     ``"wasserstein"``        → log(W1(Q, P_prior) / (C-1)) / temperature
                                Requires *class_prior* [n_classes].
+    ``"tvd"``                → log(TVD(Q, P_prior)) / temperature
+                               Requires *class_prior* [n_classes].
     ``"js_div"``             → log(JSD(Q, P_prior) / ln2) / temperature
                                Requires *class_prior* [n_classes].
     """
@@ -336,6 +364,16 @@ def compute_patch_quality_logits(
         scores = (w1 / (n_classes - 1)).clip(1e-7, 1.0)               # [P] normalised to (0, 1]
         return (np.log(scores) / temperature).astype(np.float32)
 
+    if weight_method == "tvd":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='tvd'")
+        prior = np.asarray(class_prior, dtype=np.float64).clip(1e-9, 1.0)
+        prior /= prior.sum()
+        q = patch_probs.astype(np.float64)                             # [P, n_classes]
+        tvd = 0.5 * np.abs(q - prior[None, :]).sum(axis=1)             # [P] TVD
+        scores = tvd.clip(1e-7, 1.0)                                   # [P] bounds
+        return (np.log(scores) / temperature).astype(np.float32)
+
     if weight_method == "js_div":
         if class_prior is None:
             raise ValueError("class_prior must be provided for weight_method='js_div'")
@@ -365,7 +403,7 @@ def compute_patch_quality_logits_gpu(
     Accepts and returns ``torch.Tensor`` objects on the same device as
     *patch_probs*.  All operations mirror the numpy version exactly.
     Requires *class_prior* to be a tensor on the same device for the
-    ``kl_div``, ``wasserstein``, and ``js_div`` methods.
+    ``kl_div``, ``wasserstein``, ``js_div``, and ``tvd`` methods.
     """
     import torch
 
@@ -401,6 +439,16 @@ def compute_patch_quality_logits_gpu(
         w1 = (cdf_q - cdf_p.unsqueeze(0)).abs().sum(dim=1)             # [P]
         C = patch_probs.shape[1]
         scores = (w1 / (C - 1)).clamp(eps_clip, 1.0)
+        return (scores.log() / temperature).float()
+
+    if weight_method == "tvd":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='tvd'")
+        prior = class_prior.double().clamp(eps_prob, 1.0)
+        prior = prior / prior.sum()
+        q = patch_probs.double()
+        tvd = 0.5 * (q - prior.unsqueeze(0)).abs().sum(dim=1)          # [P]
+        scores = tvd.clamp(eps_clip, 1.0)
         return (scores.log() / temperature).float()
 
     if weight_method == "js_div":
@@ -601,8 +649,8 @@ def refine_dataset_features(
     t_start = time.perf_counter()
     N, P, D = train_patches.shape
 
-    # Precompute empirical class prior (used by kl_div, wasserstein and js_div weight methods).
-    if refinement_cfg.weight_method in ("kl_div", "wasserstein", "js_div"):
+    # Precompute empirical class prior (used by kl_div, wasserstein, js_div, and tvd weight methods).
+    if refinement_cfg.weight_method in ("kl_div", "wasserstein", "js_div", "tvd"):
         n_cls_local = int(train_labels.max()) + 1
         counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls_local)
         class_prior: Optional[np.ndarray] = (counts / counts.sum()).astype(np.float32)

@@ -67,9 +67,9 @@ def visualise_image(
 ) -> plt.Figure:
     """Figure with overlay panels showing per-patch softmax quality scores.
 
-    Panels: original | P(true) | ccp weights | entropy weights | kl_div weights | wasserstein weights | js_div weights
+    Panels: original | P(true) | ccp weights | entropy weights | kl_div weights | wasserstein weights | js_div weights | tvd weights
             [+ Ridge weights when ridge_pred_logits is provided]
-    kl_div, wasserstein, and js_div panels are only shown when class_prior is provided.
+    kl_div, wasserstein, js_div, and tvd panels are only shown when class_prior is provided.
     The panel corresponding to weight_method is marked with ★ in its title.
     """
     P      = len(patch_probs)
@@ -96,9 +96,9 @@ def visualise_image(
     def _dist_panels(dist: np.ndarray, label: str) -> list[tuple[str, Optional[np.ndarray], dict]]:
         """Build overlay panels for a [P, n_classes] distribution.
 
-        Panels: original | P(true) | ccp weights | entropy weights | kl_div weights | wasserstein weights | js_div weights.
+        Panels: original | P(true) | ccp weights | entropy weights | kl_div weights | wasserstein weights | js_div weights | tvd weights.
         The panel whose method matches weight_method is marked with ★.
-        kl_div, wasserstein, and js_div panels are shown when class_prior is provided.
+        kl_div, wasserstein, js_div, and tvd panels are shown when class_prior is provided.
         """
         p_true    = dist[:, true_label]
         w_ccp     = compute_patch_pooling_weights(dist, true_label, temperature, "correct_class_prob")
@@ -128,6 +128,11 @@ def visualise_image(
             )
             panels.append((_mark("JS-div weights", "js_div"),
                            w_js, {"vmin": w_js.min(), "vmax": w_js.max()}))
+            w_tvd = compute_patch_pooling_weights(
+                dist, true_label, temperature, "tvd", class_prior
+            )
+            panels.append((_mark("TVD weights", "tvd"),
+                           w_tvd, {"vmin": w_tvd.min(), "vmax": w_tvd.max()}))
         if show_pred_label:
             pred_vals = dist.argmax(axis=1).astype(float)
             class_names = [idx_to_class[i] for i in range(n_classes)]

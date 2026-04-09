@@ -111,7 +111,7 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--batch-size",     type=int,   default=1000,
                    help="Number of images per TabICL call during refinement")
     p.add_argument("--weight-method",  type=str,   default="correct_class_prob",
-                   choices=["correct_class_prob", "entropy", "kl_div", "wasserstein", "js_div"],
+                   choices=["correct_class_prob", "entropy", "kl_div", "wasserstein", "js_div", "tvd"],
                    help="How to derive patch pooling weights from TabICL probabilities.")
     p.add_argument("--ridge-alpha",  type=float, nargs="+",  default=[1.0],
                    help="Regularisation strength for the Ridge quality model.")

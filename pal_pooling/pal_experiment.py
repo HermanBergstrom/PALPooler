@@ -166,19 +166,35 @@ def _run_visual_eval(
         split_out_dir = output_dir / tag / split_name
         split_out_dir.mkdir(parents=True, exist_ok=True)
 
+        if len(sample_idx) == 0:
+            mean_probs[split_name] = 0.0
+            continue
+
+        # --- Batch forward pass for plotting speed ---
+        sampled_patches = patches_all[sample_idx]  # [N_s, P, D]
+        N_s, P_dim, D_dim = sampled_patches.shape
+        flat_query = sampled_patches.reshape(N_s * P_dim, D_dim)
+        if pca is not None:
+            flat_query = pca.transform(flat_query)
+
+        probs_all = clf.predict_proba(flat_query)
+        probs_all = probs_all.reshape(N_s, P_dim, n_classes)
+
+        ridge_pred_logits_all = None
+        if ridge_model is not None:
+            ridge_pred_logits_all = _ridge_pool_weights(
+                sampled_patches, ridge_model, feature_scaler
+            )
+        # ---------------------------------------------
+
         results: list[dict] = []
         bar = tqdm(enumerate(sample_idx), total=len(sample_idx),
                    desc=f"[{tag}] {split_name}", unit="img")
         for i, img_idx in bar:
-            patches_i  = patches_all[img_idx]       # [P, D]
             true_label = int(labels_all[img_idx])
             class_name = idx_to_class[true_label]
 
-            query_features: np.ndarray = (
-                pca.transform(patches_i) if pca is not None else patches_i
-            )
-
-            probs = clf.predict_proba(query_features)   # [P, n_classes]
+            probs = probs_all[i]   # [P, n_classes]
 
             correct_probs     = probs[:, true_label]
             mean_correct_prob = float(correct_probs.mean())
@@ -197,11 +213,7 @@ def _run_visual_eval(
                      mean_correct_prob=mean_correct_prob)
             )
 
-            ridge_pred_logits = None
-            if ridge_model is not None:
-                ridge_pred_logits = _ridge_pool_weights(
-                    patches_i[None], ridge_model, feature_scaler
-                )[0]   # [P]
+            ridge_pred_logits = ridge_pred_logits_all[i] if ridge_pred_logits_all is not None else None
 
             _opener = open_image or (lambda p: Image.open(p).convert("RGB"))
             img = _opener(image_paths[img_idx])
