@@ -244,6 +244,7 @@ def _get_dvm_image_paths(
 
     train_loader, val_loader, test_loader, _ = load_dvm_dataset(
         feature_source="dinov3_local",
+        feature_dir="/scratch/hermanb/temp_datasets/extracted_features/dvm/dvm_dinov3_local_features",
         use_patches=False,
         use_images=False,
         num_workers=0,
@@ -410,6 +411,7 @@ def _load_features(
         from petfinder_dataset_with_dinov3 import load_petfinder_dataset  # type: ignore
 
         train_loader, val_loader, test_loader, metadata = load_petfinder_dataset(
+            feature_dir="/scratch/hermanb/temp_datasets/extracted_features/dvm/dvm_dinov3_local_features",
             feature_source="dinov3_local",
             use_patches=True,
             use_images=True,
@@ -455,6 +457,7 @@ def _load_features(
         from dvm_dataset_with_dinov3 import load_dvm_dataset
 
         train_loader, val_loader, test_loader, metadata = load_dvm_dataset(
+            feature_dir="/scratch/hermanb/temp_datasets/extracted_features/dvm/dvm_dinov3_local_features",
             feature_source="dinov3_local",
             use_patches=True,
             use_images=True,
@@ -466,7 +469,7 @@ def _load_features(
         val_ds   = val_loader.dataset
         test_ds  = test_loader.dataset
 
-        def get_dvm_subset(ds_list, n_limit):
+        def get_dvm_subset(ds_list, n_limit, desc="Loading DVM"):
             # Combine multiple datasets (like train + val)
             lengths = [len(ds) for ds in ds_list]
             total_n = sum(lengths)
@@ -478,8 +481,9 @@ def _load_features(
             else:
                 sub_idx = np.arange(total_n)
             
+            from tqdm import tqdm
             patches, cls_emb, labels = [], [], []
-            for i in sub_idx:
+            for i in tqdm(sub_idx, desc=desc):
                 # Find which dataset this index belongs to
                 offset = 0
                 ds_idx = i
@@ -495,10 +499,14 @@ def _load_features(
             return np.stack(patches, axis=0), np.stack(cls_emb, axis=0), np.array(labels, dtype=np.int64), sub_idx
 
         # We merge train + val for support set, similar to Petfinder
-        train_patches, cls_train, train_labels, train_sub_idx = get_dvm_subset([train_ds, val_ds], n_train)
+        train_patches, cls_train, train_labels, train_sub_idx = get_dvm_subset(
+            [train_ds, val_ds], n_train, desc="Loading DVM (train+val)"
+        )
 
         # Test set
-        test_patches, cls_test, test_labels, test_sub_idx = get_dvm_subset([test_ds], dataset_cfg.n_test)
+        test_patches, cls_test, test_labels, test_sub_idx = get_dvm_subset(
+            [test_ds], dataset_cfg.n_test, desc="Loading DVM (test)"
+        )
 
         target_encoder = metadata["target_encoder"]
         idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
