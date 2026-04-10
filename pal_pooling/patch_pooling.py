@@ -576,6 +576,7 @@ def refine_dataset_features(
     gpu_ridge_device:      str                 = "cuda",
     #Optional tabicl classifier
     tabicl: Optional[TabICLClassifier] = None,
+    context_features:   Optional[np.ndarray] = None,  # [N, D_context]  per-image side features
 ) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Union[Ridge, "RidgeGPU"], Optional[StandardScaler], TabICLClassifier, float, float]:
     """Refine mean-pooled support features with Ridge-predicted quality-weighted pooling.
 
@@ -680,13 +681,20 @@ def refine_dataset_features(
             return "entropy"
         return refinement_cfg.weight_method
 
-    # Fit one shared classifier (support set is fixed for all queries this stage)
+    # Fit one shared classifier (support set is fixed for all queries this stage).
+    # When context_features are provided, append them to support and to every query
+    # so the scoring is context-aware.  The Ridge model still only sees raw DINO.
     if tabicl is not None:
         clf = tabicl
     else:
         clf = TabICLClassifier(n_estimators=refinement_cfg.tabicl_n_estimators, random_state=seed)
-        
-    clf.fit(support_features, train_labels)
+
+    support_for_clf = support_features
+    if context_features is not None:
+        support_for_clf = np.concatenate(
+            [support_features, context_features.astype(np.float32)], axis=1
+        )
+    clf.fit(support_for_clf, train_labels)
 
     # GPU path: skip D2H/H2D round-trip for probs and quality-logit targets.
     use_gpu = isinstance(clf, TabICLGPUAdapter)
@@ -718,13 +726,25 @@ def refine_dataset_features(
             patch_idx_all = sampled_flat % P
             query_raw     = active_patches[local_img_idx, patch_idx_all].astype(np.float32)
             img_boundaries = np.searchsorted(local_img_idx, np.arange(N_active + 1))
+            # Each sampled row belongs to active image local_img_idx[i].
+            ctx_for_queries = (
+                context_features[active_indices][local_img_idx].astype(np.float32)
+                if context_features is not None else None
+            )
         else:
             # All active rows in one pass; sequential layout matches reshape order
             n_fwd          = active_total_rows
             query_raw      = active_patches.reshape(active_total_rows, D).astype(np.float32)
             img_boundaries = np.arange(N_active + 1) * P     # [0, P, 2P, ..., N_active*P]
+            # Repeat each active image's context P times to align with the flat patch layout.
+            ctx_for_queries = (
+                np.repeat(context_features[active_indices].astype(np.float32), P, axis=0)
+                if context_features is not None else None
+            )
 
         query_features = pca.transform(query_raw) if pca is not None else query_raw
+        if ctx_for_queries is not None:
+            query_features = np.concatenate([query_features, ctx_for_queries], axis=1)
         all_features   = query_raw
 
         if use_gpu:
@@ -782,6 +802,15 @@ def refine_dataset_features(
             B_a = len(batch_patches_arr)
             query_raw      = batch_patches_arr.reshape(B_a * P, D)
             query_features = pca.transform(query_raw) if pca is not None else query_raw
+            if context_features is not None:
+                # Gather the context for this batch's images and repeat P times per image.
+                if aoe_mask is not None and refinement_cfg.aoe_handling == "filter":
+                    batch_ctx = context_features[active_in_batch].astype(np.float32)
+                else:
+                    batch_ctx = context_features[batch_start:batch_end].astype(np.float32)
+                query_features = np.concatenate(
+                    [query_features, np.repeat(batch_ctx, P, axis=0)], axis=1
+                )
             base           = row_ptr * P
 
             if use_gpu:

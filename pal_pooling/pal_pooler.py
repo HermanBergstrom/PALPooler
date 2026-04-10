@@ -166,6 +166,7 @@ class PALPooler:
         cls_tokens: Optional[np.ndarray] = None,
         initial_support: Optional[np.ndarray] = None,
         initial_pca: Optional[PCA] = None,
+        context_features: Optional[np.ndarray] = None,
     ) -> "PALPooler":
         """Fit the Ridge quality model.
 
@@ -191,6 +192,12 @@ class PALPooler:
         initial_pca : PCA or None
             PCA corresponding to *initial_support*.  Pass
             ``prev_stage._pca_`` when chaining stages manually.
+        context_features : np.ndarray or None, shape [N, D_context]
+            Optional per-image side features (e.g. tabular) that are appended
+            to both support rows and per-patch query rows before the TabICL
+            scoring step.  They inform the quality scores but are never used
+            as Ridge inputs — pooling weights are still derived from raw DINO
+            features alone.
 
         Returns
         -------
@@ -236,8 +243,9 @@ class PALPooler:
             seed=self.seed,
             aoe_mask=aoe_mask,
             gpu_ridge_device=self.gpu_ridge_device,
-            tabicl = self.tabicl,
+            tabicl=self.tabicl,
             refinement_cfg=self.refinement_cfg,
+            context_features=context_features,
         )
 
         # Derive raw (pre-PCA) support in the original D-dimensional DINO space.
@@ -562,6 +570,7 @@ class IterativePALPooler:
         labels: np.ndarray,
         cls_tokens: Optional[np.ndarray] = None,
         stage_callback: Optional[Callable] = None,
+        context_features: Optional[np.ndarray] = None,
     ) -> "IterativePALPooler":
         """Fit all stages sequentially, passing the refined support forward.
 
@@ -575,6 +584,9 @@ class IterativePALPooler:
             Per-image CLS tokens.  When provided the CLS token is appended to
             the grouped patch tensor as one extra (ungrouped) patch at every
             stage.  The same tokens are forwarded unchanged to each stage.
+        context_features : np.ndarray or None, shape [N, D_context]
+            Optional per-image side features (e.g. tabular) forwarded unchanged
+            to every stage.  See :meth:`PALPooler.fit` for semantics.
         stage_callback : callable or None
             Optional hook called after each stage is fitted.  Signature::
 
@@ -652,7 +664,8 @@ class IterativePALPooler:
                 gpu_ridge_device=self.gpu_ridge_device,
             )
             stage.fit(patches, labels, cls_tokens=cls_tokens,
-                      initial_support=initial_support, initial_pca=initial_pca)
+                      initial_support=initial_support, initial_pca=initial_pca,
+                      context_features=context_features)
             stages.append(stage)
 
             if stage_callback is not None:
@@ -697,6 +710,7 @@ class IterativePALPooler:
         patches: np.ndarray,
         labels: np.ndarray,
         cls_tokens: Optional[np.ndarray] = None,
+        context_features: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Fit all stages then transform *patches* with the final stage.
 
@@ -704,7 +718,8 @@ class IterativePALPooler:
         -------
         np.ndarray, shape [N, D]
         """
-        return self.fit(patches, labels, cls_tokens=cls_tokens).transform(patches, cls_tokens=cls_tokens)
+        return self.fit(patches, labels, cls_tokens=cls_tokens,
+                        context_features=context_features).transform(patches, cls_tokens=cls_tokens)
 
     # ------------------------------------------------------------------
     # Convenience delegations to final stage

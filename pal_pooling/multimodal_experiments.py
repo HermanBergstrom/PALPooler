@@ -333,6 +333,37 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
           _concat_tabular(pal_train_proj, tab_train),
           _concat_tabular(pal_test_proj,  tab_test))
 
+    # ── Context-aware PALPool: fit with tabular as scoring context ───────────
+    # The pooler sees tabular features during TabICL scoring (quality targets are
+    # tabular-informed), but the Ridge model and pooling weights are still DINO-only.
+    print("\n--- Fitting IterativePALPooler (tabular context) ---")
+    pooler_ctx = pooler_factory(refinement_cfg=refinement_cfg, seed=args.seed)
+    t_fit_ctx = time.perf_counter()
+    pooler_ctx.fit(train_patches, train_labels, context_features=tab_train)
+    fit_time_ctx_s = time.perf_counter() - t_fit_ctx
+    print(f"[pal_ctx] Pooler fit in {fit_time_ctx_s:.1f}s")
+
+    pal_ctx_train_raw = pooler_ctx.transform(train_patches)
+    pal_ctx_test_raw  = pooler_ctx.transform(test_patches)
+
+    final_stage_ctx = pooler_ctx.stages_[-1]
+    pal_ctx_pca = final_stage_ctx._pca_
+
+    if pal_ctx_pca is not None:
+        pal_ctx_train_proj = pal_ctx_pca.transform(pal_ctx_train_raw).astype(np.float32)
+        pal_ctx_test_proj  = pal_ctx_pca.transform(pal_ctx_test_raw).astype(np.float32)
+    else:
+        pal_ctx_train_proj = pal_ctx_train_raw.astype(np.float32)
+        pal_ctx_test_proj  = pal_ctx_test_raw.astype(np.float32)
+
+    print("\n--- pal_context_img ---")
+    _eval("pal_context_img", pal_ctx_train_proj, pal_ctx_test_proj)
+
+    print("\n--- pal_context_img+tab ---")
+    _eval("pal_context_img+tab",
+          _concat_tabular(pal_ctx_train_proj, tab_train),
+          _concat_tabular(pal_ctx_test_proj,  tab_test))
+
     # ── Save results ─────────────────────────────────────────────────────────
     total_time_s = time.perf_counter() - t_start
     record = {
