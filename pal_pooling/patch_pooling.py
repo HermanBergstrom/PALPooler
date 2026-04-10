@@ -670,7 +670,13 @@ def refine_dataset_features(
         print("[multimodal] Computing tabular-only P(Y|X_tab) for per-image prior ...")
         _clf_tab = TabICLClassifier(n_estimators=refinement_cfg.tabicl_n_estimators, random_state=seed)
         _clf_tab.fit(context_features, train_labels)
-        tabular_probs = _clf_tab.predict_proba(context_features).astype(np.float32)  # [N, n_classes]
+        raw_tab_probs = _clf_tab.predict_proba(context_features).astype(np.float32)
+        n_cls_local = int(train_labels.max()) + 1
+        if raw_tab_probs.shape[1] != n_cls_local:
+            tabular_probs = np.zeros((raw_tab_probs.shape[0], n_cls_local), dtype=np.float32)
+            tabular_probs[:, _clf_tab.classes_] = raw_tab_probs
+        else:
+            tabular_probs = raw_tab_probs
 
     # Determine which images contribute to Ridge fitting and their per-image method.
     # "filter": only non-AoE images; all use weight_method.
@@ -771,8 +777,15 @@ def refine_dataset_features(
             query_features = np.concatenate([query_features, ctx_for_queries], axis=1)
         all_features   = query_raw
 
+        n_cls_expected = int(train_labels.max()) + 1
+
         if use_gpu:
             probs_flat_t = clf.predict_proba_tensor(query_features)     # [n_fwd, n_classes] GPU
+            if n_cls_expected is not None and probs_flat_t.shape[1] != n_cls_expected:
+                cls_tensor = _torch.tensor(clf.classes_, device=probs_flat_t.device, dtype=_torch.long)
+                full_t = _torch.zeros((probs_flat_t.shape[0], n_cls_expected), dtype=probs_flat_t.dtype, device=probs_flat_t.device)
+                full_t[:, cls_tensor] = probs_flat_t
+                probs_flat_t = full_t
             all_targets_t = _torch.empty(n_fwd, dtype=_torch.float32, device=_dev)
             for idx in range(N_active):
                 start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
@@ -786,6 +799,10 @@ def refine_dataset_features(
             all_targets = all_targets_t
         else:
             probs_flat  = clf.predict_proba(query_features)             # [n_fwd, n_classes] CPU
+            if n_cls_expected is not None and probs_flat.shape[1] != n_cls_expected:
+                full = np.zeros((probs_flat.shape[0], n_cls_expected), dtype=probs_flat.dtype)
+                full[:, clf.classes_] = probs_flat
+                probs_flat = full
             all_targets = np.empty(n_fwd, dtype=np.float32)
             for idx in range(N_active):
                 start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
@@ -839,8 +856,16 @@ def refine_dataset_features(
                 )
             base           = row_ptr * P
 
+            n_cls_expected = int(train_labels.max()) + 1
+
             if use_gpu:
-                probs_t = clf.predict_proba_tensor(query_features).reshape(B_a, P, -1)  # GPU
+                probs_t = clf.predict_proba_tensor(query_features)
+                if n_cls_expected is not None and probs_t.shape[1] != n_cls_expected:
+                    cls_tensor = _torch.tensor(clf.classes_, device=probs_t.device, dtype=_torch.long)
+                    full_t = _torch.zeros((probs_t.shape[0], n_cls_expected), dtype=probs_t.dtype, device=probs_t.device)
+                    full_t[:, cls_tensor] = probs_t
+                    probs_t = full_t
+                probs_t = probs_t.reshape(B_a, P, -1)  # GPU
                 for j in range(B_a):
                     eff = ("entropy"
                            if batch_is_aoe is not None and batch_is_aoe[j]
@@ -853,7 +878,12 @@ def refine_dataset_features(
                         active_tabular_probs_t[row_ptr + j] if active_tabular_probs_t is not None else class_prior_t,
                     )
             else:
-                probs = clf.predict_proba(query_features).reshape(B_a, P, -1)           # CPU
+                probs = clf.predict_proba(query_features)
+                if n_cls_expected is not None and probs.shape[1] != n_cls_expected:
+                    full = np.zeros((probs.shape[0], n_cls_expected), dtype=probs.dtype)
+                    full[:, clf.classes_] = probs
+                    probs = full
+                probs = probs.reshape(B_a, P, -1)  # CPU
                 for j in range(B_a):
                     eff = ("entropy"
                            if batch_is_aoe is not None and batch_is_aoe[j]

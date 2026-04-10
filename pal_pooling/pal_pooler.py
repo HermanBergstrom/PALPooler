@@ -658,7 +658,13 @@ class IterativePALPooler:
                 n_estimators=self.refinement_cfg.tabicl_n_estimators, random_state=self.seed
             )
             _clf_tab.fit(context_features, labels)
-            tabular_probs = _clf_tab.predict_proba(context_features).astype(np.float32)  # [N, n_classes]
+            raw_tab_probs = _clf_tab.predict_proba(context_features).astype(np.float32)
+            n_cls_local = int(labels.max()) + 1
+            if raw_tab_probs.shape[1] != n_cls_local:
+                tabular_probs = np.zeros((raw_tab_probs.shape[0], n_cls_local), dtype=np.float32)
+                tabular_probs[:, _clf_tab.classes_] = raw_tab_probs
+            else:
+                tabular_probs = raw_tab_probs
 
         for k, group_size in enumerate(self.patch_group_sizes):
             from pal_pooling.patch_pooling import group_patches

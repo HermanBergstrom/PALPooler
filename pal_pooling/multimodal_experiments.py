@@ -42,7 +42,7 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score
 from tabicl import TabICLClassifier
 
-from pal_pooling.config import PETFINDER_DATASET_PATH, RefinementConfig
+from pal_pooling.config import DVM_DATASET_PATH, PETFINDER_DATASET_PATH, RefinementConfig
 from pal_pooling.pal_pooler import IterativePALPooler, pooler_factory
 
 
@@ -108,9 +108,12 @@ def _concat_tabular(img_features: np.ndarray, tabular: np.ndarray) -> np.ndarray
 # Data loading
 # ---------------------------------------------------------------------------
 
-def _load_petfinder(
+def _load_dataset(
+    dataset_name: str,
     dataset_path: Path,
     n_train: Optional[int],
+    max_train: Optional[int],
+    max_test: Optional[int],
     seed: int,
 ) -> tuple[
     np.ndarray, np.ndarray,   # train_patches, train_labels
@@ -119,50 +122,94 @@ def _load_petfinder(
     np.ndarray, np.ndarray,   # tab_train, tab_test
     dict,                      # idx_to_class
 ]:
-    """Load PetFinder patch, CLS, and tabular features.
+    """Load dataset patch, CLS, and tabular features.
 
-    Merges train + val splits as the support set (50% / 10% / 40% PetFinder split).
+    Merges train + val splits as the support set.
     Returns arrays in [N, P, D], [N], [N, D], [N, F] shapes.
     """
-    petfinder_dir = Path(dataset_path)
-    if str(petfinder_dir) not in sys.path:
-        sys.path.insert(0, str(petfinder_dir))
+    dataset_dir = Path(dataset_path)
+    if str(dataset_dir) not in sys.path:
+        sys.path.insert(0, str(dataset_dir))
 
-    from petfinder_dataset_with_dinov3 import load_petfinder_dataset  # type: ignore
+    if dataset_name == "petfinder":
+        from petfinder_dataset_with_dinov3 import load_petfinder_dataset  # type: ignore
 
-    train_loader, val_loader, test_loader, metadata = load_petfinder_dataset(
-        feature_source="dinov3_local",
-        use_patches=True,
-        use_images=True,
-        num_workers=0,
-    )
+        train_loader, val_loader, test_loader, metadata = load_petfinder_dataset(
+            feature_source="dinov3_local",
+            use_patches=True,
+            use_images=True,
+            num_workers=0,
+        )
+    elif dataset_name == "dvm":
+        from dvm_dataset_with_dinov3 import load_dvm_dataset  # type: ignore
+
+        train_loader, val_loader, test_loader, metadata = load_dvm_dataset(
+            feature_source="dinov3_local",
+            feature_dir="/scratch/hermanb/temp_datasets/extracted_features/dvm/dvm_dinov3_local_features",
+            use_patches=True,
+            use_images=True,
+            num_workers=0,
+            data_dir=dataset_dir
+        )
+    else:
+        raise ValueError(f"Unknown multimodal dataset: {dataset_name}")
 
     train_ds = train_loader.dataset
     val_ds   = val_loader.dataset
     test_ds  = test_loader.dataset
 
-    # Merge train + val → support set.
-    train_patches = np.concatenate([
-        train_ds.patch_embeddings.float().numpy(),
-        val_ds.patch_embeddings.float().numpy(),
-    ], axis=0)
-    train_labels = np.concatenate([
-        train_ds.targets.numpy(),
-        val_ds.targets.numpy(),
-    ], axis=0).astype(np.int64)
-    cls_train = np.concatenate([
-        train_ds.image_embeddings.float().numpy(),
-        val_ds.image_embeddings.float().numpy(),
-    ], axis=0)
-    tab_train = np.concatenate([
-        train_ds.tabular.float().numpy(),
-        val_ds.tabular.float().numpy(),
-    ], axis=0)
+    def get_subset(ds_list, n_limit=None, desc="Loading Data"):
+        lengths = [len(ds) for ds in ds_list]
+        total_n = sum(lengths)
+        
+        if n_limit is not None and n_limit < total_n:
+            rng = np.random.RandomState(seed)
+            sub_idx = rng.choice(total_n, size=n_limit, replace=False)
+            sub_idx.sort()
+        else:
+            sub_idx = np.arange(total_n)
+            
+        from tqdm import tqdm
+        patches, cls_emb, labels, tab_feat = [], [], [], []
+        if dataset_name == "petfinder":
+            for ds in ds_list:
+                patches.append(ds.patch_embeddings.float().numpy())
+                cls_emb.append(ds.image_embeddings.float().numpy())
+                labels.append(ds.targets.numpy().astype(np.int64))
+                tab_feat.append(ds.tabular.float().numpy())
+            
+            # Concat all arrays
+            all_patches = np.concatenate(patches, axis=0)
+            all_cls_emb = np.concatenate(cls_emb, axis=0)
+            all_labels = np.concatenate(labels, axis=0)
+            all_tab_feat = np.concatenate(tab_feat, axis=0)
+            
+            # Apply limit if needed
+            if n_limit is not None and n_limit < total_n:
+                all_patches = all_patches[sub_idx]
+                all_cls_emb = all_cls_emb[sub_idx]
+                all_labels = all_labels[sub_idx]
+                all_tab_feat = all_tab_feat[sub_idx]
+                
+            return all_patches, all_cls_emb, all_labels, all_tab_feat
+        else:
+            for i in tqdm(sub_idx, desc=desc):
+                offset = 0
+                ds_idx = i
+                for l, ds in zip(lengths, ds_list):
+                    if ds_idx < l:
+                        sample = ds[ds_idx]
+                        break
+                    ds_idx -= l
+                patches.append(sample["patch_embedding"].float().numpy())
+                cls_emb.append(sample["image_embedding"].float().numpy())
+                labels.append(sample["target"])
+                tab_feat.append(sample["tabular"].float().numpy())
+            return np.stack(patches, axis=0), np.stack(cls_emb, axis=0), np.array(labels, dtype=np.int64), np.stack(tab_feat, axis=0)
 
-    test_patches = test_ds.patch_embeddings.float().numpy()
-    test_labels  = test_ds.targets.numpy().astype(np.int64)
-    cls_test     = test_ds.image_embeddings.float().numpy()
-    tab_test     = test_ds.tabular.float().numpy()
+    # Merge train + val → support set.
+    train_patches, cls_train, train_labels, tab_train = get_subset([train_ds, val_ds], n_limit=max_train, desc=f"Loading {dataset_name} (train+val)")
+    test_patches, cls_test, test_labels, tab_test = get_subset([test_ds], n_limit=max_test, desc=f"Loading {dataset_name} (test)")
 
     target_encoder = metadata["target_encoder"]
     idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
@@ -178,11 +225,11 @@ def _load_petfinder(
         tab_train     = tab_train[idx]
 
     print(
-        f"[info] PetFinder (train+val): N={len(train_labels)}  "
+        f"[info] {dataset_name} (train+val): N={len(train_labels)}  "
         f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}  "
         f"tab_dim={tab_train.shape[1]}"
     )
-    print(f"[info] PetFinder (test):  N={len(test_labels)}")
+    print(f"[info] {dataset_name} (test):  N={len(test_labels)}")
     return (
         train_patches, train_labels,
         test_patches,  test_labels,
@@ -199,6 +246,10 @@ def _load_petfinder(
 def run_multimodal_experiment(args: argparse.Namespace) -> None:
     _set_global_seeds(args.seed)
 
+    dataset_path = args.dataset_path
+    if dataset_path is None:
+        dataset_path = DVM_DATASET_PATH if args.dataset == "dvm" else PETFINDER_DATASET_PATH
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     run_ts = datetime.now(timezone.utc).isoformat()
@@ -209,14 +260,17 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
      test_patches,  test_labels,
      cls_train, cls_test,
      tab_train, tab_test,
-     idx_to_class) = _load_petfinder(
-        dataset_path=args.dataset_path,
+     idx_to_class) = _load_dataset(
+        dataset_name=args.dataset,
+        dataset_path=dataset_path,
         n_train=args.n_train,
+        max_train=args.max_train,
+        max_test=args.max_test,
         seed=args.seed,
     )
 
     N_train, P, D = train_patches.shape
-    n_classes = int(train_labels.max()) + 1
+    n_classes = len(idx_to_class)
     pca_dim = None if args.no_pca else args.pca_dim
 
     _counts = np.bincount(train_labels.astype(np.int64), minlength=n_classes)
@@ -371,8 +425,8 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
         "run_timestamp": run_ts,
         "total_time_s":  round(total_time_s, 2),
         "args": {
-            "dataset":            "petfinder",
-            "dataset_path":       str(args.dataset_path),
+            "dataset":            args.dataset,
+            "dataset_path":       str(dataset_path),
             "n_train":            args.n_train,
             "n_estimators":       args.n_estimators,
             "pca_dim":            pca_dim,
@@ -418,12 +472,18 @@ def _print_summary(results: dict) -> None:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Multimodal experiment: PALPool image features + tabular (PetFinder)"
+        description="Multimodal experiment: PALPool image features + tabular (PetFinder or DVM)"
     )
-    p.add_argument("--dataset-path",   type=Path,  default=PETFINDER_DATASET_PATH,
-                   help="Root directory of the PetFinder dataset")
+    p.add_argument("--dataset",        type=str,   default="petfinder",
+                   choices=["petfinder", "dvm"], help="Dataset to run multimodal experiment on")
+    p.add_argument("--dataset-path",   type=Path,  default=None,
+                   help="Root directory of the dataset (defaults to config value)")
     p.add_argument("--n-train",        type=int,   default=None,
-                   help="Subsample this many training images (default: use all)")
+                   help="Subsample this many training images AFTER loading (default: use all)")
+    p.add_argument("--max-train",      type=int,   default=None,
+                   help="Load at most this many train+val images (fast initial subset)")
+    p.add_argument("--max-test",       type=int,   default=None,
+                   help="Load at most this many test images")
     p.add_argument("--n-estimators",   type=int,   default=1,
                    help="TabICL ensemble size (default: 1)")
     p.add_argument("--pca-dim",        type=int,   default=128,
