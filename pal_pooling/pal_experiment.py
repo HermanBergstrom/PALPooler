@@ -48,6 +48,7 @@ from pal_pooling.data_loading import (
     _dicom_to_pil,
     _get_petfinder_image_paths,
     _get_dvm_image_paths,
+    _get_pad_ufes_image_paths,
     _get_rsna_image_paths,
     _load_features,
     _balance_classes,
@@ -732,6 +733,8 @@ def run_pal_experiment(
             train_image_paths, test_image_paths = _get_petfinder_image_paths(cfg.dataset.dataset_path)
         elif cfg.dataset.dataset == "dvm":
             train_image_paths, test_image_paths = _get_dvm_image_paths(cfg.dataset.dataset_path)
+        elif cfg.dataset.dataset == "pad-ufes":
+            train_image_paths, test_image_paths = _get_pad_ufes_image_paths(cfg.dataset.dataset_path, seed=cfg.seed)
 
         # Keep train_image_paths aligned with train_patches by applying the same
         # index selections that _load_features and _balance_classes applied.

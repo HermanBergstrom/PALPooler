@@ -23,6 +23,7 @@ from torch.utils.data import Dataset
 from pal_pooling.config import (
     BUTTERFLY_DATASET_PATH,
     FEATURES_DIR,
+    PAD_UFES_DATASET_PATH,
     PETFINDER_DATASET_PATH,
     RSNA_DATASET_PATH,
     DatasetConfig,
@@ -260,6 +261,32 @@ def _get_dvm_image_paths(
     train_paths += [val_ds.get_image_path(i) for i in range(len(val_ds))]
     test_paths = [test_ds.get_image_path(i) for i in range(len(test_ds))]
     
+    return train_paths, test_paths
+
+
+def _get_pad_ufes_image_paths(
+    dataset_path: Path,
+    seed: int = 42,
+    test_fraction: float = 0.2,
+) -> tuple[list[Path], list[Path]]:
+    """Return (train_paths, test_paths) aligned with _load_features pad-ufes output."""
+    pad_ufes_dir = Path(dataset_path)
+    if str(pad_ufes_dir) not in sys.path:
+        sys.path.insert(0, str(pad_ufes_dir))
+    from pad_ufes_dataset import load_metadata  # type: ignore
+    from sklearn.model_selection import train_test_split
+
+    meta = load_metadata(data_dir=str(pad_ufes_dir))
+    df   = meta["df"]
+    df_train, df_test = train_test_split(
+        df, test_size=test_fraction, random_state=seed, stratify=df["diagnostic"]
+    )
+
+    def _stem_to_path(stem: str) -> Path:
+        return meta["img_index"].get(stem, pad_ufes_dir / "images" / f"{stem}.png")
+
+    train_paths = [_stem_to_path(Path(r["img_id"]).stem) for _, r in df_train.iterrows()]
+    test_paths  = [_stem_to_path(Path(r["img_id"]).stem) for _, r in df_test.iterrows()]
     return train_paths, test_paths
 
 
@@ -518,8 +545,49 @@ def _load_features(
         # we mark n_train as None so that generic subsampling is skipped
         n_train = None
 
+    elif dataset_cfg.dataset == "pad-ufes":
+        pad_ufes_dir = Path(dataset_cfg.dataset_path)
+        if str(pad_ufes_dir) not in sys.path:
+            sys.path.insert(0, str(pad_ufes_dir))
+        from pad_ufes_dataset import PADUFESDataset, load_metadata  # type: ignore
+        from sklearn.model_selection import train_test_split
+        from tqdm import tqdm
+
+        metadata = load_metadata(data_dir=str(pad_ufes_dir))
+        df = metadata["df"]
+
+        df_train, df_test = train_test_split(
+            df, test_size=0.2, random_state=seed, stratify=df["diagnostic"]
+        )
+
+        train_ds = PADUFESDataset(df_train, metadata, use_patches=True, use_images=True)
+        test_ds  = PADUFESDataset(df_test,  metadata, use_patches=True, use_images=True)
+
+        def _collect_pad_ufes(ds, desc: str):
+            patches_list, cls_list, labels_list = [], [], []
+            for i in tqdm(range(len(ds)), desc=desc):
+                sample = ds[i]
+                patches_list.append(sample["patch_embedding"].numpy())
+                cls_list.append(sample["image_embedding"].numpy())
+                labels_list.append(sample["target"].item())
+            return (
+                np.stack(patches_list, axis=0),
+                np.stack(cls_list,     axis=0),
+                np.array(labels_list,  dtype=np.int64),
+            )
+
+        train_patches, cls_train, train_labels = _collect_pad_ufes(train_ds, "Loading PAD-UFES (train)")
+        test_patches,  cls_test,  test_labels  = _collect_pad_ufes(test_ds,  "Loading PAD-UFES (test)")
+
+        target_encoder = metadata["target_encoder"]
+        idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
+
+        print(f"[info] PAD-UFES (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] PAD-UFES (test):  N={len(test_labels)}")
+
     else:
-        raise ValueError(f"Unknown dataset '{dataset_cfg.dataset}'. Choices: butterfly, rsna, petfinder, dvm")
+        raise ValueError(f"Unknown dataset '{dataset_cfg.dataset}'. Choices: butterfly, rsna, petfinder, dvm, pad-ufes")
 
     # --- Optional n_train subsampling for non-RSNA datasets ---
     if dataset_cfg.n_train is not None and dataset_cfg.n_train < len(train_labels):

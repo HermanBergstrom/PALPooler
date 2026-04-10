@@ -42,7 +42,7 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score
 from tabicl import TabICLClassifier
 
-from pal_pooling.config import DVM_DATASET_PATH, PETFINDER_DATASET_PATH, RefinementConfig
+from pal_pooling.config import DVM_DATASET_PATH, PAD_UFES_DATASET_PATH, PETFINDER_DATASET_PATH, RefinementConfig
 from pal_pooling.pal_pooler import IterativePALPooler, pooler_factory
 
 
@@ -151,6 +151,74 @@ def _load_dataset(
             num_workers=0,
             data_dir=dataset_dir
         )
+    elif dataset_name == "pad-ufes":
+        from pad_ufes_dataset import PADUFESDataset, load_metadata  # type: ignore
+        from sklearn.model_selection import train_test_split
+        from tqdm import tqdm
+
+        metadata = load_metadata(data_dir=str(dataset_dir))
+        df_full  = metadata["df"]
+        df_tr, df_te = train_test_split(
+            df_full, test_size=0.2, random_state=seed, stratify=df_full["diagnostic"]
+        )
+        train_ds_pad = PADUFESDataset(df_tr, metadata, use_patches=True, use_images=True)
+        test_ds_pad  = PADUFESDataset(df_te, metadata, use_patches=True, use_images=True)
+
+        def _collect_pad(ds, n_limit, desc):
+            total_n = len(ds)
+            if n_limit is not None and n_limit < total_n:
+                rng  = np.random.RandomState(seed)
+                idxs = rng.choice(total_n, size=n_limit, replace=False)
+                idxs.sort()
+            else:
+                idxs = np.arange(total_n)
+            patches, cls_emb, labels, tab_feat = [], [], [], []
+            for i in tqdm(idxs, desc=desc):
+                s = ds[int(i)]
+                patches.append(s["patch_embedding"].float().numpy())
+                cls_emb.append(s["image_embedding"].float().numpy())
+                labels.append(s["target"].item())
+                tab_feat.append(s["tabular"].float().numpy())
+            return (
+                np.stack(patches,   axis=0),
+                np.stack(cls_emb,   axis=0),
+                np.array(labels,    dtype=np.int64),
+                np.stack(tab_feat,  axis=0),
+            )
+
+        train_patches, cls_train, train_labels, tab_train = _collect_pad(
+            train_ds_pad, max_train, f"Loading pad-ufes (train)"
+        )
+        test_patches, cls_test, test_labels, tab_test = _collect_pad(
+            test_ds_pad, max_test, f"Loading pad-ufes (test)"
+        )
+        target_encoder = metadata["target_encoder"]
+        idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
+
+        # Optional n_train subsampling.
+        if n_train is not None and n_train < len(train_labels):
+            rng = np.random.RandomState(seed)
+            idx = rng.choice(len(train_labels), size=n_train, replace=False)
+            idx.sort()
+            train_patches = train_patches[idx]
+            train_labels  = train_labels[idx]
+            cls_train     = cls_train[idx]
+            tab_train     = tab_train[idx]
+
+        print(
+            f"[info] pad-ufes (train): N={len(train_labels)}  "
+            f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}  "
+            f"tab_dim={tab_train.shape[1]}"
+        )
+        print(f"[info] pad-ufes (test):  N={len(test_labels)}")
+        return (
+            train_patches, train_labels,
+            test_patches,  test_labels,
+            cls_train, cls_test,
+            tab_train, tab_test,
+            idx_to_class,
+        )
+
     else:
         raise ValueError(f"Unknown multimodal dataset: {dataset_name}")
 
@@ -248,7 +316,11 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
 
     dataset_path = args.dataset_path
     if dataset_path is None:
-        dataset_path = DVM_DATASET_PATH if args.dataset == "dvm" else PETFINDER_DATASET_PATH
+        dataset_path = {
+            "dvm":       DVM_DATASET_PATH,
+            "petfinder": PETFINDER_DATASET_PATH,
+            "pad-ufes":  PAD_UFES_DATASET_PATH,
+        }[args.dataset]
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -307,6 +379,8 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
 
     # ── Baseline: tabular only ───────────────────────────────────────────────
     print("\n--- tabular_only ---")
+    #print(tab_train.shape, tab_test.shape)
+    #print(tab_train[:5])
     _eval("tabular_only", tab_train, tab_test)
 
     # ── Baseline: mean-pool image only ───────────────────────────────────────
@@ -475,7 +549,7 @@ def _parse_args() -> argparse.Namespace:
         description="Multimodal experiment: PALPool image features + tabular (PetFinder or DVM)"
     )
     p.add_argument("--dataset",        type=str,   default="petfinder",
-                   choices=["petfinder", "dvm"], help="Dataset to run multimodal experiment on")
+                   choices=["petfinder", "dvm", "pad-ufes"], help="Dataset to run multimodal experiment on")
     p.add_argument("--dataset-path",   type=Path,  default=None,
                    help="Root directory of the dataset (defaults to config value)")
     p.add_argument("--n-train",        type=int,   default=None,

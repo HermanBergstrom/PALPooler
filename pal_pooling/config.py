@@ -7,6 +7,7 @@ BUTTERFLY_DATASET_PATH = Path("/project/aip-rahulgk/hermanb/datasets/butterfly-i
 RSNA_DATASET_PATH      = Path("/project/aip-rahulgk/hermanb/datasets/rsna-pneumonia")
 PETFINDER_DATASET_PATH = Path("/project/aip-rahulgk/image_icl_project/petfinder")
 DVM_DATASET_PATH       = Path("/project/6101781/image_icl_project/DVM_Dataset")
+PAD_UFES_DATASET_PATH  = Path("/project/6101781/image_icl_project/pad-ufes-20-copy")
 FEATURES_DIR           = Path("/scratch/hermanb/temp_datasets/extracted_features")
 
 @dataclass
@@ -76,7 +77,7 @@ class ExperimentConfig:
 def parse_args() -> ExperimentConfig:
     p = argparse.ArgumentParser(description="Patch quality evaluation with TabICL")
     p.add_argument("--dataset",       type=str,   default="butterfly",
-                   choices=["butterfly", "rsna", "petfinder", "dvm"],
+                   choices=["butterfly", "rsna", "petfinder", "dvm", "pad-ufes"],
                    help="Which dataset to run on")
     p.add_argument("--backbone",      type=str,   default="rad-dino",
                    choices=["rad-dino", "dinov3"],
@@ -182,6 +183,7 @@ def parse_args() -> ExperimentConfig:
         "rsna":      RSNA_DATASET_PATH,
         "petfinder": PETFINDER_DATASET_PATH,
         "dvm":       DVM_DATASET_PATH,
+        "pad-ufes":  PAD_UFES_DATASET_PATH,
     }
     dataset_path = args.dataset_path or _dataset_defaults[args.dataset]
     
