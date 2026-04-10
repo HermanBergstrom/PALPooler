@@ -39,6 +39,7 @@ class RefinementConfig:
     tabicl_n_estimators: int
     tabicl_pca_dim: Optional[int]
     append_cls: bool = False
+    use_global_prior: bool = False
 
 @dataclass
 class AttentionPoolConfig:
@@ -146,6 +147,9 @@ def parse_args() -> ExperimentConfig:
     
     p.add_argument("--append-cls", action="store_true",
                    help="Append the CLS token as an extra (ungrouped) patch for Ridge fitting and pooling.")
+    p.add_argument("--use-global-prior", action="store_true",
+                   help="Use the global empirical class prior P(Y) as the divergence reference even when "
+                        "context (tabular) features are provided, instead of the per-image P(Y|X_tab).")
     p.add_argument("--aoe-class", type=str, default=None,
                    help="Absence-of-evidence class.")
     p.add_argument("--aoe-handling", type=str, default="filter",
@@ -213,6 +217,7 @@ def parse_args() -> ExperimentConfig:
         tabicl_n_estimators=args.n_estimators,
         tabicl_pca_dim=pca_dim,
         append_cls=args.append_cls,
+        use_global_prior=args.use_global_prior,
     )
     
     attention_cfg = AttentionPoolConfig(

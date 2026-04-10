@@ -167,6 +167,7 @@ class PALPooler:
         initial_support: Optional[np.ndarray] = None,
         initial_pca: Optional[PCA] = None,
         context_features: Optional[np.ndarray] = None,
+        tabular_probs: Optional[np.ndarray] = None,
     ) -> "PALPooler":
         """Fit the Ridge quality model.
 
@@ -198,6 +199,14 @@ class PALPooler:
             scoring step.  They inform the quality scores but are never used
             as Ridge inputs — pooling weights are still derived from raw DINO
             features alone.
+        tabular_probs : np.ndarray or None, shape [N, n_classes]
+            Pre-computed P(Y|X_tab) for each training image.  When provided
+            (and a divergence weight method is used), replaces the global class
+            prior so each image's patches are scored relative to the
+            tabular-informed marginal P(Y|X_tab_i).  Computed internally when
+            *context_features* is given but *tabular_probs* is not; prefer
+            passing it from :class:`IterativePALPooler` to avoid recomputation
+            across stages.
 
         Returns
         -------
@@ -246,6 +255,7 @@ class PALPooler:
             tabicl=self.tabicl,
             refinement_cfg=self.refinement_cfg,
             context_features=context_features,
+            tabular_probs=tabular_probs,
         )
 
         # Derive raw (pre-PCA) support in the original D-dimensional DINO space.
@@ -637,6 +647,19 @@ class IterativePALPooler:
             initial_pca = None
             initial_support = support_raw
 
+        # Compute tabular-only P(Y|X_tab) once — reused as the per-image reference prior
+        # across all stages to avoid repeated TabICL calls for divergence weight methods.
+        tabular_probs: Optional[np.ndarray] = None
+        if (context_features is not None
+                and self.refinement_cfg.weight_method in ("kl_div", "wasserstein", "js_div", "tvd")
+                and not getattr(self.refinement_cfg, "use_global_prior", False)):
+            print("[IterativePALPooler] Computing tabular-only P(Y|X_tab) for per-image prior ...")
+            _clf_tab = TabICLClassifier(
+                n_estimators=self.refinement_cfg.tabicl_n_estimators, random_state=self.seed
+            )
+            _clf_tab.fit(context_features, labels)
+            tabular_probs = _clf_tab.predict_proba(context_features).astype(np.float32)  # [N, n_classes]
+
         for k, group_size in enumerate(self.patch_group_sizes):
             from pal_pooling.patch_pooling import group_patches
 
@@ -665,7 +688,7 @@ class IterativePALPooler:
             )
             stage.fit(patches, labels, cls_tokens=cls_tokens,
                       initial_support=initial_support, initial_pca=initial_pca,
-                      context_features=context_features)
+                      context_features=context_features, tabular_probs=tabular_probs)
             stages.append(stage)
 
             if stage_callback is not None:

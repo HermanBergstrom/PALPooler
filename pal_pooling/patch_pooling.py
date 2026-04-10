@@ -577,6 +577,7 @@ def refine_dataset_features(
     #Optional tabicl classifier
     tabicl: Optional[TabICLClassifier] = None,
     context_features:   Optional[np.ndarray] = None,  # [N, D_context]  per-image side features
+    tabular_probs:      Optional[np.ndarray] = None,  # [N, n_classes]  pre-computed P(Y|X_tab); replaces global prior for divergence methods
 ) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Union[Ridge, "RidgeGPU"], Optional[StandardScaler], TabICLClassifier, float, float]:
     """Refine mean-pooled support features with Ridge-predicted quality-weighted pooling.
 
@@ -651,12 +652,25 @@ def refine_dataset_features(
     N, P, D = train_patches.shape
 
     # Precompute empirical class prior (used by kl_div, wasserstein, js_div, and tvd weight methods).
-    if refinement_cfg.weight_method in ("kl_div", "wasserstein", "js_div", "tvd"):
+    _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd")
+    if refinement_cfg.weight_method in _divergence_methods:
         n_cls_local = int(train_labels.max()) + 1
         counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls_local)
         class_prior: Optional[np.ndarray] = (counts / counts.sum()).astype(np.float32)
     else:
         class_prior = None
+
+    # When context features are provided with a divergence method, compute tabular-only
+    # P(Y|X_tab) as the per-image reference prior (replaces global class_prior).
+    # If pre-computed externally (e.g. by IterativePALPooler), use it directly.
+    if (context_features is not None
+            and refinement_cfg.weight_method in _divergence_methods
+            and tabular_probs is None
+            and not getattr(refinement_cfg, "use_global_prior", False)):
+        print("[multimodal] Computing tabular-only P(Y|X_tab) for per-image prior ...")
+        _clf_tab = TabICLClassifier(n_estimators=refinement_cfg.tabicl_n_estimators, random_state=seed)
+        _clf_tab.fit(context_features, train_labels)
+        tabular_probs = _clf_tab.predict_proba(context_features).astype(np.float32)  # [N, n_classes]
 
     # Determine which images contribute to Ridge fitting and their per-image method.
     # "filter": only non-AoE images; all use weight_method.
@@ -669,6 +683,12 @@ def refine_dataset_features(
     active_patches    = train_patches[active_indices]   # [N_active, P, D]
     active_labels     = train_labels[active_indices]    # [N_active]
     active_total_rows = N_active * P
+
+    # Per-image reference prior: slice tabular_probs to active images.
+    # None when not using a divergence method or context_features were not provided.
+    active_tabular_probs: Optional[np.ndarray] = (
+        tabular_probs[active_indices].astype(np.float32) if tabular_probs is not None else None
+    )  # [N_active, n_classes] or None
 
     # Per-image effective weight method (None = all images use weight_method)
     if aoe_mask is not None and refinement_cfg.aoe_handling == "entropy":
@@ -704,6 +724,10 @@ def refine_dataset_features(
         class_prior_t = (
             _torch.from_numpy(class_prior).to(_dev) if class_prior is not None else None
         )
+        active_tabular_probs_t = (
+            _torch.from_numpy(active_tabular_probs).to(_dev)
+            if active_tabular_probs is not None else None
+        )  # [N_active, n_classes] on GPU, or None
 
     # Decide forward-pass strategy:
     #   one_pass=True  → forward a contiguous block of rows in a single predict_proba call
@@ -756,7 +780,8 @@ def refine_dataset_features(
                     continue
                 all_targets_t[start:end] = compute_patch_quality_logits_gpu(
                     probs_flat_t[start:end], int(active_labels[idx]),
-                    refinement_cfg.temperature, _eff_method(idx), class_prior_t,
+                    refinement_cfg.temperature, _eff_method(idx),
+                    active_tabular_probs_t[idx] if active_tabular_probs_t is not None else class_prior_t,
                 )
             all_targets = all_targets_t
         else:
@@ -768,7 +793,8 @@ def refine_dataset_features(
                     continue
                 all_targets[start:end] = compute_patch_quality_logits(
                     probs_flat[start:end], int(active_labels[idx]),
-                    refinement_cfg.temperature, _eff_method(idx), class_prior,
+                    refinement_cfg.temperature, _eff_method(idx),
+                    active_tabular_probs[idx] if active_tabular_probs is not None else class_prior,
                 )
 
     else:
@@ -823,7 +849,8 @@ def refine_dataset_features(
                     all_features[s:e] = batch_patches_arr[j]
                     all_targets[s:e]  = compute_patch_quality_logits_gpu(
                         probs_t[j], int(batch_labels_arr[j]),
-                        refinement_cfg.temperature, eff, class_prior_t,
+                        refinement_cfg.temperature, eff,
+                        active_tabular_probs_t[row_ptr + j] if active_tabular_probs_t is not None else class_prior_t,
                     )
             else:
                 probs = clf.predict_proba(query_features).reshape(B_a, P, -1)           # CPU
@@ -835,7 +862,8 @@ def refine_dataset_features(
                     all_features[s:e] = batch_patches_arr[j]
                     all_targets[s:e]  = compute_patch_quality_logits(
                         probs[j], int(batch_labels_arr[j]),
-                        refinement_cfg.temperature, eff, class_prior,
+                        refinement_cfg.temperature, eff,
+                        active_tabular_probs[row_ptr + j] if active_tabular_probs is not None else class_prior,
                     )
             row_ptr += B_a
 

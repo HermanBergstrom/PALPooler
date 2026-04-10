@@ -298,6 +298,7 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
         tabicl_n_estimators=args.n_estimators,
         tabicl_pca_dim=pca_dim,
         append_cls=False,
+        use_global_prior=args.use_global_prior,
     )
 
     pooler = pooler_factory(refinement_cfg=refinement_cfg, seed=args.seed)
@@ -447,6 +448,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Cap on patch-group rows forwarded through TabICL")
     p.add_argument("--gpu-ridge",      action="store_true",
                    help="Solve Ridge on the GPU (requires PyTorch + CUDA)")
+    p.add_argument("--use-global-prior", action="store_true",
+                   help="Use the global class prior P(Y) as the divergence reference even when "
+                        "context features are provided, instead of the per-image P(Y|X_tab).")
     p.add_argument("--seed",           type=int,   default=42)
     p.add_argument("--output-dir",     type=Path,  default=Path("results/multimodal"))
     return p.parse_args()
