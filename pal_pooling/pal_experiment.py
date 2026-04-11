@@ -470,6 +470,10 @@ def _make_stage_callback(
     test_image_paths: list,
     train_sample_idx: np.ndarray,
     test_sample_idx: np.ndarray,
+    val_patches: Optional[np.ndarray],
+    val_labels: Optional[np.ndarray],
+    val_image_paths: Optional[list],
+    val_sample_idx: Optional[np.ndarray],
     idx_to_class: dict,
     open_image,
     class_prior: np.ndarray,
@@ -501,6 +505,7 @@ def _make_stage_callback(
         tag          = f"iter_{stage_idx}_g{group_size}"
 
         test_grouped   = group_patches(test_patches, group_size)  # [N_test, P', D]
+        val_grouped    = group_patches(val_patches, group_size) if val_patches is not None else None
         ridge_model    = stage.ridge_model_
         feature_scaler = stage.feature_scaler_
         fit_time_s     = stage.fit_time_s_
@@ -514,6 +519,8 @@ def _make_stage_callback(
                 ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
                 ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
             ]
+            if val_grouped is not None:
+                split_configs_iter.append(("val", val_grouped, val_labels, val_image_paths, val_sample_idx))
             if cfg.run.viz_loo_train:
                 split_configs_iter.append(("train_loo", train_grouped, train_labels, train_image_paths, train_sample_idx))
             iter_mean_probs = _run_visual_eval(
@@ -540,6 +547,8 @@ def _make_stage_callback(
                 ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
                 ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
             ]
+            if val_grouped is not None:
+                split_configs_post.append(("val", val_grouped, val_labels, val_image_paths, val_sample_idx))
             if cfg.run.viz_loo_train:
                 split_configs_post.append(("train_loo", train_grouped, train_labels, train_image_paths, train_sample_idx))
             iter_mean_probs = _run_visual_eval(
@@ -582,6 +591,7 @@ def _make_stage_callback(
         last_stage_data.update(
             tag=tag, eff_patch_sz=eff_patch_sz,
             train_grouped=train_grouped, test_grouped=test_grouped,
+            val_grouped=val_grouped,
             ridge_model=ridge_model, feature_scaler=feature_scaler,
             pre_refine_support=pre_refine_support, pre_refine_pca=pre_refine_pca,
             temperature=stage.refinement_cfg.temperature,
@@ -622,6 +632,31 @@ def run_pal_experiment(
             test_patches, test_labels, cls_test_feats, bal_rng
         )
 
+    val_patches: Optional[np.ndarray] = None
+    val_labels: Optional[np.ndarray] = None
+    cls_val_feats: Optional[np.ndarray] = None
+    val_keep_idx: Optional[np.ndarray] = None
+    train_keep_idx: Optional[np.ndarray] = None
+    
+    if cfg.dataset.train_val_fraction is not None and cfg.dataset.train_val_fraction > 0.0:
+        split_rng = np.random.RandomState(cfg.seed + 2)
+        n_val_split = int(len(train_labels) * cfg.dataset.train_val_fraction)
+        perm = split_rng.permutation(len(train_labels))
+        val_keep_idx = perm[:n_val_split]
+        train_keep_idx = perm[n_val_split:]
+        
+        val_patches = train_patches[val_keep_idx]
+        val_labels = train_labels[val_keep_idx]
+        if cls_train_feats is not None:
+            cls_val_feats = cls_train_feats[val_keep_idx]
+        
+        train_patches = train_patches[train_keep_idx]
+        train_labels = train_labels[train_keep_idx]
+        if cls_train_feats is not None:
+            cls_train_feats = cls_train_feats[train_keep_idx]
+            
+        print(f"[val_split] Held out {n_val_split} images for validation during refinement (fraction={cfg.dataset.train_val_fraction})")
+
     N_train, _P, D = train_patches.shape
     n_classes      = int(train_labels.max()) + 1
 
@@ -638,6 +673,7 @@ def run_pal_experiment(
 
     # --- Resolve absence-of-evidence class ---
     aoe_mask: Optional[np.ndarray] = None
+    val_aoe_mask: Optional[np.ndarray] = None
     if cfg.refinement.aoe_class is not None:
         class_to_idx = {v: k for k, v in idx_to_class.items()}
         try:
@@ -657,6 +693,8 @@ def run_pal_experiment(
             aoe_class_idx = class_to_idx[name]
         aoe_class_name = idx_to_class[aoe_class_idx]
         aoe_mask = (train_labels == aoe_class_idx)
+        if val_labels is not None:
+            val_aoe_mask = (val_labels == aoe_class_idx)
         print(f"[aoe] Absence-of-evidence class: '{aoe_class_name}' (index {aoe_class_idx}), "
               f"{int(aoe_mask.sum())} training images excluded from Ridge fitting")
 
@@ -756,6 +794,11 @@ def run_pal_experiment(
         if bal_train_keep_idx is not None:
             train_image_paths = [train_image_paths[i] for i in bal_train_keep_idx]
         
+        val_image_paths: list = []
+        if val_keep_idx is not None and train_keep_idx is not None:
+            val_image_paths = [train_image_paths[i] for i in val_keep_idx]
+            train_image_paths = [train_image_paths[i] for i in train_keep_idx]
+        
         if test_sub_idx is not None:
             test_image_paths = [test_image_paths[i] for i in test_sub_idx]
         if bal_test_keep_idx is not None:
@@ -764,6 +807,9 @@ def run_pal_experiment(
     rng              = np.random.RandomState(cfg.seed)
     train_sample_idx = rng.choice(len(train_labels), size=min(cfg.dataset.n_sample, len(train_labels)), replace=False)
     test_sample_idx  = rng.choice(len(test_labels),  size=min(cfg.dataset.n_sample, len(test_labels)),  replace=False)
+    val_sample_idx   = None
+    if val_labels is not None:
+        val_sample_idx = rng.choice(len(val_labels), size=min(cfg.dataset.n_sample, len(val_labels)), replace=False)
 
     # --- Baseline: accuracy + visual eval at original patch resolution ---
     baseline_acc, baseline_auroc = _compute_accuracy(
@@ -791,6 +837,8 @@ def run_pal_experiment(
             ("train", train_patches, train_labels, train_image_paths, train_sample_idx),
             ("test",  test_patches,  test_labels,  test_image_paths,  test_sample_idx),
         ]
+        if val_patches is not None:
+            split_configs_orig.append(("val", val_patches, val_labels, val_image_paths, val_sample_idx))
         if cfg.run.viz_loo_train:
             split_configs_orig.append(("train_loo", train_patches, train_labels, train_image_paths, train_sample_idx))
         baseline_mean_probs = _run_visual_eval(
@@ -844,6 +892,10 @@ def run_pal_experiment(
         test_image_paths=test_image_paths,
         train_sample_idx=train_sample_idx,
         test_sample_idx=test_sample_idx,
+        val_patches=val_patches,
+        val_labels=val_labels,
+        val_image_paths=val_image_paths,
+        val_sample_idx=val_sample_idx,
         idx_to_class=idx_to_class,
         open_image=open_image,
         class_prior=class_prior,
@@ -864,7 +916,14 @@ def run_pal_experiment(
         gpu_ridge_device=_refine_dev,
     )
     train_cls = cls_train_feats if cfg.refinement.append_cls else None
-    pal_pooler.fit(train_patches, train_labels, cls_tokens=train_cls, stage_callback=stage_callback)
+    fit_kwargs = {}
+    if val_patches is not None:
+        fit_kwargs["val_patches"] = val_patches
+        fit_kwargs["val_labels"] = val_labels
+        if cfg.refinement.append_cls:
+            fit_kwargs["val_cls_tokens"] = cls_val_feats
+
+    pal_pooler.fit(train_patches, train_labels, cls_tokens=train_cls, stage_callback=stage_callback, **fit_kwargs)
 
     # -- Final post-all-refinement visualisation (only when --post-refinement-viz is off) --
     # Produces Ridge-weight figures for the last refinement stage, giving you the quality
@@ -875,6 +934,8 @@ def run_pal_experiment(
             ("train", _last_stage_data["train_grouped"], train_labels, train_image_paths, train_sample_idx),
             ("test",  _last_stage_data["test_grouped"],  test_labels,  test_image_paths,  test_sample_idx),
         ]
+        if _last_stage_data.get("val_grouped") is not None:
+            split_configs_final.append(("val", _last_stage_data["val_grouped"], val_labels, val_image_paths, val_sample_idx))
         if cfg.run.viz_loo_train:
             split_configs_final.append(("train_loo", _last_stage_data["train_grouped"], train_labels, train_image_paths, train_sample_idx))
         _run_visual_eval(

@@ -568,7 +568,7 @@ def _ridge_pool_weights(
 def refine_dataset_features(
     train_patches:      np.ndarray,      # [N, P, D]  raw DINO patch features
     train_labels:       np.ndarray,      # [N]
-    support_features:   np.ndarray,      # [N, d]  initial mean-pooled (post-PCA) features
+    support_features:   np.ndarray,      # [N_train, d]  initial mean-pooled (post-PCA) features
     refinement_cfg: RefinementConfig,
     pca:                Optional[PCA],   # PCA fitted on the baseline support set
     seed:               int   = 42,
@@ -578,6 +578,11 @@ def refine_dataset_features(
     tabicl: Optional[TabICLClassifier] = None,
     context_features:   Optional[np.ndarray] = None,  # [N, D_context]  per-image side features
     tabular_probs:      Optional[np.ndarray] = None,  # [N, n_classes]  pre-computed P(Y|X_tab); replaces global prior for divergence methods
+    val_patches:        Optional[np.ndarray] = None,  # [N_val, P, D] raw DINO patch features for validation
+    val_labels:         Optional[np.ndarray] = None,  # [N_val] validation labels
+    val_context_features: Optional[np.ndarray] = None, # [N_val, D_context]
+    val_tabular_probs:  Optional[np.ndarray] = None,  # [N_val, n_classes]
+    val_aoe_mask:       Optional[np.ndarray] = None,  # [N_val] bool
 ) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Union[Ridge, "RidgeGPU"], Optional[StandardScaler], TabICLClassifier, float, float]:
     """Refine mean-pooled support features with Ridge-predicted quality-weighted pooling.
 
@@ -679,26 +684,44 @@ def refine_dataset_features(
             tabular_probs = raw_tab_probs
 
     # Determine which images contribute to Ridge fitting and their per-image method.
+    # If val blocks are present, fit Ridge strictly on validation patches.
+    # Otherwise, fallback to train patches.
     # "filter": only non-AoE images; all use weight_method.
     # "entropy": all images; AoE images use "entropy" instead of weight_method.
-    if aoe_mask is not None and refinement_cfg.aoe_handling == "filter":
-        active_indices = np.where(~aoe_mask)[0]
+    
+    if val_patches is not None and val_labels is not None:
+        source_patches = val_patches
+        source_labels = val_labels
+        source_aoe = val_aoe_mask
+        source_tabular = val_tabular_probs
+        source_context = val_context_features
     else:
-        active_indices = np.arange(N)
-    N_active          = len(active_indices)
-    active_patches    = train_patches[active_indices]   # [N_active, P, D]
-    active_labels     = train_labels[active_indices]    # [N_active]
-    active_total_rows = N_active * P
+        source_patches = train_patches
+        source_labels = train_labels
+        source_aoe = aoe_mask
+        source_tabular = tabular_probs
+        source_context = context_features
 
-    # Per-image reference prior: slice tabular_probs to active images.
-    # None when not using a divergence method or context_features were not provided.
+    M, P_dim, _D_dim = source_patches.shape
+
+    if source_aoe is not None and refinement_cfg.aoe_handling == "filter":
+        active_indices = np.where(~source_aoe)[0]
+    else:
+        active_indices = np.arange(M)
+    
+    N_active          = len(active_indices)
+    active_patches    = source_patches[active_indices]   # [N_active, P, D]
+    active_labels     = source_labels[active_indices]    # [N_active]
+    active_total_rows = N_active * P_dim
+
+    # Per-image reference prior: slice source_tabular to active images.
     active_tabular_probs: Optional[np.ndarray] = (
-        tabular_probs[active_indices].astype(np.float32) if tabular_probs is not None else None
+        source_tabular[active_indices].astype(np.float32) if source_tabular is not None else None
     )  # [N_active, n_classes] or None
 
     # Per-image effective weight method (None = all images use weight_method)
-    if aoe_mask is not None and refinement_cfg.aoe_handling == "entropy":
-        active_is_aoe = aoe_mask[active_indices]   # [N_active] bool
+    if source_aoe is not None and refinement_cfg.aoe_handling == "entropy":
+        active_is_aoe = source_aoe[active_indices]   # [N_active] bool
     else:
         active_is_aoe = None
 
@@ -752,24 +775,24 @@ def refine_dataset_features(
             rng           = np.random.RandomState(seed)
             sampled_flat  = rng.choice(active_total_rows, size=n_fwd, replace=False)
             sampled_flat.sort()                          # sort → group by image for searchsorted
-            local_img_idx = sampled_flat // P            # index into active_patches
-            patch_idx_all = sampled_flat % P
+            local_img_idx = sampled_flat // P_dim        # index into active_patches
+            patch_idx_all = sampled_flat % P_dim
             query_raw     = active_patches[local_img_idx, patch_idx_all].astype(np.float32)
             img_boundaries = np.searchsorted(local_img_idx, np.arange(N_active + 1))
             # Each sampled row belongs to active image local_img_idx[i].
             ctx_for_queries = (
-                context_features[active_indices][local_img_idx].astype(np.float32)
-                if context_features is not None else None
+                source_context[active_indices][local_img_idx].astype(np.float32)
+                if source_context is not None else None
             )
         else:
             # All active rows in one pass; sequential layout matches reshape order
             n_fwd          = active_total_rows
             query_raw      = active_patches.reshape(active_total_rows, D).astype(np.float32)
-            img_boundaries = np.arange(N_active + 1) * P     # [0, P, 2P, ..., N_active*P]
+            img_boundaries = np.arange(N_active + 1) * P_dim     # [0, P, 2P, ..., N_active*P]
             # Repeat each active image's context P times to align with the flat patch layout.
             ctx_for_queries = (
-                np.repeat(context_features[active_indices].astype(np.float32), P, axis=0)
-                if context_features is not None else None
+                np.repeat(source_context[active_indices].astype(np.float32), P_dim, axis=0)
+                if source_context is not None else None
             )
 
         query_features = pca.transform(query_raw) if pca is not None else query_raw

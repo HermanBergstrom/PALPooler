@@ -168,6 +168,11 @@ class PALPooler:
         initial_pca: Optional[PCA] = None,
         context_features: Optional[np.ndarray] = None,
         tabular_probs: Optional[np.ndarray] = None,
+        val_patches: Optional[np.ndarray] = None,
+        val_labels: Optional[np.ndarray] = None,
+        val_cls_tokens: Optional[np.ndarray] = None,
+        val_context_features: Optional[np.ndarray] = None,
+        val_tabular_probs: Optional[np.ndarray] = None,
     ) -> "PALPooler":
         """Fit the Ridge quality model.
 
@@ -207,6 +212,13 @@ class PALPooler:
             *context_features* is given but *tabular_probs* is not; prefer
             passing it from :class:`IterativePALPooler` to avoid recomputation
             across stages.
+        val_patches : np.ndarray or None, shape [N_val, P_val, D]
+            Optional validation patches to be used for scoring and fitting the
+            Ridge model instead of the training patches.
+        val_labels : np.ndarray or None, shape [N_val]
+        val_cls_tokens : np.ndarray or None, shape [N_val, D]
+        val_context_features : np.ndarray or None, shape [N_val, D_context]
+        val_tabular_probs : np.ndarray or None, shape [N_val, n_classes]
 
         Returns
         -------
@@ -243,6 +255,16 @@ class PALPooler:
         if self.refinement_cfg.aoe_class is not None:
             aoe_mask = (labels == self.refinement_cfg.aoe_class)
 
+        val_grouped = None
+        val_aoe_mask = None
+        if val_patches is not None and val_labels is not None:
+            val_patches = np.asarray(val_patches, dtype=np.float32)
+            val_labels = np.asarray(val_labels)
+            val_grouped = group_patches(val_patches, self.refinement_cfg.patch_group_sizes)
+            val_grouped = _append_cls(val_grouped, val_cls_tokens)
+            if self.refinement_cfg.aoe_class is not None:
+                val_aoe_mask = (val_labels == self.refinement_cfg.aoe_class)
+
         (refined_support, new_pca, weights_ridge, ridge_model, feature_scaler, scoring_clf,
          fit_time_s, pool_time_s) = refine_dataset_features(
             train_patches=grouped,
@@ -256,6 +278,11 @@ class PALPooler:
             refinement_cfg=self.refinement_cfg,
             context_features=context_features,
             tabular_probs=tabular_probs,
+            val_patches=val_grouped,
+            val_labels=val_labels,
+            val_context_features=val_context_features,
+            val_tabular_probs=val_tabular_probs,
+            val_aoe_mask=val_aoe_mask,
         )
 
         # Derive raw (pre-PCA) support in the original D-dimensional DINO space.
@@ -581,6 +608,10 @@ class IterativePALPooler:
         cls_tokens: Optional[np.ndarray] = None,
         stage_callback: Optional[Callable] = None,
         context_features: Optional[np.ndarray] = None,
+        val_patches: Optional[np.ndarray] = None,
+        val_labels: Optional[np.ndarray] = None,
+        val_cls_tokens: Optional[np.ndarray] = None,
+        val_context_features: Optional[np.ndarray] = None,
     ) -> "IterativePALPooler":
         """Fit all stages sequentially, passing the refined support forward.
 
@@ -666,6 +697,15 @@ class IterativePALPooler:
             else:
                 tabular_probs = raw_tab_probs
 
+        val_tabular_probs: Optional[np.ndarray] = None
+        if val_context_features is not None and val_labels is not None and tabular_probs is not None:
+            raw_vtab_probs = _clf_tab.predict_proba(val_context_features).astype(np.float32)
+            if raw_vtab_probs.shape[1] != n_cls_local:
+                val_tabular_probs = np.zeros((raw_vtab_probs.shape[0], n_cls_local), dtype=np.float32)
+                val_tabular_probs[:, _clf_tab.classes_] = raw_vtab_probs
+            else:
+                val_tabular_probs = raw_vtab_probs
+
         for k, group_size in enumerate(self.patch_group_sizes):
             from pal_pooling.patch_pooling import group_patches
 
@@ -694,7 +734,10 @@ class IterativePALPooler:
             )
             stage.fit(patches, labels, cls_tokens=cls_tokens,
                       initial_support=initial_support, initial_pca=initial_pca,
-                      context_features=context_features, tabular_probs=tabular_probs)
+                      context_features=context_features, tabular_probs=tabular_probs,
+                      val_patches=val_patches, val_labels=val_labels,
+                      val_cls_tokens=val_cls_tokens,
+                      val_context_features=val_context_features, val_tabular_probs=val_tabular_probs)
             stages.append(stage)
 
             if stage_callback is not None:
@@ -740,6 +783,10 @@ class IterativePALPooler:
         labels: np.ndarray,
         cls_tokens: Optional[np.ndarray] = None,
         context_features: Optional[np.ndarray] = None,
+        val_patches: Optional[np.ndarray] = None,
+        val_labels: Optional[np.ndarray] = None,
+        val_cls_tokens: Optional[np.ndarray] = None,
+        val_context_features: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Fit all stages then transform *patches* with the final stage.
 
@@ -748,7 +795,10 @@ class IterativePALPooler:
         np.ndarray, shape [N, D]
         """
         return self.fit(patches, labels, cls_tokens=cls_tokens,
-                        context_features=context_features).transform(patches, cls_tokens=cls_tokens)
+                        context_features=context_features,
+                        val_patches=val_patches, val_labels=val_labels,
+                        val_cls_tokens=val_cls_tokens,
+                        val_context_features=val_context_features).transform(patches, cls_tokens=cls_tokens)
 
     # ------------------------------------------------------------------
     # Convenience delegations to final stage

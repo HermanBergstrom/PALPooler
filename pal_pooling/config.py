@@ -19,6 +19,7 @@ class DatasetConfig:
     n_train: Optional[int]
     n_test: Optional[int]
     n_val: Optional[int]
+    train_val_fraction: Optional[float]
     n_sample: int
     balance_train: bool
     balance_test: bool
@@ -96,6 +97,8 @@ def parse_args() -> ExperimentConfig:
                    help="Limit the test set to this many testing images (random subsample, only DVM)")
     p.add_argument("--n-val",         type=int,   default=None,
                    help="Limit the val set to this many validation images (random subsample, only DVM)")
+    p.add_argument("--train-val-fraction", type=float, default=None,
+                   help="Fraction of the training set to hold out as a validation set for Ridge fitting (e.g. 0.2)")
     p.add_argument("--n-estimators",  type=int,   default=1)
     p.add_argument("--pca-dim",       type=int,   default=128)
     p.add_argument("--no-pca",        action="store_true",
@@ -200,6 +203,7 @@ def parse_args() -> ExperimentConfig:
         n_train=args.n_train,
         n_test=args.n_test,
         n_val=args.n_val,
+        train_val_fraction=args.train_val_fraction,
         n_sample=args.n_sample,
         balance_train=args.balance_train,
         balance_test=args.balance_test
