@@ -266,7 +266,7 @@ class PALPooler:
                 val_aoe_mask = (val_labels == self.refinement_cfg.aoe_class)
 
         (refined_support, new_pca, weights_ridge, ridge_model, feature_scaler, scoring_clf,
-         fit_time_s, pool_time_s) = refine_dataset_features(
+         fit_time_s, pool_time_s, updated_class_prior) = refine_dataset_features(
             train_patches=grouped,
             train_labels=labels,
             support_features=support,
@@ -300,6 +300,7 @@ class PALPooler:
         self.support_ = raw_support
         self.support_labels_ = labels
         self.scoring_clf_ = scoring_clf
+        self.class_prior_ = updated_class_prior
         self.fit_time_s_ = fit_time_s
         self.pool_time_s_ = pool_time_s
 

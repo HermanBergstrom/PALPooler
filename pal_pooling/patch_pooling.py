@@ -583,7 +583,7 @@ def refine_dataset_features(
     val_context_features: Optional[np.ndarray] = None, # [N_val, D_context]
     val_tabular_probs:  Optional[np.ndarray] = None,  # [N_val, n_classes]
     val_aoe_mask:       Optional[np.ndarray] = None,  # [N_val] bool
-) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Union[Ridge, "RidgeGPU"], Optional[StandardScaler], TabICLClassifier, float, float]:
+) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Union[Ridge, "RidgeGPU"], Optional[StandardScaler], TabICLClassifier, float, float, Optional[np.ndarray]]:
     """Refine mean-pooled support features with Ridge-predicted quality-weighted pooling.
 
     A TabICL classifier fitted on the *input* support is used solely to generate
@@ -838,16 +838,6 @@ def refine_dataset_features(
             mean_probs = probs_flat_t.mean(dim=0).cpu().numpy()
 
             all_targets_t = _torch.empty(n_fwd, dtype=_torch.float32, device=_dev)
-            for idx in range(N_active):
-                start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
-                if start == end:
-                    continue
-                all_targets_t[start:end] = compute_patch_quality_logits_gpu(
-                    probs_flat_t[start:end], int(active_labels[idx]),
-                    refinement_cfg.temperature, _eff_method(idx),
-                    active_tabular_probs_t[idx] if active_tabular_probs_t is not None else class_prior_t,
-                )
-            all_targets = all_targets_t
         else:
             probs_flat  = clf.predict_proba(query_features, attn_mask=attn_mask_np)  # [n_fwd, n_classes] CPU
             if n_cls_expected is not None and probs_flat.shape[1] != n_cls_expected:
@@ -858,15 +848,6 @@ def refine_dataset_features(
             mean_probs = probs_flat.mean(axis=0)
 
             all_targets = np.empty(n_fwd, dtype=np.float32)
-            for idx in range(N_active):
-                start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
-                if start == end:
-                    continue
-                all_targets[start:end] = compute_patch_quality_logits(
-                    probs_flat[start:end], int(active_labels[idx]),
-                    refinement_cfg.temperature, _eff_method(idx),
-                    active_tabular_probs[idx] if active_tabular_probs is not None else class_prior,
-                )
 
     else:
         # Batched loop: used when max_query_rows is None, or when cap is exceeded
@@ -880,6 +861,7 @@ def refine_dataset_features(
 
         sum_probs = None
         count_probs = 0
+        saved_probs = []
 
         for batch_start in tqdm(range(0, N, refinement_cfg.batch_size),
                                 desc="Computing patch quality scores", unit="batch"):
@@ -947,17 +929,10 @@ def refine_dataset_features(
                     sum_probs += batch_mean_sum
 
                 probs_t = probs_t.reshape(B_a, P, -1)  # GPU
+                saved_probs.append((probs_t, batch_labels_arr, batch_is_aoe, B_a))
                 for j in range(B_a):
-                    eff = ("entropy"
-                           if batch_is_aoe is not None and batch_is_aoe[j]
-                           else refinement_cfg.weight_method)
                     s, e = base + j * P, base + (j + 1) * P
                     all_features[s:e] = batch_patches_arr[j]
-                    all_targets[s:e]  = compute_patch_quality_logits_gpu(
-                        probs_t[j], int(batch_labels_arr[j]),
-                        refinement_cfg.temperature, eff,
-                        active_tabular_probs_t[row_ptr + j] if active_tabular_probs_t is not None else class_prior_t,
-                    )
             else:
                 probs = clf.predict_proba(query_features, attn_mask=_batch_attn_mask_np)
                 if n_cls_expected is not None and probs.shape[1] != n_cls_expected:
@@ -973,17 +948,10 @@ def refine_dataset_features(
                     sum_probs += batch_mean_sum
 
                 probs = probs.reshape(B_a, P, -1)  # CPU
+                saved_probs.append((probs, batch_labels_arr, batch_is_aoe, B_a))
                 for j in range(B_a):
-                    eff = ("entropy"
-                           if batch_is_aoe is not None and batch_is_aoe[j]
-                           else refinement_cfg.weight_method)
                     s, e = base + j * P, base + (j + 1) * P
                     all_features[s:e] = batch_patches_arr[j]
-                    all_targets[s:e]  = compute_patch_quality_logits(
-                        probs[j], int(batch_labels_arr[j]),
-                        refinement_cfg.temperature, eff,
-                        active_tabular_probs[row_ptr + j] if active_tabular_probs is not None else class_prior,
-                    )
             row_ptr += B_a
 
         if count_probs > 0:
@@ -991,6 +959,71 @@ def refine_dataset_features(
 
     print(f"[calibration] Empirical label prior:    {np.round(empirical_prior, 4)}")
     print(f"[calibration] Marginal patch predicted: {np.round(mean_probs, 4)}")
+
+    if refinement_cfg.use_marginal_prior:
+        class_prior = mean_probs.astype(np.float32)
+
+    if use_gpu:
+        import torch as _torch
+        class_prior_t = (
+            _torch.from_numpy(class_prior).to(_dev) if class_prior is not None else None
+        )
+        
+    # Now we assign quality-logit targets using the optionally updated class_prior.
+    n_cls_expected = int(train_labels.max()) + 1
+
+    if one_pass:
+        if use_gpu:
+            for idx in range(N_active):
+                start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
+                if start == end:
+                    continue
+                all_targets_t[start:end] = compute_patch_quality_logits_gpu(
+                    probs_flat_t[start:end], int(active_labels[idx]),
+                    refinement_cfg.temperature, _eff_method(idx),
+                    active_tabular_probs_t[idx] if active_tabular_probs_t is not None else class_prior_t,
+                )
+            all_targets = all_targets_t
+        else:
+            for idx in range(N_active):
+                start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
+                if start == end:
+                    continue
+                all_targets[start:end] = compute_patch_quality_logits(
+                    probs_flat[start:end], int(active_labels[idx]),
+                    refinement_cfg.temperature, _eff_method(idx),
+                    active_tabular_probs[idx] if active_tabular_probs is not None else class_prior,
+                )
+
+    else:
+        # Re-iterate over saved probabilities to compute targets
+        row_ptr = 0
+        for probs_batch, batch_labels, batch_is_aoe, B_a in saved_probs:
+            base = row_ptr * P
+            if use_gpu:
+                for j in range(B_a):
+                    eff = ("entropy"
+                           if batch_is_aoe is not None and batch_is_aoe[j]
+                           else refinement_cfg.weight_method)
+                    s, e = base + j * P, base + (j + 1) * P
+                    all_targets[s:e]  = compute_patch_quality_logits_gpu(
+                        probs_batch[j], int(batch_labels[j]),
+                        refinement_cfg.temperature, eff,
+                        active_tabular_probs_t[row_ptr + j] if active_tabular_probs_t is not None else class_prior_t,
+                    )
+            else:
+                for j in range(B_a):
+                    eff = ("entropy"
+                           if batch_is_aoe is not None and batch_is_aoe[j]
+                           else refinement_cfg.weight_method)
+                    s, e = base + j * P, base + (j + 1) * P
+                    all_targets[s:e]  = compute_patch_quality_logits(
+                        probs_batch[j], int(batch_labels[j]),
+                        refinement_cfg.temperature, eff,
+                        active_tabular_probs[row_ptr + j] if active_tabular_probs is not None else class_prior,
+                    )
+            row_ptr += B_a
+
 
     # --- Fit Ridge on collected (patch_feature, quality_logit) pairs ---
     feature_scaler: Optional[StandardScaler] = None
@@ -1031,4 +1064,4 @@ def refine_dataset_features(
     print(f"[timing] fit={fit_time_s:.1f}s  pool={pool_time_s:.1f}s  "
           f"total={fit_time_s + pool_time_s:.1f}s")
 
-    return refined, new_pca, weights_ridge, ridge_model, feature_scaler, clf, fit_time_s, pool_time_s
+    return refined, new_pca, weights_ridge, ridge_model, feature_scaler, clf, fit_time_s, pool_time_s, class_prior

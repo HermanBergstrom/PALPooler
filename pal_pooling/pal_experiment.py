@@ -532,13 +532,17 @@ def _make_stage_callback(
                 split_configs_iter.append(("val", val_grouped, val_labels, val_image_paths, val_sample_idx))
             if cfg.run.viz_loo_train:
                 split_configs_iter.append(("train_loo", train_grouped, train_labels, train_image_paths, train_sample_idx))
+            
+            # Use stage.class_prior_ if available, falling back to class_prior.
+            active_class_prior = getattr(stage, 'class_prior_', class_prior)
+
             iter_mean_probs = _run_visual_eval(
                 tag, pre_refine_support, train_labels, split_configs_iter, idx_to_class,
                 pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators,
                 patch_size=eff_patch_sz, seed=cfg.seed, output_dir=output_dir,
                 temperature=stage.refinement_cfg.temperature,
                 ridge_model=None, feature_scaler=None, open_image=open_image,
-                class_prior=class_prior, weight_method=cfg.refinement.weight_method,
+                class_prior=active_class_prior, weight_method=cfg.refinement.weight_method,
                 show_pred_label=cfg.run.show_pred_label,
                 show_minority_prob=cfg.run.show_minority_prob,
                 use_attn_masking=cfg.refinement.use_attn_masking,
@@ -561,13 +565,17 @@ def _make_stage_callback(
                 split_configs_post.append(("val", val_grouped, val_labels, val_image_paths, val_sample_idx))
             if cfg.run.viz_loo_train:
                 split_configs_post.append(("train_loo", train_grouped, train_labels, train_image_paths, train_sample_idx))
+            
+            # Use stage.class_prior_ if available, falling back to class_prior.
+            active_class_prior = getattr(stage, 'class_prior_', class_prior)
+
             iter_mean_probs = _run_visual_eval(
                 f"{tag}_post", pre_refine_support, train_labels, split_configs_post, idx_to_class,
                 pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators,
                 patch_size=eff_patch_sz, seed=cfg.seed, output_dir=output_dir,
                 temperature=stage.refinement_cfg.temperature,
                 ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
-                class_prior=class_prior, weight_method=cfg.refinement.weight_method,
+                class_prior=active_class_prior, weight_method=cfg.refinement.weight_method,
                 show_pred_label=cfg.run.show_pred_label,
                 show_minority_prob=cfg.run.show_minority_prob,
                 use_attn_masking=cfg.refinement.use_attn_masking,
@@ -606,6 +614,7 @@ def _make_stage_callback(
             ridge_model=ridge_model, feature_scaler=feature_scaler,
             pre_refine_support=pre_refine_support, pre_refine_pca=pre_refine_pca,
             temperature=stage.refinement_cfg.temperature,
+            class_prior=getattr(stage, 'class_prior_', class_prior),
         )
 
     return callback, last_stage_data
@@ -958,7 +967,7 @@ def run_pal_experiment(
             seed=cfg.seed, output_dir=output_dir,
             temperature=_last_stage_data["temperature"],
             ridge_model=_last_stage_data["ridge_model"], feature_scaler=_last_stage_data["feature_scaler"],
-            open_image=open_image, class_prior=class_prior, weight_method=cfg.refinement.weight_method,
+            open_image=open_image, class_prior=_last_stage_data.get("class_prior", class_prior), weight_method=cfg.refinement.weight_method,
             show_pred_label=cfg.run.show_pred_label,
             show_minority_prob=cfg.run.show_minority_prob,
             use_attn_masking=cfg.refinement.use_attn_masking,
