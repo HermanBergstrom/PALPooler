@@ -59,6 +59,7 @@ class AttentionPoolConfig:
 class RunConfig:
     output_dir: Path
     post_refinement_viz: bool
+    viz_loo_train: bool
     show_pred_label: bool
     show_minority_prob: bool
     n_train_sweep: Optional[List[int]]
@@ -160,6 +161,8 @@ def parse_args() -> ExperimentConfig:
                    help="Solve Ridge regression on the GPU (requires PyTorch + CUDA).")
     p.add_argument("--post-refinement-viz", action="store_true",
                    help="Skip pre-refinement visualisations; only produce post-refinement figures.")
+    p.add_argument("--viz-loo-train", action="store_true",
+                   help="Add a leave-one-out visual evaluation of train images without themselves in the support set.")
     p.add_argument("--pred-label-viz", action="store_true",
                    help="Add a discrete per-patch predicted-label panel to visualisation figures.")
     p.add_argument("--minority-prob-viz", action="store_true",
@@ -238,6 +241,7 @@ def parse_args() -> ExperimentConfig:
     run_cfg = RunConfig(
         output_dir=args.output_dir,
         post_refinement_viz=args.post_refinement_viz,
+        viz_loo_train=args.viz_loo_train,
         show_pred_label=args.pred_label_viz,
         show_minority_prob=args.minority_prob_viz,
         n_train_sweep=args.n_train_sweep,

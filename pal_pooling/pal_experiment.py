@@ -178,7 +178,16 @@ def _run_visual_eval(
         if pca is not None:
             flat_query = pca.transform(flat_query)
 
-        probs_all = clf.predict_proba(flat_query)
+        if split_name == "train_loo":
+            mask = np.ones(len(support_features), dtype=bool)
+            mask[sample_idx] = False
+            clf.fit(support_features[mask], train_labels[mask])
+            probs_all = clf.predict_proba(flat_query)
+            # Restore clf state for potential next configs
+            clf.fit(support_features, train_labels)
+        else:
+            probs_all = clf.predict_proba(flat_query)
+            
         probs_all = probs_all.reshape(N_s, P_dim, n_classes)
 
         ridge_pred_logits_all = None
@@ -505,6 +514,8 @@ def _make_stage_callback(
                 ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
                 ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
             ]
+            if cfg.run.viz_loo_train:
+                split_configs_iter.append(("train_loo", train_grouped, train_labels, train_image_paths, train_sample_idx))
             iter_mean_probs = _run_visual_eval(
                 tag, pre_refine_support, train_labels, split_configs_iter, idx_to_class,
                 pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators,
@@ -529,6 +540,8 @@ def _make_stage_callback(
                 ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
                 ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
             ]
+            if cfg.run.viz_loo_train:
+                split_configs_post.append(("train_loo", train_grouped, train_labels, train_image_paths, train_sample_idx))
             iter_mean_probs = _run_visual_eval(
                 f"{tag}_post", pre_refine_support, train_labels, split_configs_post, idx_to_class,
                 pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators,
@@ -778,6 +791,8 @@ def run_pal_experiment(
             ("train", train_patches, train_labels, train_image_paths, train_sample_idx),
             ("test",  test_patches,  test_labels,  test_image_paths,  test_sample_idx),
         ]
+        if cfg.run.viz_loo_train:
+            split_configs_orig.append(("train_loo", train_patches, train_labels, train_image_paths, train_sample_idx))
         baseline_mean_probs = _run_visual_eval(
             "baseline", baseline_support, train_labels, split_configs_orig, idx_to_class,
             pca=pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=cfg.refinement.patch_size,
@@ -860,6 +875,8 @@ def run_pal_experiment(
             ("train", _last_stage_data["train_grouped"], train_labels, train_image_paths, train_sample_idx),
             ("test",  _last_stage_data["test_grouped"],  test_labels,  test_image_paths,  test_sample_idx),
         ]
+        if cfg.run.viz_loo_train:
+            split_configs_final.append(("train_loo", _last_stage_data["train_grouped"], train_labels, train_image_paths, train_sample_idx))
         _run_visual_eval(
             f"{_last_stage_data['tag']}_post", _last_stage_data["pre_refine_support"], train_labels,
             split_configs_final, idx_to_class,
