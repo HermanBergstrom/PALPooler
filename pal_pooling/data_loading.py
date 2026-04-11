@@ -438,7 +438,7 @@ def _load_features(
         from petfinder_dataset_with_dinov3 import load_petfinder_dataset  # type: ignore
 
         train_loader, val_loader, test_loader, metadata = load_petfinder_dataset(
-            feature_dir="/scratch/hermanb/temp_datasets/extracted_features/dvm/dvm_dinov3_local_features",
+            processed_dir=petfinder_dir / "extracted_features" / "preprocessed_dinov3_local",
             feature_source="dinov3_local",
             use_patches=True,
             use_images=True,

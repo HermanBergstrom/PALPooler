@@ -656,12 +656,14 @@ def refine_dataset_features(
     t_start = time.perf_counter()
     N, P, D = train_patches.shape
 
-    # Precompute empirical class prior (used by kl_div, wasserstein, js_div, and tvd weight methods).
+    # Precompute empirical class prior
+    n_cls_local = int(train_labels.max()) + 1
+    counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls_local)
+    empirical_prior = (counts / counts.sum()).astype(np.float32)
+
     _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd")
     if refinement_cfg.weight_method in _divergence_methods:
-        n_cls_local = int(train_labels.max()) + 1
-        counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls_local)
-        class_prior: Optional[np.ndarray] = (counts / counts.sum()).astype(np.float32)
+        class_prior: Optional[np.ndarray] = empirical_prior
     else:
         class_prior = None
 
@@ -765,6 +767,11 @@ def refine_dataset_features(
     exceeded = refinement_cfg.max_query_rows is not None and active_total_rows > refinement_cfg.max_query_rows
     one_pass = refinement_cfg.max_query_rows is not None and (not exceeded or refinement_cfg.use_random_subsampling)
 
+    # Attention masking is only meaningful when the query images are the same as the support
+    # images (i.e. when no separate validation set is used for Ridge fitting).  When val_patches
+    # are supplied, the query images are out-of-support val images, so masking doesn't apply.
+    _apply_attn_mask = refinement_cfg.use_attn_masking and (val_patches is None)
+
     if one_pass:
         if exceeded:
             # Subsampled: draw max_query_rows (image, patch) pairs from active images
@@ -784,6 +791,13 @@ def refine_dataset_features(
                 source_context[active_indices][local_img_idx].astype(np.float32)
                 if source_context is not None else None
             )
+            # Attention mask: query row k belongs to active image local_img_idx[k],
+            # original support index active_indices[local_img_idx[k]].
+            if _apply_attn_mask:
+                attn_mask_np = np.zeros((n_fwd, N), dtype=bool)
+                attn_mask_np[np.arange(n_fwd), active_indices[local_img_idx]] = True
+            else:
+                attn_mask_np = None
         else:
             # All active rows in one pass; sequential layout matches reshape order
             n_fwd          = active_total_rows
@@ -794,6 +808,14 @@ def refine_dataset_features(
                 np.repeat(source_context[active_indices].astype(np.float32), P_dim, axis=0)
                 if source_context is not None else None
             )
+            # Attention mask: each query row k belongs to active image k // P_dim,
+            # original support index active_indices[k // P_dim].
+            if _apply_attn_mask:
+                attn_mask_np = np.zeros((n_fwd, N), dtype=bool)
+                for _i in range(N_active):
+                    attn_mask_np[_i * P_dim:(_i + 1) * P_dim, active_indices[_i]] = True
+            else:
+                attn_mask_np = None
 
         query_features = pca.transform(query_raw) if pca is not None else query_raw
         if ctx_for_queries is not None:
@@ -803,12 +825,18 @@ def refine_dataset_features(
         n_cls_expected = int(train_labels.max()) + 1
 
         if use_gpu:
-            probs_flat_t = clf.predict_proba_tensor(query_features)     # [n_fwd, n_classes] GPU
+            _attn_mask_t = (
+                _torch.from_numpy(attn_mask_np) if attn_mask_np is not None else None
+            )
+            probs_flat_t = clf.predict_proba_tensor(query_features, attn_mask=_attn_mask_t)  # [n_fwd, n_classes] GPU
             if n_cls_expected is not None and probs_flat_t.shape[1] != n_cls_expected:
                 cls_tensor = _torch.tensor(clf.classes_, device=probs_flat_t.device, dtype=_torch.long)
                 full_t = _torch.zeros((probs_flat_t.shape[0], n_cls_expected), dtype=probs_flat_t.dtype, device=probs_flat_t.device)
                 full_t[:, cls_tensor] = probs_flat_t
                 probs_flat_t = full_t
+
+            mean_probs = probs_flat_t.mean(dim=0).cpu().numpy()
+
             all_targets_t = _torch.empty(n_fwd, dtype=_torch.float32, device=_dev)
             for idx in range(N_active):
                 start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
@@ -821,11 +849,14 @@ def refine_dataset_features(
                 )
             all_targets = all_targets_t
         else:
-            probs_flat  = clf.predict_proba(query_features)             # [n_fwd, n_classes] CPU
+            probs_flat  = clf.predict_proba(query_features, attn_mask=attn_mask_np)  # [n_fwd, n_classes] CPU
             if n_cls_expected is not None and probs_flat.shape[1] != n_cls_expected:
                 full = np.zeros((probs_flat.shape[0], n_cls_expected), dtype=probs_flat.dtype)
                 full[:, clf.classes_] = probs_flat
                 probs_flat = full
+
+            mean_probs = probs_flat.mean(axis=0)
+
             all_targets = np.empty(n_fwd, dtype=np.float32)
             for idx in range(N_active):
                 start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
@@ -846,6 +877,9 @@ def refine_dataset_features(
         else:
             all_targets = np.empty(active_total_rows, dtype=np.float32)
         row_ptr      = 0
+
+        sum_probs = None
+        count_probs = 0
 
         for batch_start in tqdm(range(0, N, refinement_cfg.batch_size),
                                 desc="Computing patch quality scores", unit="batch"):
@@ -879,15 +913,39 @@ def refine_dataset_features(
                 )
             base           = row_ptr * P
 
+            # Build attention mask for this batch when use_attn_masking is enabled.
+            # query row j*P:(j+1)*P belongs to original image orig_idx[j]; mask its support row.
+            if _apply_attn_mask:
+                if aoe_mask is not None and refinement_cfg.aoe_handling == "filter":
+                    batch_orig_indices = active_in_batch        # already original indices
+                else:
+                    batch_orig_indices = list(range(batch_start, batch_end))
+                _batch_attn_mask_np = np.zeros((B_a * P, N), dtype=bool)
+                for _j, _orig in enumerate(batch_orig_indices):
+                    _batch_attn_mask_np[_j * P:(_j + 1) * P, _orig] = True
+            else:
+                _batch_attn_mask_np = None
+
             n_cls_expected = int(train_labels.max()) + 1
 
             if use_gpu:
-                probs_t = clf.predict_proba_tensor(query_features)
+                _batch_attn_mask_t = (
+                    _torch.from_numpy(_batch_attn_mask_np) if _batch_attn_mask_np is not None else None
+                )
+                probs_t = clf.predict_proba_tensor(query_features, attn_mask=_batch_attn_mask_t)
                 if n_cls_expected is not None and probs_t.shape[1] != n_cls_expected:
                     cls_tensor = _torch.tensor(clf.classes_, device=probs_t.device, dtype=_torch.long)
                     full_t = _torch.zeros((probs_t.shape[0], n_cls_expected), dtype=probs_t.dtype, device=probs_t.device)
                     full_t[:, cls_tensor] = probs_t
                     probs_t = full_t
+
+                batch_mean_sum = probs_t.sum(dim=0).cpu().numpy()
+                count_probs += probs_t.shape[0]
+                if sum_probs is None:
+                    sum_probs = batch_mean_sum
+                else:
+                    sum_probs += batch_mean_sum
+
                 probs_t = probs_t.reshape(B_a, P, -1)  # GPU
                 for j in range(B_a):
                     eff = ("entropy"
@@ -901,11 +959,19 @@ def refine_dataset_features(
                         active_tabular_probs_t[row_ptr + j] if active_tabular_probs_t is not None else class_prior_t,
                     )
             else:
-                probs = clf.predict_proba(query_features)
+                probs = clf.predict_proba(query_features, attn_mask=_batch_attn_mask_np)
                 if n_cls_expected is not None and probs.shape[1] != n_cls_expected:
                     full = np.zeros((probs.shape[0], n_cls_expected), dtype=probs.dtype)
                     full[:, clf.classes_] = probs
                     probs = full
+
+                batch_mean_sum = probs.sum(axis=0)
+                count_probs += probs.shape[0]
+                if sum_probs is None:
+                    sum_probs = batch_mean_sum
+                else:
+                    sum_probs += batch_mean_sum
+
                 probs = probs.reshape(B_a, P, -1)  # CPU
                 for j in range(B_a):
                     eff = ("entropy"
@@ -919,6 +985,12 @@ def refine_dataset_features(
                         active_tabular_probs[row_ptr + j] if active_tabular_probs is not None else class_prior,
                     )
             row_ptr += B_a
+
+        if count_probs > 0:
+            mean_probs = sum_probs / count_probs
+
+    print(f"[calibration] Empirical label prior:    {np.round(empirical_prior, 4)}")
+    print(f"[calibration] Marginal patch predicted: {np.round(mean_probs, 4)}")
 
     # --- Fit Ridge on collected (patch_feature, quality_logit) pairs ---
     feature_scaler: Optional[StandardScaler] = None

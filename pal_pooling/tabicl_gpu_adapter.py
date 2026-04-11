@@ -60,6 +60,7 @@ class TabICLGPUAdapter(TabICLClassifier):
         Xs: np.ndarray,
         ys: np.ndarray,
         feature_shuffles: Optional[np.ndarray] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """GPU-persistent version of the parent's ``_batch_forward``.
 
@@ -68,6 +69,9 @@ class TabICLGPUAdapter(TabICLClassifier):
         Xs : np.ndarray, shape (n_datasets, n_samples, n_features)
         ys : np.ndarray, shape (n_datasets, train_size)
         feature_shuffles : np.ndarray or None
+        attn_mask : torch.Tensor or None
+            Attention mask of shape ``(test_size, train_size)`` forwarded to the
+            ICL transformer.  Non-zero / True values suppress attention scores.
 
         Returns
         -------
@@ -105,6 +109,7 @@ class TabICLGPUAdapter(TabICLClassifier):
                     return_logits=True if self.average_logits else False,
                     softmax_temperature=self.softmax_temperature,
                     inference_config=self.inference_config_,
+                    attn_mask=attn_mask,
                 )
             outputs.append(out.float())  # stays on device
 
@@ -158,13 +163,20 @@ class TabICLGPUAdapter(TabICLClassifier):
     # Public prediction interface
     # ------------------------------------------------------------------
 
-    def predict_proba_tensor(self, X: np.ndarray) -> torch.Tensor:
+    def predict_proba_tensor(
+        self,
+        X: np.ndarray,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Like ``predict_proba`` but returns a GPU ``torch.Tensor``.
 
         Parameters
         ----------
         X : np.ndarray, shape (n_samples, n_features)
             Test features (same dtype/format as for the parent class).
+        attn_mask : torch.Tensor or None, default=None
+            Attention mask of shape ``(n_test, n_train)`` forwarded to the ICL
+            transformer.  Non-zero / True values suppress attention scores.
 
         Returns
         -------
@@ -200,7 +212,7 @@ class TabICLGPUAdapter(TabICLClassifier):
                 outputs_list = []
                 for norm_method, (Xs, ys) in data.items():
                     feature_shuffles = self.ensemble_generator_.feature_shuffles_[norm_method]
-                    outputs_list.append(self._batch_forward(Xs, ys, feature_shuffles))
+                    outputs_list.append(self._batch_forward(Xs, ys, feature_shuffles, attn_mask=attn_mask))
                 outputs = torch.cat(outputs_list, dim=0)
 
             # outputs: [n_estimators, test_size, n_classes]  on GPU
@@ -229,6 +241,10 @@ class TabICLGPUAdapter(TabICLClassifier):
             if self.n_jobs is not None:
                 torch.set_num_threads(old_n_threads)
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(
+        self,
+        X: np.ndarray,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> np.ndarray:
         """Drop-in replacement: calls ``predict_proba_tensor`` and converts to numpy."""
-        return self.predict_proba_tensor(X).cpu().numpy()
+        return self.predict_proba_tensor(X, attn_mask=attn_mask).cpu().numpy()

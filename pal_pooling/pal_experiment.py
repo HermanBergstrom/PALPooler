@@ -151,6 +151,7 @@ def _run_visual_eval(
     weight_method:     str  = "correct_class_prob",
     show_pred_label:   bool = False,
     show_minority_prob: bool = False,
+    use_attn_masking:  bool = False,
 ) -> dict[str, float]:
     """Run the patch-quality visual evaluation for one support set variant.
 
@@ -185,6 +186,14 @@ def _run_visual_eval(
             probs_all = clf.predict_proba(flat_query)
             # Restore clf state for potential next configs
             clf.fit(support_features, train_labels)
+        elif split_name == "train" and use_attn_masking:
+            # Each query image is in the support; block its patches from attending
+            # to its own support row. Mask shape: (N_s * P_dim, N_train).
+            N_train = len(support_features)
+            attn_mask = np.zeros((N_s * P_dim, N_train), dtype=bool)
+            for _i, _orig in enumerate(sample_idx):
+                attn_mask[_i * P_dim:(_i + 1) * P_dim, _orig] = True
+            probs_all = clf.predict_proba(flat_query, attn_mask=attn_mask)
         else:
             probs_all = clf.predict_proba(flat_query)
             
@@ -532,6 +541,7 @@ def _make_stage_callback(
                 class_prior=class_prior, weight_method=cfg.refinement.weight_method,
                 show_pred_label=cfg.run.show_pred_label,
                 show_minority_prob=cfg.run.show_minority_prob,
+                use_attn_masking=cfg.refinement.use_attn_masking,
             )
         else:
             iter_mean_probs = {}
@@ -560,6 +570,7 @@ def _make_stage_callback(
                 class_prior=class_prior, weight_method=cfg.refinement.weight_method,
                 show_pred_label=cfg.run.show_pred_label,
                 show_minority_prob=cfg.run.show_minority_prob,
+                use_attn_masking=cfg.refinement.use_attn_masking,
             )
 
         # Pool test queries with Ridge and evaluate accuracy.
@@ -771,6 +782,7 @@ def run_pal_experiment(
     # --- Image paths + opener for visualisation (only loaded when needed) ---
     train_image_paths: list = []
     test_image_paths:  list = []
+    val_image_paths:   list = []
     open_image: Optional[Callable] = None
     if cfg.dataset.n_sample > 0:
         if cfg.dataset.dataset == "butterfly":
@@ -794,7 +806,6 @@ def run_pal_experiment(
         if bal_train_keep_idx is not None:
             train_image_paths = [train_image_paths[i] for i in bal_train_keep_idx]
         
-        val_image_paths: list = []
         if val_keep_idx is not None and train_keep_idx is not None:
             val_image_paths = [train_image_paths[i] for i in val_keep_idx]
             train_image_paths = [train_image_paths[i] for i in train_keep_idx]
@@ -850,6 +861,7 @@ def run_pal_experiment(
             class_prior=class_prior, weight_method=cfg.refinement.weight_method,
             show_pred_label=cfg.run.show_pred_label,
             show_minority_prob=cfg.run.show_minority_prob,
+            use_attn_masking=cfg.refinement.use_attn_masking,
         )
     else:
         baseline_mean_probs = {}
@@ -949,6 +961,7 @@ def run_pal_experiment(
             open_image=open_image, class_prior=class_prior, weight_method=cfg.refinement.weight_method,
             show_pred_label=cfg.run.show_pred_label,
             show_minority_prob=cfg.run.show_minority_prob,
+            use_attn_masking=cfg.refinement.use_attn_masking,
         )
 
     total_time_s = time.perf_counter() - experiment_start
