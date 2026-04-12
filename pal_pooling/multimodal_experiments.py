@@ -311,19 +311,14 @@ def _load_dataset(
 # Experiment runner
 # ---------------------------------------------------------------------------
 
-def run_multimodal_experiment(args: argparse.Namespace) -> None:
-    _set_global_seeds(args.seed)
-
-    dataset_path = args.dataset_path
-    if dataset_path is None:
-        dataset_path = {
-            "dvm":       DVM_DATASET_PATH,
-            "petfinder": PETFINDER_DATASET_PATH,
-            "pad-ufes":  PAD_UFES_DATASET_PATH,
-        }[args.dataset]
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _run_single_seed(
+    args: argparse.Namespace,
+    seed: int,
+    dataset_path: Path,
+    output_dir: Path,
+) -> dict:
+    """Run all experiment conditions for a single seed. Returns the result record."""
+    _set_global_seeds(seed)
     run_ts = datetime.now(timezone.utc).isoformat()
     t_start = time.perf_counter()
 
@@ -338,7 +333,7 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
         n_train=args.n_train,
         max_train=args.max_train,
         max_test=args.max_test,
-        seed=args.seed,
+        seed=seed,
     )
 
     N_train, P, D = train_patches.shape
@@ -365,7 +360,7 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
             train_feat, train_labels,
             test_feat,  test_labels,
             n_estimators=args.n_estimators,
-            seed=args.seed,
+            seed=seed,
         )
         elapsed = time.perf_counter() - t0
         auroc_str = f"{auroc:.4f}" if not np.isnan(auroc) else "nan"
@@ -379,20 +374,18 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
 
     # ── Baseline: tabular only ───────────────────────────────────────────────
     print("\n--- tabular_only ---")
-    #print(tab_train.shape, tab_test.shape)
-    #print(tab_train[:5])
     _eval("tabular_only", tab_train, tab_test)
 
     # ── Baseline: mean-pool image only ───────────────────────────────────────
     print("\n--- mean_pool_img ---")
     mean_train_raw = train_patches.astype(np.float32).mean(axis=1)  # [N, D]
     mean_test_raw  = test_patches.astype(np.float32).mean(axis=1)
-    mean_train, mean_test, mean_pca = _pca_project(mean_train_raw, mean_test_raw, pca_dim, args.seed)
+    mean_train, mean_test, mean_pca = _pca_project(mean_train_raw, mean_test_raw, pca_dim, seed)
     _eval("mean_pool_img", mean_train, mean_test)
 
     # ── Baseline: CLS token image only ──────────────────────────────────────
     print("\n--- cls_img ---")
-    cls_train_proj, cls_test_proj, cls_pca = _pca_project(cls_train, cls_test, pca_dim, args.seed)
+    cls_train_proj, cls_test_proj, cls_pca = _pca_project(cls_train, cls_test, pca_dim, seed)
     _eval("cls_img", cls_train_proj, cls_test_proj)
 
     # ── Baseline: mean-pool image + tabular ──────────────────────────────────
@@ -427,11 +420,11 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
         tabicl_pca_dim=pca_dim,
         append_cls=False,
         use_global_prior=args.use_global_prior,
-        use_attn_masking=True,
-        use_marginal_prior=True
+        use_attn_masking=args.use_attn_masking,
+        use_marginal_prior=args.use_marginal_prior
     )
 
-    pooler = pooler_factory(refinement_cfg=refinement_cfg, seed=args.seed)
+    pooler = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
     t_fit = time.perf_counter()
     pooler.fit(train_patches, train_labels)
     fit_time_s = time.perf_counter() - t_fit
@@ -468,7 +461,7 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
     # The pooler sees tabular features during TabICL scoring (quality targets are
     # tabular-informed), but the Ridge model and pooling weights are still DINO-only.
     print("\n--- Fitting IterativePALPooler (tabular context) ---")
-    pooler_ctx = pooler_factory(refinement_cfg=refinement_cfg, seed=args.seed)
+    pooler_ctx = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
     t_fit_ctx = time.perf_counter()
     pooler_ctx.fit(train_patches, train_labels, context_features=tab_train)
     fit_time_ctx_s = time.perf_counter() - t_fit_ctx
@@ -495,10 +488,10 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
           _concat_tabular(pal_ctx_train_proj, tab_train),
           _concat_tabular(pal_ctx_test_proj,  tab_test))
 
-    # ── Save results ─────────────────────────────────────────────────────────
     total_time_s = time.perf_counter() - t_start
     record = {
         "run_timestamp": run_ts,
+        "seed":          seed,
         "total_time_s":  round(total_time_s, 2),
         "args": {
             "dataset":            args.dataset,
@@ -510,7 +503,7 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
             "temperature":        args.temperature,
             "ridge_alpha":        args.ridge_alpha,
             "weight_method":      args.weight_method,
-            "seed":               args.seed,
+            "seed":               seed,
         },
         "dataset_info": {
             "n_train":   int(N_train),
@@ -523,13 +516,56 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
         },
         "results": results,
     }
-    results_path = output_dir / "multimodal_results.json"
-    with results_path.open("w") as f:
-        json.dump(record, f, indent=2)
 
-    print(f"\n[done] Total time: {total_time_s:.1f}s")
-    print(f"[done] Results saved → {results_path}")
+    print(f"\n[seed {seed}] Total time: {total_time_s:.1f}s")
     _print_summary(results)
+    return record
+
+
+def run_multimodal_experiment(args: argparse.Namespace) -> None:
+    seeds = args.seeds
+
+    dataset_path = args.dataset_path
+    if dataset_path is None:
+        dataset_path = {
+            "dvm":       DVM_DATASET_PATH,
+            "petfinder": PETFINDER_DATASET_PATH,
+            "pad-ufes":  PAD_UFES_DATASET_PATH,
+        }[args.dataset]
+
+    output_dir = Path(args.output_dir) if args.output_dir is not None else Path("results/multimodal") / args.dataset
+    output_dir.mkdir(parents=True, exist_ok=True)
+    combined_path = output_dir / "multimodal_results.json"
+
+    # Load existing results so a re-run appends rather than overwrites.
+    if combined_path.exists():
+        with combined_path.open() as f:
+            all_records: list[dict] = json.load(f)
+        if not isinstance(all_records, list):
+            # Legacy single-record file — wrap it.
+            all_records = [all_records]
+    else:
+        all_records = []
+
+    completed_seeds = {r.get("seed", r["args"]["seed"]) for r in all_records}
+
+    for i, seed in enumerate(seeds):
+        print(f"\n{'='*60}")
+        print(f"  Seed {seed}  ({i + 1}/{len(seeds)})")
+        print(f"{'='*60}")
+
+        if seed in completed_seeds:
+            print(f"[skip] seed {seed} already present in {combined_path}")
+            continue
+
+        record = _run_single_seed(args, seed, dataset_path, output_dir)
+        all_records.append(record)
+
+        with combined_path.open("w") as f:
+            json.dump(all_records, f, indent=2)
+        print(f"[saved] {combined_path}  ({len(all_records)} record(s) total)")
+
+    print(f"\n[done] All seeds finished. Results → {combined_path}")
 
 
 def _print_summary(results: dict) -> None:
@@ -587,8 +623,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--use-global-prior", action="store_true",
                    help="Use the global class prior P(Y) as the divergence reference even when "
                         "context features are provided, instead of the per-image P(Y|X_tab).")
-    p.add_argument("--seed",           type=int,   default=42)
-    p.add_argument("--output-dir",     type=Path,  default=Path("results/multimodal"))
+    p.add_argument("--use-attn-masking", action=argparse.BooleanOptionalAction, default=True,
+                   help="Use attention masking in PALPooler (default: True)")
+    p.add_argument("--use-marginal-prior", action=argparse.BooleanOptionalAction, default=True,
+                   help="Use marginal patch prior in PALPooler (default: True)")
+    p.add_argument("--seeds",          type=int,   nargs="+", default=[42],
+                   help="One or more random seeds, e.g. --seeds 42 123 456. "
+                        "Results are saved after every seed. (default: 42)")
+    p.add_argument("--output-dir",     type=Path,  default=None,
+                   help="Directory to save results (default: results/multimodal/<dataset>)")
     return p.parse_args()
 
 
