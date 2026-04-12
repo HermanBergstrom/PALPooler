@@ -427,6 +427,8 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
         tabicl_pca_dim=pca_dim,
         append_cls=False,
         use_global_prior=args.use_global_prior,
+        use_attn_masking=True,
+        use_marginal_prior=True
     )
 
     pooler = pooler_factory(refinement_cfg=refinement_cfg, seed=args.seed)

@@ -61,6 +61,7 @@ class TabICLGPUAdapter(TabICLClassifier):
         ys: np.ndarray,
         feature_shuffles: Optional[np.ndarray] = None,
         attn_mask: Optional[torch.Tensor] = None,
+        blocked_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """GPU-persistent version of the parent's ``_batch_forward``.
 
@@ -70,8 +71,13 @@ class TabICLGPUAdapter(TabICLClassifier):
         ys : np.ndarray, shape (n_datasets, train_size)
         feature_shuffles : np.ndarray or None
         attn_mask : torch.Tensor or None
-            Attention mask of shape ``(test_size, train_size)`` forwarded to the
-            ICL transformer.  Non-zero / True values suppress attention scores.
+            Dense attention mask of shape ``(test_size, train_size)`` forwarded to
+            the ICL transformer.  Non-zero / True values suppress attention scores.
+            Mutually exclusive with ``blocked_indices``.
+        blocked_indices : torch.Tensor or None
+            Memory-efficient alternative: integer tensor of shape ``(test_size,)``
+            where each value is the single support index blocked for that query.
+            Mutually exclusive with ``attn_mask``.
 
         Returns
         -------
@@ -110,6 +116,7 @@ class TabICLGPUAdapter(TabICLClassifier):
                     softmax_temperature=self.softmax_temperature,
                     inference_config=self.inference_config_,
                     attn_mask=attn_mask,
+                    blocked_indices=blocked_indices,
                 )
             outputs.append(out.float())  # stays on device
 
@@ -167,6 +174,7 @@ class TabICLGPUAdapter(TabICLClassifier):
         self,
         X: np.ndarray,
         attn_mask: Optional[torch.Tensor] = None,
+        blocked_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Like ``predict_proba`` but returns a GPU ``torch.Tensor``.
 
@@ -175,8 +183,13 @@ class TabICLGPUAdapter(TabICLClassifier):
         X : np.ndarray, shape (n_samples, n_features)
             Test features (same dtype/format as for the parent class).
         attn_mask : torch.Tensor or None, default=None
-            Attention mask of shape ``(n_test, n_train)`` forwarded to the ICL
-            transformer.  Non-zero / True values suppress attention scores.
+            Dense attention mask of shape ``(n_test, n_train)`` forwarded to the
+            ICL transformer.  Non-zero / True values suppress attention scores.
+            Mutually exclusive with ``blocked_indices``.
+        blocked_indices : torch.Tensor or None, default=None
+            Memory-efficient alternative: integer tensor of shape ``(n_test,)``
+            where each value is the single support index blocked for that query.
+            Mutually exclusive with ``attn_mask``.
 
         Returns
         -------
@@ -212,7 +225,7 @@ class TabICLGPUAdapter(TabICLClassifier):
                 outputs_list = []
                 for norm_method, (Xs, ys) in data.items():
                     feature_shuffles = self.ensemble_generator_.feature_shuffles_[norm_method]
-                    outputs_list.append(self._batch_forward(Xs, ys, feature_shuffles, attn_mask=attn_mask))
+                    outputs_list.append(self._batch_forward(Xs, ys, feature_shuffles, attn_mask=attn_mask, blocked_indices=blocked_indices))
                 outputs = torch.cat(outputs_list, dim=0)
 
             # outputs: [n_estimators, test_size, n_classes]  on GPU
@@ -245,6 +258,7 @@ class TabICLGPUAdapter(TabICLClassifier):
         self,
         X: np.ndarray,
         attn_mask: Optional[torch.Tensor] = None,
+        blocked_indices: Optional[torch.Tensor] = None,
     ) -> np.ndarray:
         """Drop-in replacement: calls ``predict_proba_tensor`` and converts to numpy."""
-        return self.predict_proba_tensor(X, attn_mask=attn_mask).cpu().numpy()
+        return self.predict_proba_tensor(X, attn_mask=attn_mask, blocked_indices=blocked_indices).cpu().numpy()

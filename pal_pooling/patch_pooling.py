@@ -791,13 +791,9 @@ def refine_dataset_features(
                 source_context[active_indices][local_img_idx].astype(np.float32)
                 if source_context is not None else None
             )
-            # Attention mask: query row k belongs to active image local_img_idx[k],
-            # original support index active_indices[local_img_idx[k]].
-            if _apply_attn_mask:
-                attn_mask_np = np.zeros((n_fwd, N), dtype=bool)
-                attn_mask_np[np.arange(n_fwd), active_indices[local_img_idx]] = True
-            else:
-                attn_mask_np = None
+            # blocked_indices: query row k must not attend to support row active_indices[local_img_idx[k]].
+            # Uses O(n_fwd) memory instead of O(n_fwd × N) for the dense mask.
+            blocked_indices_np = active_indices[local_img_idx] if _apply_attn_mask else None
         else:
             # All active rows in one pass; sequential layout matches reshape order
             n_fwd          = active_total_rows
@@ -808,14 +804,9 @@ def refine_dataset_features(
                 np.repeat(source_context[active_indices].astype(np.float32), P_dim, axis=0)
                 if source_context is not None else None
             )
-            # Attention mask: each query row k belongs to active image k // P_dim,
-            # original support index active_indices[k // P_dim].
-            if _apply_attn_mask:
-                attn_mask_np = np.zeros((n_fwd, N), dtype=bool)
-                for _i in range(N_active):
-                    attn_mask_np[_i * P_dim:(_i + 1) * P_dim, active_indices[_i]] = True
-            else:
-                attn_mask_np = None
+            # blocked_indices: patches for image i must not attend to support row active_indices[i].
+            # np.repeat gives shape (N_active * P_dim,) = (n_fwd,) with O(n_fwd) memory.
+            blocked_indices_np = np.repeat(active_indices, P_dim) if _apply_attn_mask else None
 
         query_features = pca.transform(query_raw) if pca is not None else query_raw
         if ctx_for_queries is not None:
@@ -825,10 +816,10 @@ def refine_dataset_features(
         n_cls_expected = int(train_labels.max()) + 1
 
         if use_gpu:
-            _attn_mask_t = (
-                _torch.from_numpy(attn_mask_np) if attn_mask_np is not None else None
+            _blocked_indices_t = (
+                _torch.from_numpy(blocked_indices_np).long() if blocked_indices_np is not None else None
             )
-            probs_flat_t = clf.predict_proba_tensor(query_features, attn_mask=_attn_mask_t)  # [n_fwd, n_classes] GPU
+            probs_flat_t = clf.predict_proba_tensor(query_features, blocked_indices=_blocked_indices_t)  # [n_fwd, n_classes] GPU
             if n_cls_expected is not None and probs_flat_t.shape[1] != n_cls_expected:
                 cls_tensor = _torch.tensor(clf.classes_, device=probs_flat_t.device, dtype=_torch.long)
                 full_t = _torch.zeros((probs_flat_t.shape[0], n_cls_expected), dtype=probs_flat_t.dtype, device=probs_flat_t.device)
@@ -839,7 +830,7 @@ def refine_dataset_features(
 
             all_targets_t = _torch.empty(n_fwd, dtype=_torch.float32, device=_dev)
         else:
-            probs_flat  = clf.predict_proba(query_features, attn_mask=attn_mask_np)  # [n_fwd, n_classes] CPU
+            probs_flat  = clf.predict_proba(query_features, blocked_indices=blocked_indices_np)  # [n_fwd, n_classes] CPU
             if n_cls_expected is not None and probs_flat.shape[1] != n_cls_expected:
                 full = np.zeros((probs_flat.shape[0], n_cls_expected), dtype=probs_flat.dtype)
                 full[:, clf.classes_] = probs_flat
@@ -895,26 +886,25 @@ def refine_dataset_features(
                 )
             base           = row_ptr * P
 
-            # Build attention mask for this batch when use_attn_masking is enabled.
-            # query row j*P:(j+1)*P belongs to original image orig_idx[j]; mask its support row.
+            # Build blocked_indices for this batch when use_attn_masking is enabled.
+            # Patches for image j must not attend to its own support row orig_idx[j].
+            # np.repeat gives shape (B_a * P,) with O(B_a * P) memory instead of O(B_a * P * N).
             if _apply_attn_mask:
                 if aoe_mask is not None and refinement_cfg.aoe_handling == "filter":
                     batch_orig_indices = active_in_batch        # already original indices
                 else:
                     batch_orig_indices = list(range(batch_start, batch_end))
-                _batch_attn_mask_np = np.zeros((B_a * P, N), dtype=bool)
-                for _j, _orig in enumerate(batch_orig_indices):
-                    _batch_attn_mask_np[_j * P:(_j + 1) * P, _orig] = True
+                _blocked_indices_np = np.repeat(batch_orig_indices, P)
             else:
-                _batch_attn_mask_np = None
+                _blocked_indices_np = None
 
             n_cls_expected = int(train_labels.max()) + 1
 
             if use_gpu:
-                _batch_attn_mask_t = (
-                    _torch.from_numpy(_batch_attn_mask_np) if _batch_attn_mask_np is not None else None
+                _blocked_indices_t = (
+                    _torch.from_numpy(_blocked_indices_np).long() if _blocked_indices_np is not None else None
                 )
-                probs_t = clf.predict_proba_tensor(query_features, attn_mask=_batch_attn_mask_t)
+                probs_t = clf.predict_proba_tensor(query_features, blocked_indices=_blocked_indices_t)
                 if n_cls_expected is not None and probs_t.shape[1] != n_cls_expected:
                     cls_tensor = _torch.tensor(clf.classes_, device=probs_t.device, dtype=_torch.long)
                     full_t = _torch.zeros((probs_t.shape[0], n_cls_expected), dtype=probs_t.dtype, device=probs_t.device)
@@ -934,7 +924,7 @@ def refine_dataset_features(
                     s, e = base + j * P, base + (j + 1) * P
                     all_features[s:e] = batch_patches_arr[j]
             else:
-                probs = clf.predict_proba(query_features, attn_mask=_batch_attn_mask_np)
+                probs = clf.predict_proba(query_features, blocked_indices=_blocked_indices_np)
                 if n_cls_expected is not None and probs.shape[1] != n_cls_expected:
                     full = np.zeros((probs.shape[0], n_cls_expected), dtype=probs.dtype)
                     full[:, clf.classes_] = probs
