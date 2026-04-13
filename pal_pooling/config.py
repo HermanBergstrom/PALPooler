@@ -44,6 +44,7 @@ class RefinementConfig:
     use_global_prior: bool = False
     use_marginal_prior: bool = False
     use_attn_masking: bool = False
+    model_selection: str = "last_iteration"
 
 @dataclass
 class AttentionPoolConfig:
@@ -162,6 +163,12 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--use-attn-masking", action="store_true",
                    help="During refinement, prevent each image's patches from attending to that image's "
                         "own support row in the TabICL ICL transformer.")
+    p.add_argument("--model-selection", type=str, default="last_iteration",
+                   choices=["last_iteration", "masked_train_accuracy"],
+                   help="Which stage to use at inference after iterative refinement. "
+                        "'last_iteration' (default) always uses the final stage. "
+                        "'masked_train_accuracy' evaluates every stage on the training set with a "
+                        "diagonal attention mask and selects the best-performing one.")
     p.add_argument("--aoe-class", type=str, default=None,
                    help="Absence-of-evidence class.")
     p.add_argument("--aoe-handling", type=str, default="filter",
@@ -236,6 +243,7 @@ def parse_args() -> ExperimentConfig:
         use_global_prior=args.use_global_prior,
         use_marginal_prior=args.use_marginal_prior,
         use_attn_masking=args.use_attn_masking,
+        model_selection=args.model_selection,
     )
     
     attention_cfg = AttentionPoolConfig(

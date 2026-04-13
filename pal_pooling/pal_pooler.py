@@ -558,8 +558,8 @@ class IterativePALPooler:
     Each stage fits a :class:`PALPooler`, refines the support, and passes the
     refined projected support to the next stage as its starting point — exactly
     replicating the iterative loop in ``pal_experiment.py``.
-    After fitting, all transform / scoring calls are delegated to the final
-    stage.
+    After fitting, all transform / scoring calls are delegated to the selected
+    stage (controlled by *model_selection*).
 
     Parameters
     ----------
@@ -574,12 +574,34 @@ class IterativePALPooler:
         Random seed forwarded to every stage.
     gpu_ridge_device : str
         Torch device string forwarded to every stage (e.g. ``"cuda"``).
+    model_selection : str
+        Strategy for selecting which stage to use at inference time.
+
+        ``"last_iteration"`` (default)
+            Always use the final stage — the current behaviour.
+
+        ``"masked_train_accuracy"``
+            After each stage is fitted, evaluate its masked train accuracy:
+            transform the training samples with the stage's Ridge model,
+            project into its internal PCA space, then run a fresh
+            ``TabICLClassifier`` on the support with a diagonal attention mask
+            so each query sample cannot attend to its own support row.
+            After all stages are fitted, the stage with the highest accuracy
+            is selected.  The per-stage accuracies are stored in
+            ``stage_train_accuracies_``.
+
     Fitted attributes (available after ``fit``)
     -------------------------------------------
     stages_ : list of PALPooler
         All fitted stage poolers, in order.
+    best_stage_idx_ : int
+        Index of the selected stage (0-based).  Always ``len(stages_) - 1``
+        when *model_selection* is ``"last_iteration"``.
+    stage_train_accuracies_ : list of float or None
+        Per-stage masked train accuracies.  ``None`` unless
+        *model_selection* is ``"masked_train_accuracy"``.
     support_ : np.ndarray, shape [N, D]
-        Raw DINO-space support from the final stage (``stages_[-1].support_``).
+        Raw DINO-space support from the selected stage.
     support_labels_ : np.ndarray, shape [N]
         Labels corresponding to ``support_``.
     """
@@ -590,13 +612,20 @@ class IterativePALPooler:
         refinement_cfg: RefinementConfig,
         gpu_ridge_device: str = "cuda",
         seed: int = 42,
+        model_selection: str = "last_iteration",
     ) -> None:
+        if model_selection not in ("last_iteration", "masked_train_accuracy"):
+            raise ValueError(
+                f"model_selection must be 'last_iteration' or 'masked_train_accuracy', "
+                f"got {model_selection!r}"
+            )
         self.tabicl = tabicl
         self.refinement_cfg = refinement_cfg
         self.patch_group_sizes = list(refinement_cfg.patch_group_sizes)
         self.pca_dim = refinement_cfg.tabicl_pca_dim
         self.seed = seed
         self.gpu_ridge_device = gpu_ridge_device
+        self.model_selection = model_selection
 
     # ------------------------------------------------------------------
     # Core API
@@ -658,6 +687,7 @@ class IterativePALPooler:
         alphas = self._expand_param(self.refinement_cfg.ridge_alpha, n_stages, "ridge_alpha")
 
         stages: List[PALPooler] = []
+        stage_train_accuracies: List[float] = []
 
         # Build the mean-pool baseline support up front so that stage 0's callback
         # receives it as pre_refine_support rather than None.
@@ -757,11 +787,27 @@ class IterativePALPooler:
                     train_grouped=train_grouped,
                 )
 
+            if self.model_selection == "masked_train_accuracy":
+                acc = self._eval_masked_train_accuracy(stage, patches, labels, cls_tokens,
+                                                       context_features=context_features)
+                stage_train_accuracies.append(acc)
+                print(f"[IterativePALPooler] Stage {k} masked train accuracy: {acc:.4f}")
+
             # Hand the internal projected support to the next stage.
             initial_support = stage._support_projected_
             initial_pca = stage._pca_
 
         self.stages_ = stages
+        if self.model_selection == "masked_train_accuracy":
+            self.best_stage_idx_ = int(np.argmax(stage_train_accuracies))
+            self.stage_train_accuracies_ = stage_train_accuracies
+            print(
+                f"[IterativePALPooler] Best stage: {self.best_stage_idx_} "
+                f"(masked train acc={stage_train_accuracies[self.best_stage_idx_]:.4f})"
+            )
+        else:
+            self.best_stage_idx_ = len(stages) - 1
+            self.stage_train_accuracies_ = None
         return self
 
     def transform(
@@ -769,7 +815,7 @@ class IterativePALPooler:
         patches: np.ndarray,
         cls_tokens: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Pool patches using the final fitted stage.
+        """Pool patches using the selected fitted stage.
 
         Parameters
         ----------
@@ -782,7 +828,7 @@ class IterativePALPooler:
             Quality-weighted pooled embeddings in the original DINO feature space.
         """
         self._check_fitted()
-        return self.stages_[-1].transform(patches, cls_tokens=cls_tokens)
+        return self.stages_[self.best_stage_idx_].transform(patches, cls_tokens=cls_tokens)
 
     def fit_transform(
         self,
@@ -795,7 +841,7 @@ class IterativePALPooler:
         val_cls_tokens: Optional[np.ndarray] = None,
         val_context_features: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Fit all stages then transform *patches* with the final stage.
+        """Fit all stages then transform *patches* with the selected stage.
 
         Returns
         -------
@@ -813,32 +859,32 @@ class IterativePALPooler:
 
     @property
     def support_(self) -> np.ndarray:
-        """Raw DINO-space support from the final stage."""
+        """Raw DINO-space support from the selected stage."""
         self._check_fitted()
-        return self.stages_[-1].support_
+        return self.stages_[self.best_stage_idx_].support_
 
     @property
     def support_labels_(self) -> np.ndarray:
         self._check_fitted()
-        return self.stages_[-1].support_labels_
+        return self.stages_[self.best_stage_idx_].support_labels_
 
     def patch_weights(
         self,
         patches: np.ndarray,
         cls_tokens: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Per-patch Ridge softmax weights from the final stage."""
+        """Per-patch Ridge softmax weights from the selected stage."""
         self._check_fitted()
-        return self.stages_[-1].patch_weights(patches, cls_tokens=cls_tokens)
+        return self.stages_[self.best_stage_idx_].patch_weights(patches, cls_tokens=cls_tokens)
 
     def patch_quality_logits(
         self,
         patches: np.ndarray,
         cls_tokens: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Raw Ridge quality logits from the final stage."""
+        """Raw Ridge quality logits from the selected stage."""
         self._check_fitted()
-        return self.stages_[-1].patch_quality_logits(patches, cls_tokens=cls_tokens)
+        return self.stages_[self.best_stage_idx_].patch_quality_logits(patches, cls_tokens=cls_tokens)
 
     def score_tabicl(
         self,
@@ -852,7 +898,7 @@ class IterativePALPooler:
         See :meth:`PALPooler.score_tabicl` for full documentation.
         """
         self._check_fitted()
-        return self.stages_[-1].score_tabicl(
+        return self.stages_[self.best_stage_idx_].score_tabicl(
             query_patches, query_labels, n_estimators,
             query_cls_tokens=query_cls_tokens,
         )
@@ -883,6 +929,78 @@ class IterativePALPooler:
     # Internals
     # ------------------------------------------------------------------
 
+    def _eval_masked_train_accuracy(
+        self,
+        stage: PALPooler,
+        patches: np.ndarray,
+        labels: np.ndarray,
+        cls_tokens: Optional[np.ndarray],
+        context_features: Optional[np.ndarray] = None,
+    ) -> float:
+        """Evaluate masked train accuracy for a fitted stage.
+
+        Transforms all training samples with *stage*'s Ridge model, projects
+        into its internal PCA space, fits a fresh ``TabICLClassifier`` on the
+        resulting support, then predicts on the same samples using a diagonal
+        attention mask — each query sample is blocked from attending to its own
+        support row.  This prevents the trivial self-lookup that would otherwise
+        inflate the accuracy estimate.
+
+        When *context_features* are provided they are appended to both support
+        and query rows before the TabICL call, mirroring what ``patch_pooling``
+        does during fitting.
+
+        Parameters
+        ----------
+        stage : PALPooler
+            A freshly fitted stage pooler.
+        patches : np.ndarray, shape [N, P, D]
+            Raw training patch embeddings.
+        labels : np.ndarray, shape [N]
+            Integer class labels for the training set.
+        cls_tokens : np.ndarray or None, shape [N, D]
+            CLS tokens, forwarded to ``stage.transform``.
+        context_features : np.ndarray or None, shape [N, D_context]
+            Per-image side features (e.g. tabular) used during fitting.
+            When provided, they are concatenated to both the support and the
+            query features so the masked accuracy is evaluated in the same
+            feature space that was used during stage fitting.
+
+        Returns
+        -------
+        float
+            Top-1 accuracy on the training set under the diagonal attention mask.
+        """
+        # Pool training patches with the current stage's Ridge model.
+        train_raw = stage.transform(patches, cls_tokens=cls_tokens)  # [N, D]
+
+        # Project into the stage's internal PCA space (same space as the support).
+        if stage._pca_ is not None:
+            train_features = stage._pca_.transform(train_raw).astype(np.float32)
+        else:
+            train_features = train_raw.astype(np.float32)
+
+        N = len(labels)
+
+        # Append context features to support and query, mirroring patch_pooling.py.
+        support_for_clf = stage._support_projected_
+        query_for_clf = train_features
+        if context_features is not None:
+            ctx = context_features.astype(np.float32)
+            support_for_clf = np.concatenate([support_for_clf, ctx], axis=1)
+            query_for_clf = np.concatenate([query_for_clf, ctx], axis=1)
+
+        # Fit a fresh classifier on the stage's projected support.
+        n_est = getattr(self.tabicl, "n_estimators", 1)
+        clf = TabICLClassifier(n_estimators=n_est, random_state=self.seed)
+        clf.fit(support_for_clf, stage.support_labels_)
+
+        # Diagonal attention mask: query i must not attend to support row i.
+        blocked_indices = np.arange(N)
+
+        proba = clf.predict_proba(query_for_clf, blocked_indices=blocked_indices)
+        return float((np.argmax(proba, axis=1) == labels).mean())
+
     @staticmethod
     def _expand_param(param, n_stages: int, name: str) -> list:
         if isinstance(param, list):
@@ -910,6 +1028,7 @@ class IterativePALPooler:
                 f"g{s.refinement_cfg.patch_group_sizes}(T={s.refinement_cfg.temperature}, α={s.refinement_cfg.ridge_alpha})"
                 for s in self.stages_
             ]
+            best_note = f"  best={self.best_stage_idx_}"
         else:
             temps = self._expand_param(self.refinement_cfg.temperature, len(self.patch_group_sizes), "temperature")
             alphas = self._expand_param(self.refinement_cfg.ridge_alpha, len(self.patch_group_sizes), "ridge_alpha")
@@ -917,10 +1036,12 @@ class IterativePALPooler:
                 f"g{g}(T={t}, α={a})"
                 for g, t, a in zip(self.patch_group_sizes, temps, alphas)
             ]
+            best_note = ""
         return (
             f"IterativePALPooler("
             f"{'fitted' if fitted else 'not fitted'}: "
-            f"[{', '.join(stage_strs)}])"
+            f"[{', '.join(stage_strs)}]"
+            f"  model_selection='{self.model_selection}'{best_note})"
         )
 
 
@@ -928,7 +1049,10 @@ def pooler_factory(refinement_cfg: RefinementConfig, seed: int) -> IterativePALP
     """Convenience factory to build a PALPooler from config dataclasses."""
     tabicl = TabICLClassifier(n_estimators=refinement_cfg.tabicl_n_estimators, random_state=seed)
     
-    pooler = IterativePALPooler(tabicl=tabicl, 
-                                refinement_cfg=refinement_cfg, 
-                                seed=seed)
+    pooler = IterativePALPooler(
+        tabicl=tabicl,
+        refinement_cfg=refinement_cfg,
+        seed=seed,
+        model_selection=getattr(refinement_cfg, "model_selection", "last_iteration"),
+    )
     return pooler

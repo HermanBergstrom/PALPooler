@@ -421,7 +421,8 @@ def _run_single_seed(
         append_cls=False,
         use_global_prior=args.use_global_prior,
         use_attn_masking=args.use_attn_masking,
-        use_marginal_prior=args.use_marginal_prior
+        use_marginal_prior=args.use_marginal_prior,
+        model_selection=args.model_selection,
     )
 
     pooler = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
@@ -437,8 +438,8 @@ def _run_single_seed(
     # Project to PCA space (same pca_dim used internally by the pooler).
     # The pooler's internal _pca_ was fit on pooled train embeddings; reuse it
     # so image features are in the same space used by the pooler's TabICL scorer.
-    final_stage = pooler.stages_[-1]
-    pal_pca = final_stage._pca_
+    best_stage = pooler.stages_[pooler.best_stage_idx_]
+    pal_pca = best_stage._pca_
 
     if pal_pca is not None:
         pal_train_proj = pal_pca.transform(pal_train_raw).astype(np.float32)
@@ -470,8 +471,8 @@ def _run_single_seed(
     pal_ctx_train_raw = pooler_ctx.transform(train_patches)
     pal_ctx_test_raw  = pooler_ctx.transform(test_patches)
 
-    final_stage_ctx = pooler_ctx.stages_[-1]
-    pal_ctx_pca = final_stage_ctx._pca_
+    best_stage_ctx = pooler_ctx.stages_[pooler_ctx.best_stage_idx_]
+    pal_ctx_pca = best_stage_ctx._pca_
 
     if pal_ctx_pca is not None:
         pal_ctx_train_proj = pal_ctx_pca.transform(pal_ctx_train_raw).astype(np.float32)
@@ -627,6 +628,12 @@ def _parse_args() -> argparse.Namespace:
                    help="Use attention masking in PALPooler (default: True)")
     p.add_argument("--use-marginal-prior", action=argparse.BooleanOptionalAction, default=True,
                    help="Use marginal patch prior in PALPooler (default: True)")
+    p.add_argument("--model-selection", type=str, default="last_iteration",
+                   choices=["last_iteration", "masked_train_accuracy"],
+                   help="Which stage to use at inference after iterative refinement. "
+                        "'last_iteration' (default) always uses the final stage. "
+                        "'masked_train_accuracy' evaluates every stage on the training set "
+                        "with a diagonal attention mask and selects the best-performing one.")
     p.add_argument("--seeds",          type=int,   nargs="+", default=[42],
                    help="One or more random seeds, e.g. --seeds 42 123 456. "
                         "Results are saved after every seed. (default: 42)")
