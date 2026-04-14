@@ -279,7 +279,7 @@ def _get_cbis_ddsm_image_paths(
         sys.path.insert(0, cbis_module_dir)
     from cbis_ddsm import get_image_paths  # type: ignore
 
-    return get_image_paths(kind, image_type="crop", data_dir=str(dataset_path))
+    return get_image_paths(kind, image_type="full", data_dir=str(dataset_path))
 
 
 def _get_pad_ufes_image_paths(
@@ -619,15 +619,15 @@ def _load_features(
         df_train = df[df["split"] == "train"].reset_index(drop=True)
         df_test  = df[df["split"] == "test"].reset_index(drop=True)
 
-        train_ds = CBISDDSMDataset(df_train, metadata, image_type="crop",
+        train_ds = CBISDDSMDataset(df_train, metadata, image_type="full",
                                    use_images=True, use_patches=True)
-        test_ds  = CBISDDSMDataset(df_test,  metadata, image_type="crop",
+        test_ds  = CBISDDSMDataset(df_test,  metadata, image_type="full",
                                    use_images=True, use_patches=True)
 
         # CBISDDSMDataset drops rows with missing embeddings. We need to align
         # image_paths with the rows that the dataset kept.
         # Get all image paths (before filtering), then keep only those for kept rows.
-        all_train_paths, all_test_paths = get_image_paths(kind, image_type="crop", data_dir=str(cbis_dir))
+        all_train_paths, all_test_paths = get_image_paths(kind, image_type="full", data_dir=str(cbis_dir))
 
         # For train: match train_ds.df rows back to original df_train
         # The dataset's df is a filtered version of the input df_train

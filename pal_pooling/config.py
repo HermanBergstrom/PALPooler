@@ -43,7 +43,7 @@ class RefinementConfig:
     tabicl_pca_dim: Optional[int]
     append_cls: bool = False
     use_global_prior: bool = False
-    use_marginal_prior: bool = False
+    prior: str = "label_frequency"
     use_attn_masking: bool = False
     model_selection: str = "last_iteration"
 
@@ -67,6 +67,7 @@ class RunConfig:
     viz_loo_train: bool
     show_pred_label: bool
     show_minority_prob: bool
+    show_per_class_probs: bool
     n_train_sweep: Optional[List[int]]
     seeds: Optional[List[int]] = None
 
@@ -160,8 +161,10 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--use-global-prior", action="store_true",
                    help="Use the global empirical class prior P(Y) as the divergence reference even when "
                         "context (tabular) features are provided, instead of the per-image P(Y|X_tab).")
-    p.add_argument("--use-marginal-prior", action="store_true",
-                   help="Use the marginal patch prediction distribution instead of the empirical class prior.")
+    p.add_argument("--prior", type=str, default="label_frequency",
+                   choices=["label_frequency", "patch_marginal", "current_pool_marginal"],
+                   help="Prior to use as the divergence reference: 'label_frequency' (default) uses the "
+                        "empirical class prior; 'patch_marginal' uses the marginal patch prediction distribution.")
     p.add_argument("--use-attn-masking", action="store_true",
                    help="During refinement, prevent each image's patches from attending to that image's "
                         "own support row in the TabICL ICL transformer.")
@@ -186,6 +189,8 @@ def parse_args() -> ExperimentConfig:
                    help="Add a discrete per-patch predicted-label panel to visualisation figures.")
     p.add_argument("--minority-prob-viz", action="store_true",
                    help="Add a P(minority class) panel with image-local colour scale to visualisation figures.")
+    p.add_argument("--per-class-probs-viz", action="store_true",
+                   help="Add one P(class k) heatmap panel per class (only when n_classes <= 10).")
     p.add_argument("--n-train-sweep", type=int, nargs="+", default=None,
                    metavar="N",
                    help="Run one experiment per value and collect results into a single sweep_results.json. Mutually exclusive with --n-train.")
@@ -245,7 +250,7 @@ def parse_args() -> ExperimentConfig:
         tabicl_pca_dim=pca_dim,
         append_cls=args.append_cls,
         use_global_prior=args.use_global_prior,
-        use_marginal_prior=args.use_marginal_prior,
+        prior=args.prior,
         use_attn_masking=args.use_attn_masking,
         model_selection=args.model_selection,
     )
@@ -269,6 +274,7 @@ def parse_args() -> ExperimentConfig:
         viz_loo_train=args.viz_loo_train,
         show_pred_label=args.pred_label_viz,
         show_minority_prob=args.minority_prob_viz,
+        show_per_class_probs=args.per_class_probs_viz,
         n_train_sweep=args.n_train_sweep,
         seeds=args.seeds,
     )

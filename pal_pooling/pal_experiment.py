@@ -152,6 +152,7 @@ def _run_visual_eval(
     weight_method:     str  = "correct_class_prob",
     show_pred_label:   bool = False,
     show_minority_prob: bool = False,
+    show_per_class_probs: bool = False,
     use_attn_masking:  bool = False,
 ) -> dict[str, float]:
     """Run the patch-quality visual evaluation for one support set variant.
@@ -247,6 +248,7 @@ def _run_visual_eval(
                 weight_method=weight_method,
                 show_pred_label=show_pred_label,
                 show_minority_prob=show_minority_prob,
+                show_per_class_probs=show_per_class_probs,
             )
             out_path = (
                 split_out_dir
@@ -546,6 +548,7 @@ def _make_stage_callback(
                 class_prior=active_class_prior, weight_method=cfg.refinement.weight_method,
                 show_pred_label=cfg.run.show_pred_label,
                 show_minority_prob=cfg.run.show_minority_prob,
+                show_per_class_probs=cfg.run.show_per_class_probs,
                 use_attn_masking=cfg.refinement.use_attn_masking,
             )
         else:
@@ -579,6 +582,7 @@ def _make_stage_callback(
                 class_prior=active_class_prior, weight_method=cfg.refinement.weight_method,
                 show_pred_label=cfg.run.show_pred_label,
                 show_minority_prob=cfg.run.show_minority_prob,
+                show_per_class_probs=cfg.run.show_per_class_probs,
                 use_attn_masking=cfg.refinement.use_attn_masking,
             )
 
@@ -874,6 +878,7 @@ def run_pal_experiment(
             class_prior=class_prior, weight_method=cfg.refinement.weight_method,
             show_pred_label=cfg.run.show_pred_label,
             show_minority_prob=cfg.run.show_minority_prob,
+            show_per_class_probs=cfg.run.show_per_class_probs,
             use_attn_masking=cfg.refinement.use_attn_masking,
         )
     else:
@@ -974,6 +979,7 @@ def run_pal_experiment(
             open_image=open_image, class_prior=_last_stage_data.get("class_prior", class_prior), weight_method=cfg.refinement.weight_method,
             show_pred_label=cfg.run.show_pred_label,
             show_minority_prob=cfg.run.show_minority_prob,
+            show_per_class_probs=cfg.run.show_per_class_probs,
             use_attn_masking=cfg.refinement.use_attn_masking,
         )
 

@@ -522,6 +522,12 @@ def group_patches(patches: np.ndarray, patch_group_size: int) -> np.ndarray:
     else:
         # Pad spatial dims to next multiple of group_side, then average only
         # valid elements (ceil_mode equivalent — boundary groups are smaller).
+        import warnings
+        warnings.warn(
+            f"Padding employed during patch grouping: grid side {n_side} is not cleanly divisible "
+            f"by group_side {group_side}. Padding added to reach size {new_n_side * group_side}."
+        )
+        
         pad = new_n_side * group_side - n_side
         x = patches.astype(np.float32).reshape(N, n_side, n_side, D)
         x = np.pad(x, ((0, 0), (0, pad), (0, pad), (0, 0)), mode="constant", constant_values=0.0)
@@ -747,6 +753,34 @@ def refine_dataset_features(
         )
     clf.fit(support_for_clf, train_labels)
 
+    # For current_pool_marginal, compute the prior by running the just-fitted classifier
+    # on the current pooled support with a diagonal attention mask (each image cannot
+    # attend to its own support row).  This gives an image-level marginal that reflects
+    # the actual discriminability of the pooled representation at this stage.
+    if refinement_cfg.prior == "current_pool_marginal" and refinement_cfg.weight_method in _divergence_methods:
+        print("[calibration] Computing current_pool_marginal prior from current pooled features ...")
+        N_supp = len(support_for_clf)
+        n_cls_prior = int(train_labels.max()) + 1
+        blocked_diag_np = np.arange(N_supp)
+        if isinstance(clf, TabICLGPUAdapter):
+            import torch as _torch
+            blocked_diag_t = _torch.from_numpy(blocked_diag_np).long()
+            probs_supp_t = clf.predict_proba_tensor(support_for_clf, blocked_indices=blocked_diag_t)
+            if probs_supp_t.shape[1] != n_cls_prior:
+                cls_t = _torch.tensor(clf.classes_, device=probs_supp_t.device, dtype=_torch.long)
+                full_t = _torch.zeros((N_supp, n_cls_prior), dtype=probs_supp_t.dtype, device=probs_supp_t.device)
+                full_t[:, cls_t] = probs_supp_t
+                probs_supp_t = full_t
+            class_prior = probs_supp_t.mean(dim=0).cpu().numpy().astype(np.float32)
+        else:
+            probs_supp = clf.predict_proba(support_for_clf, blocked_indices=blocked_diag_np)
+            if probs_supp.shape[1] != n_cls_prior:
+                full = np.zeros((N_supp, n_cls_prior), dtype=probs_supp.dtype)
+                full[:, clf.classes_] = probs_supp
+                probs_supp = full
+            class_prior = probs_supp.mean(axis=0).astype(np.float32)
+        print(f"[calibration] current_pool_marginal prior: {np.round(class_prior, 4)}")
+
     # GPU path: skip D2H/H2D round-trip for probs and quality-logit targets.
     use_gpu = isinstance(clf, TabICLGPUAdapter)
     if use_gpu:
@@ -854,47 +888,47 @@ def refine_dataset_features(
         count_probs = 0
         saved_probs = []
 
-        for batch_start in tqdm(range(0, N, refinement_cfg.batch_size),
+        for batch_start in tqdm(range(0, M, refinement_cfg.batch_size),
                                 desc="Computing patch quality scores", unit="batch"):
-            batch_end = min(batch_start + refinement_cfg.batch_size, N)
+            batch_end = min(batch_start + refinement_cfg.batch_size, M)
             # For "filter" mode, exclude AoE images from the batch.
             # For "entropy" mode (and no AoE), include all images.
-            if aoe_mask is not None and refinement_cfg.aoe_handling == "filter":
-                active_in_batch = [j for j in range(batch_start, batch_end) if not aoe_mask[j]]
+            if source_aoe is not None and refinement_cfg.aoe_handling == "filter":
+                active_in_batch = [j for j in range(batch_start, batch_end) if not source_aoe[j]]
                 if not active_in_batch:
                     continue
-                batch_patches_arr = train_patches[active_in_batch]   # [B_a, P, D]
-                batch_labels_arr  = train_labels[active_in_batch]
+                batch_patches_arr = source_patches[active_in_batch]   # [B_a, P, D]
+                batch_labels_arr  = source_labels[active_in_batch]
                 batch_is_aoe      = None
             else:
-                batch_patches_arr = train_patches[batch_start:batch_end]   # [B, P, D]
-                batch_labels_arr  = train_labels[batch_start:batch_end]
-                batch_is_aoe      = (aoe_mask[batch_start:batch_end]
-                                     if aoe_mask is not None else None)
+                batch_patches_arr = source_patches[batch_start:batch_end]   # [B, P, D]
+                batch_labels_arr  = source_labels[batch_start:batch_end]
+                batch_is_aoe      = (source_aoe[batch_start:batch_end]
+                                     if source_aoe is not None else None)
 
             B_a = len(batch_patches_arr)
-            query_raw      = batch_patches_arr.reshape(B_a * P, D)
+            query_raw      = batch_patches_arr.reshape(B_a * P_dim, D)
             query_features = pca.transform(query_raw) if pca is not None else query_raw
-            if context_features is not None:
+            if source_context is not None:
                 # Gather the context for this batch's images and repeat P times per image.
-                if aoe_mask is not None and refinement_cfg.aoe_handling == "filter":
-                    batch_ctx = context_features[active_in_batch].astype(np.float32)
+                if source_aoe is not None and refinement_cfg.aoe_handling == "filter":
+                    batch_ctx = source_context[active_in_batch].astype(np.float32)
                 else:
-                    batch_ctx = context_features[batch_start:batch_end].astype(np.float32)
+                    batch_ctx = source_context[batch_start:batch_end].astype(np.float32)
                 query_features = np.concatenate(
-                    [query_features, np.repeat(batch_ctx, P, axis=0)], axis=1
+                    [query_features, np.repeat(batch_ctx, P_dim, axis=0)], axis=1
                 )
-            base           = row_ptr * P
+            base           = row_ptr * P_dim
 
             # Build blocked_indices for this batch when use_attn_masking is enabled.
             # Patches for image j must not attend to its own support row orig_idx[j].
             # np.repeat gives shape (B_a * P,) with O(B_a * P) memory instead of O(B_a * P * N).
             if _apply_attn_mask:
-                if aoe_mask is not None and refinement_cfg.aoe_handling == "filter":
+                if source_aoe is not None and refinement_cfg.aoe_handling == "filter":
                     batch_orig_indices = active_in_batch        # already original indices
                 else:
                     batch_orig_indices = list(range(batch_start, batch_end))
-                _blocked_indices_np = np.repeat(batch_orig_indices, P)
+                _blocked_indices_np = np.repeat(batch_orig_indices, P_dim)
             else:
                 _blocked_indices_np = None
 
@@ -950,7 +984,7 @@ def refine_dataset_features(
     print(f"[calibration] Empirical label prior:    {np.round(empirical_prior, 4)}")
     print(f"[calibration] Marginal patch predicted: {np.round(mean_probs, 4)}")
 
-    if refinement_cfg.use_marginal_prior:
+    if refinement_cfg.prior == "patch_marginal":
         class_prior = mean_probs.astype(np.float32)
 
     if use_gpu:

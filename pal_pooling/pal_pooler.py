@@ -723,7 +723,7 @@ class IterativePALPooler:
             N_tab = len(context_features)
             _tab_attn_mask = (
                 np.eye(N_tab, dtype=bool)
-                if getattr(self.refinement_cfg, "use_attn_masking", False)
+                if self.refinement_cfg.use_attn_masking
                 else None
             )
             raw_tab_probs = _clf_tab.predict_proba(context_features, attn_mask=_tab_attn_mask).astype(np.float32)
@@ -731,6 +731,8 @@ class IterativePALPooler:
             if raw_tab_probs.shape[1] != n_cls_local:
                 tabular_probs = np.zeros((raw_tab_probs.shape[0], n_cls_local), dtype=np.float32)
                 tabular_probs[:, _clf_tab.classes_] = raw_tab_probs
+                print(f"[IterativePALPooler] Warning: TabICL predicted {raw_tab_probs.shape[1]} classes, "
+                      f"but found {n_cls_local} in labels.  Filling missing classes with zeros).")
             else:
                 tabular_probs = raw_tab_probs
 

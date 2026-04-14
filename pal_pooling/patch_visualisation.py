@@ -64,6 +64,7 @@ def visualise_image(
     weight_method:     str   = "correct_class_prob",  # method used for refinement (highlighted)
     show_pred_label:   bool  = False,                 # add a discrete per-patch predicted-class panel
     show_minority_prob: bool = False,                 # add a P(minority class) panel with image-local scale
+    show_per_class_probs: bool = False,               # add one P(class k) panel per class (only when n_classes <= 10)
 ) -> plt.Figure:
     """Figure with overlay panels showing per-patch softmax quality scores.
 
@@ -164,6 +165,18 @@ def visualise_image(
              "vmax": ridge_pred_logits.max()},
         )
         all_rows = [row + [ridge_panel] for row in all_rows]
+
+    if show_per_class_probs and n_classes <= 10:
+        per_class_row = [("Original image\n[per-class]", None, {})]
+        for k in range(n_classes):
+            p_k = patch_probs[:, k]
+            star = "  ★" if k == true_label else ""
+            per_class_row.append((
+                f"P({idx_to_class[k]!r}){star}",
+                p_k,
+                {"vmin": 0.0, "vmax": 1.0, "cmap": "Blues"},
+            ))
+        all_rows.append(per_class_row)
 
     n_cols = max(len(r) for r in all_rows)
     fig, axes = plt.subplots(len(all_rows), n_cols,

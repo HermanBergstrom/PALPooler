@@ -494,7 +494,7 @@ def _run_single_seed(
         append_cls=False,
         use_global_prior=args.use_global_prior,
         use_attn_masking=args.use_attn_masking,
-        use_marginal_prior=args.use_marginal_prior,
+        prior=args.prior,
         model_selection=args.model_selection,
     )
 
@@ -702,8 +702,9 @@ def _parse_args() -> argparse.Namespace:
                         "context features are provided, instead of the per-image P(Y|X_tab).")
     p.add_argument("--use-attn-masking", action=argparse.BooleanOptionalAction, default=True,
                    help="Use attention masking in PALPooler (default: True)")
-    p.add_argument("--use-marginal-prior", action=argparse.BooleanOptionalAction, default=True,
-                   help="Use marginal patch prior in PALPooler (default: True)")
+    p.add_argument("--prior", type=str, default="label_frequency",
+                   choices=["label_frequency", "patch_marginal", "current_pool_marginal"],
+                   help="Prior to use as the divergence reference (default: label_frequency)")
     p.add_argument("--model-selection", type=str, default="last_iteration",
                    choices=["last_iteration", "masked_train_accuracy"],
                    help="Which stage to use at inference after iterative refinement. "
