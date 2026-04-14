@@ -559,36 +559,38 @@ class IterativePALPooler:
     refined projected support to the next stage as its starting point — exactly
     replicating the iterative loop in ``pal_experiment.py``.
     After fitting, all transform / scoring calls are delegated to the selected
-    stage (controlled by *model_selection*).
+    stage (controlled by ``refinement_cfg.model_selection``).
 
     Parameters
     ----------
     tabicl : TabICLClassifier
         Pre-initialized (unfitted) TabICL model shared across all stages.
     refinement_cfg : RefinementConfig
-        Pooling hyperparameters shared across all stages.
+        Pooling hyperparameters shared across all stages, including model_selection.
         ``patch_group_sizes`` must be a list with one entry per stage;
         ``temperature`` and ``ridge_alpha`` may be scalars (broadcast) or
         per-stage lists of the same length.
+        ``model_selection`` controls which stage is used at inference:
+        ``"last_iteration"`` (default) or ``"masked_train_accuracy"``.
     seed : int
         Random seed forwarded to every stage.
     gpu_ridge_device : str
         Torch device string forwarded to every stage (e.g. ``"cuda"``).
-    model_selection : str
-        Strategy for selecting which stage to use at inference time.
 
-        ``"last_iteration"`` (default)
-            Always use the final stage — the current behaviour.
+    Model selection strategies
+    --------------------------
+    ``"last_iteration"`` (default)
+        Always use the final stage — the current behaviour.
 
-        ``"masked_train_accuracy"``
-            After each stage is fitted, evaluate its masked train accuracy:
-            transform the training samples with the stage's Ridge model,
-            project into its internal PCA space, then run a fresh
-            ``TabICLClassifier`` on the support with a diagonal attention mask
-            so each query sample cannot attend to its own support row.
-            After all stages are fitted, the stage with the highest accuracy
-            is selected.  The per-stage accuracies are stored in
-            ``stage_train_accuracies_``.
+    ``"masked_train_accuracy"``
+        After each stage is fitted, evaluate its masked train accuracy:
+        transform the training samples with the stage's Ridge model,
+        project into its internal PCA space, then run a fresh
+        ``TabICLClassifier`` on the support with a diagonal attention mask
+        so each query sample cannot attend to its own support row.
+        After all stages are fitted, the stage with the highest accuracy
+        is selected.  The per-stage accuracies are stored in
+        ``stage_train_accuracies_``.
 
     Fitted attributes (available after ``fit``)
     -------------------------------------------
@@ -612,12 +614,11 @@ class IterativePALPooler:
         refinement_cfg: RefinementConfig,
         gpu_ridge_device: str = "cuda",
         seed: int = 42,
-        model_selection: str = "last_iteration",
     ) -> None:
-        if model_selection not in ("last_iteration", "masked_train_accuracy"):
+        if refinement_cfg.model_selection not in ("last_iteration", "masked_train_accuracy"):
             raise ValueError(
                 f"model_selection must be 'last_iteration' or 'masked_train_accuracy', "
-                f"got {model_selection!r}"
+                f"got {refinement_cfg.model_selection!r}"
             )
         self.tabicl = tabicl
         self.refinement_cfg = refinement_cfg
@@ -625,7 +626,6 @@ class IterativePALPooler:
         self.pca_dim = refinement_cfg.tabicl_pca_dim
         self.seed = seed
         self.gpu_ridge_device = gpu_ridge_device
-        self.model_selection = model_selection
 
     # ------------------------------------------------------------------
     # Core API
@@ -787,7 +787,7 @@ class IterativePALPooler:
                     train_grouped=train_grouped,
                 )
 
-            if self.model_selection == "masked_train_accuracy":
+            if self.refinement_cfg.model_selection == "masked_train_accuracy":
                 acc = self._eval_masked_train_accuracy(stage, patches, labels, cls_tokens,
                                                        context_features=context_features)
                 stage_train_accuracies.append(acc)
@@ -798,7 +798,7 @@ class IterativePALPooler:
             initial_pca = stage._pca_
 
         self.stages_ = stages
-        if self.model_selection == "masked_train_accuracy":
+        if self.refinement_cfg.model_selection == "masked_train_accuracy":
             self.best_stage_idx_ = int(np.argmax(stage_train_accuracies))
             self.stage_train_accuracies_ = stage_train_accuracies
             print(
@@ -1041,18 +1041,17 @@ class IterativePALPooler:
             f"IterativePALPooler("
             f"{'fitted' if fitted else 'not fitted'}: "
             f"[{', '.join(stage_strs)}]"
-            f"  model_selection='{self.model_selection}'{best_note})"
+            f"  model_selection='{self.refinement_cfg.model_selection}'{best_note})"
         )
 
 
 def pooler_factory(refinement_cfg: RefinementConfig, seed: int) -> IterativePALPooler:
     """Convenience factory to build a PALPooler from config dataclasses."""
     tabicl = TabICLClassifier(n_estimators=refinement_cfg.tabicl_n_estimators, random_state=seed)
-    
+
     pooler = IterativePALPooler(
         tabicl=tabicl,
         refinement_cfg=refinement_cfg,
         seed=seed,
-        model_selection=getattr(refinement_cfg, "model_selection", "last_iteration"),
     )
     return pooler

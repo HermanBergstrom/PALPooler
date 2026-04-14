@@ -42,7 +42,7 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score
 from tabicl import TabICLClassifier
 
-from pal_pooling.config import DVM_DATASET_PATH, PAD_UFES_DATASET_PATH, PETFINDER_DATASET_PATH, RefinementConfig
+from pal_pooling.config import CBIS_DDSM_DATASET_PATH, DVM_DATASET_PATH, PAD_UFES_DATASET_PATH, PETFINDER_DATASET_PATH, RefinementConfig
 from pal_pooling.pal_pooler import IterativePALPooler, pooler_factory
 
 
@@ -211,6 +211,79 @@ def _load_dataset(
             f"tab_dim={tab_train.shape[1]}"
         )
         print(f"[info] pad-ufes (test):  N={len(test_labels)}")
+        return (
+            train_patches, train_labels,
+            test_patches,  test_labels,
+            cls_train, cls_test,
+            tab_train, tab_test,
+            idx_to_class,
+        )
+
+    elif dataset_name in ("cbis-ddsm-mass", "cbis-ddsm-calc"):
+        cbis_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/cbis-ddsm"
+        if cbis_module_dir not in sys.path:
+            sys.path.insert(0, cbis_module_dir)
+        from cbis_ddsm import CBISDDSMDataset, load_metadata  # type: ignore
+        from tqdm import tqdm
+
+        kind = "mass" if dataset_name == "cbis-ddsm-mass" else "calc"
+        metadata = load_metadata(kind, data_dir=str(dataset_dir))
+        df = metadata["df"]
+
+        df_train = df[df["split"] == "train"].reset_index(drop=True)
+        df_test  = df[df["split"] == "test"].reset_index(drop=True)
+
+        train_ds_cbis = CBISDDSMDataset(df_train, metadata, image_type="crop",
+                                        use_images=True, use_patches=True)
+        test_ds_cbis  = CBISDDSMDataset(df_test,  metadata, image_type="crop",
+                                        use_images=True, use_patches=True)
+
+        def _collect_cbis_mm(ds, n_limit, desc):
+            total_n = len(ds)
+            if n_limit is not None and n_limit < total_n:
+                rng  = np.random.RandomState(seed)
+                idxs = rng.choice(total_n, size=n_limit, replace=False)
+                idxs.sort()
+            else:
+                idxs = np.arange(total_n)
+            patches, cls_emb, labels, tab_feat = [], [], [], []
+            for i in tqdm(idxs, desc=desc):
+                s = ds[int(i)]
+                patches.append(s["patch_embedding"].float().numpy())
+                cls_emb.append(s["image_embedding"].float().numpy())
+                labels.append(s["target"].item())
+                tab_feat.append(s["tabular"].float().numpy())
+            return (
+                np.stack(patches,  axis=0),
+                np.stack(cls_emb,  axis=0),
+                np.array(labels,   dtype=np.int64),
+                np.stack(tab_feat, axis=0),
+            )
+
+        train_patches, cls_train, train_labels, tab_train = _collect_cbis_mm(
+            train_ds_cbis, max_train, f"Loading {dataset_name} (train)")
+        test_patches, cls_test, test_labels, tab_test = _collect_cbis_mm(
+            test_ds_cbis, max_test, f"Loading {dataset_name} (test)")
+
+        target_encoder = metadata["target_encoder"]
+        idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
+
+        # Optional n_train subsampling.
+        if n_train is not None and n_train < len(train_labels):
+            rng = np.random.RandomState(seed)
+            idx = rng.choice(len(train_labels), size=n_train, replace=False)
+            idx.sort()
+            train_patches = train_patches[idx]
+            train_labels  = train_labels[idx]
+            cls_train     = cls_train[idx]
+            tab_train     = tab_train[idx]
+
+        print(
+            f"[info] {dataset_name} (train): N={len(train_labels)}  "
+            f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}  "
+            f"tab_dim={tab_train.shape[1]}"
+        )
+        print(f"[info] {dataset_name} (test):  N={len(test_labels)}")
         return (
             train_patches, train_labels,
             test_patches,  test_labels,
@@ -529,9 +602,11 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
     dataset_path = args.dataset_path
     if dataset_path is None:
         dataset_path = {
-            "dvm":       DVM_DATASET_PATH,
-            "petfinder": PETFINDER_DATASET_PATH,
-            "pad-ufes":  PAD_UFES_DATASET_PATH,
+            "dvm":            DVM_DATASET_PATH,
+            "petfinder":      PETFINDER_DATASET_PATH,
+            "pad-ufes":       PAD_UFES_DATASET_PATH,
+            "cbis-ddsm-mass": CBIS_DDSM_DATASET_PATH,
+            "cbis-ddsm-calc": CBIS_DDSM_DATASET_PATH,
         }[args.dataset]
 
     output_dir = Path(args.output_dir) if args.output_dir is not None else Path("results/multimodal") / args.dataset
@@ -588,7 +663,8 @@ def _parse_args() -> argparse.Namespace:
         description="Multimodal experiment: PALPool image features + tabular (PetFinder or DVM)"
     )
     p.add_argument("--dataset",        type=str,   default="petfinder",
-                   choices=["petfinder", "dvm", "pad-ufes"], help="Dataset to run multimodal experiment on")
+                   choices=["petfinder", "dvm", "pad-ufes", "cbis-ddsm-mass", "cbis-ddsm-calc"],
+                   help="Dataset to run multimodal experiment on")
     p.add_argument("--dataset-path",   type=Path,  default=None,
                    help="Root directory of the dataset (defaults to config value)")
     p.add_argument("--n-train",        type=int,   default=None,

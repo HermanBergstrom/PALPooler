@@ -3,12 +3,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-BUTTERFLY_DATASET_PATH = Path("/project/aip-rahulgk/hermanb/datasets/butterfly-image-classification")
-RSNA_DATASET_PATH      = Path("/project/aip-rahulgk/hermanb/datasets/rsna-pneumonia")
-PETFINDER_DATASET_PATH = Path("/project/aip-rahulgk/image_icl_project/petfinder")
-DVM_DATASET_PATH       = Path("/project/6101781/image_icl_project/DVM_Dataset")
-PAD_UFES_DATASET_PATH  = Path("/project/6101781/image_icl_project/pad-ufes-20-copy")
-FEATURES_DIR           = Path("/scratch/hermanb/temp_datasets/extracted_features")
+BUTTERFLY_DATASET_PATH  = Path("/project/aip-rahulgk/hermanb/datasets/butterfly-image-classification")
+RSNA_DATASET_PATH       = Path("/project/aip-rahulgk/hermanb/datasets/rsna-pneumonia")
+PETFINDER_DATASET_PATH  = Path("/project/aip-rahulgk/image_icl_project/petfinder")
+DVM_DATASET_PATH        = Path("/project/6101781/image_icl_project/DVM_Dataset")
+PAD_UFES_DATASET_PATH   = Path("/project/6101781/image_icl_project/pad-ufes-20-copy")
+CBIS_DDSM_DATASET_PATH  = Path("/project/6101781/image_icl_project/cbis-ddsm/cbis-ddsm-breast-cancer-image-dataset")
+FEATURES_DIR            = Path("/scratch/hermanb/temp_datasets/extracted_features")
 
 @dataclass
 class DatasetConfig:
@@ -82,7 +83,8 @@ class ExperimentConfig:
 def parse_args() -> ExperimentConfig:
     p = argparse.ArgumentParser(description="Patch quality evaluation with TabICL")
     p.add_argument("--dataset",       type=str,   default="butterfly",
-                   choices=["butterfly", "rsna", "petfinder", "dvm", "pad-ufes"],
+                   choices=["butterfly", "rsna", "petfinder", "dvm", "pad-ufes",
+                            "cbis-ddsm-mass", "cbis-ddsm-calc"],
                    help="Which dataset to run on")
     p.add_argument("--backbone",      type=str,   default="rad-dino",
                    choices=["rad-dino", "dinov3"],
@@ -199,11 +201,13 @@ def parse_args() -> ExperimentConfig:
         p.error("--seeds and --seed are mutually exclusive.")
 
     _dataset_defaults = {
-        "butterfly": BUTTERFLY_DATASET_PATH,
-        "rsna":      RSNA_DATASET_PATH,
-        "petfinder": PETFINDER_DATASET_PATH,
-        "dvm":       DVM_DATASET_PATH,
-        "pad-ufes":  PAD_UFES_DATASET_PATH,
+        "butterfly":      BUTTERFLY_DATASET_PATH,
+        "rsna":           RSNA_DATASET_PATH,
+        "petfinder":      PETFINDER_DATASET_PATH,
+        "dvm":            DVM_DATASET_PATH,
+        "pad-ufes":       PAD_UFES_DATASET_PATH,
+        "cbis-ddsm-mass": CBIS_DDSM_DATASET_PATH,
+        "cbis-ddsm-calc": CBIS_DDSM_DATASET_PATH,
     }
     dataset_path = args.dataset_path or _dataset_defaults[args.dataset]
     

@@ -22,6 +22,7 @@ from torch.utils.data import Dataset
 
 from pal_pooling.config import (
     BUTTERFLY_DATASET_PATH,
+    CBIS_DDSM_DATASET_PATH,
     FEATURES_DIR,
     PAD_UFES_DATASET_PATH,
     PETFINDER_DATASET_PATH,
@@ -262,6 +263,23 @@ def _get_dvm_image_paths(
     test_paths = [test_ds.get_image_path(i) for i in range(len(test_ds))]
     
     return train_paths, test_paths
+
+
+def _get_cbis_ddsm_image_paths(
+    dataset_path: Path,
+    kind: str,  # 'mass' or 'calc'
+) -> tuple[list[Path], list[Path]]:
+    """Return (train_paths, test_paths) for CBIS-DDSM crop JPEGs.
+
+    Delegates to the upstream get_image_paths helper which correctly resolves
+    each row's JPEG via the DICOM index embedded in the CSV path string.
+    """
+    cbis_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/cbis-ddsm"
+    if cbis_module_dir not in sys.path:
+        sys.path.insert(0, cbis_module_dir)
+    from cbis_ddsm import get_image_paths  # type: ignore
+
+    return get_image_paths(kind, image_type="crop", data_dir=str(dataset_path))
 
 
 def _get_pad_ufes_image_paths(
@@ -586,8 +604,92 @@ def _load_features(
               f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] PAD-UFES (test):  N={len(test_labels)}")
 
+    elif dataset_cfg.dataset in ("cbis-ddsm-mass", "cbis-ddsm-calc"):
+        cbis_dir = Path(dataset_cfg.dataset_path)
+        cbis_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/cbis-ddsm"
+        if cbis_module_dir not in sys.path:
+            sys.path.insert(0, cbis_module_dir)
+        from cbis_ddsm import CBISDDSMDataset, load_metadata, get_image_paths  # type: ignore
+        from tqdm import tqdm
+
+        kind = "mass" if dataset_cfg.dataset == "cbis-ddsm-mass" else "calc"
+        metadata = load_metadata(kind, data_dir=str(cbis_dir))
+        df = metadata["df"]
+
+        df_train = df[df["split"] == "train"].reset_index(drop=True)
+        df_test  = df[df["split"] == "test"].reset_index(drop=True)
+
+        train_ds = CBISDDSMDataset(df_train, metadata, image_type="crop",
+                                   use_images=True, use_patches=True)
+        test_ds  = CBISDDSMDataset(df_test,  metadata, image_type="crop",
+                                   use_images=True, use_patches=True)
+
+        # CBISDDSMDataset drops rows with missing embeddings. We need to align
+        # image_paths with the rows that the dataset kept.
+        # Get all image paths (before filtering), then keep only those for kept rows.
+        all_train_paths, all_test_paths = get_image_paths(kind, image_type="crop", data_dir=str(cbis_dir))
+
+        # For train: match train_ds.df rows back to original df_train
+        # The dataset's df is a filtered version of the input df_train
+        train_image_paths = []
+        test_image_paths = []
+
+        # Build mapping: for each row in train_ds.df, find its corresponding image path.
+        # Since CBISDDSMDataset already filtered df, we need to find which rows were kept
+        # by matching on a unique identifier (the crop image path).
+
+        train_image_paths = []
+        for _, row in train_ds.df.iterrows():
+            crop_path_str = row['cropped image file path']
+            # Find this row in all_train_paths by finding its position in the original df_train
+            matching_mask = df_train['cropped image file path'] == crop_path_str
+            matching_pos = matching_mask.idxmax() if matching_mask.any() else -1
+            if matching_pos >= 0:
+                train_image_paths.append(all_train_paths[matching_pos])
+            else:
+                print(f"[warn] Could not find image path for crop: {crop_path_str}")
+                train_image_paths.append(Path(''))
+
+        test_image_paths = []
+        for _, row in test_ds.df.iterrows():
+            crop_path_str = row['cropped image file path']
+            matching_mask = df_test['cropped image file path'] == crop_path_str
+            matching_pos = matching_mask.idxmax() if matching_mask.any() else -1
+            if matching_pos >= 0:
+                test_image_paths.append(all_test_paths[matching_pos])
+            else:
+                print(f"[warn] Could not find image path for crop: {crop_path_str}")
+                test_image_paths.append(Path(''))
+
+        def _collect_cbis(ds, desc: str):
+            patches_list, cls_list, labels_list = [], [], []
+            for i in tqdm(range(len(ds)), desc=desc):
+                sample = ds[i]
+                patches_list.append(sample["patch_embedding"].numpy())
+                cls_list.append(sample["image_embedding"].numpy())
+                labels_list.append(sample["target"].item())
+            return (
+                np.stack(patches_list, axis=0),
+                np.stack(cls_list,     axis=0),
+                np.array(labels_list,  dtype=np.int64),
+            )
+
+        train_patches, cls_train, train_labels = _collect_cbis(
+            train_ds, f"Loading CBIS-DDSM {kind} (train)")
+        test_patches,  cls_test,  test_labels  = _collect_cbis(
+            test_ds,  f"Loading CBIS-DDSM {kind} (test)")
+
+        target_encoder = metadata["target_encoder"]
+        idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
+
+        print(f"[info] CBIS-DDSM {kind} (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] CBIS-DDSM {kind} (test):  N={len(test_labels)}")
+
     else:
-        raise ValueError(f"Unknown dataset '{dataset_cfg.dataset}'. Choices: butterfly, rsna, petfinder, dvm, pad-ufes")
+        raise ValueError(f"Unknown dataset '{dataset_cfg.dataset}'. "
+                         f"Choices: butterfly, rsna, petfinder, dvm, pad-ufes, "
+                         f"cbis-ddsm-mass, cbis-ddsm-calc")
 
     # --- Optional n_train subsampling for non-RSNA datasets ---
     if dataset_cfg.n_train is not None and dataset_cfg.n_train < len(train_labels):
