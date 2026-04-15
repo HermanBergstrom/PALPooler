@@ -8,17 +8,23 @@ attention-pooling upper bound and patch-quality visualisations.
 
 ```
 pal_pooling/
-    pal_experiment.py        ← CLI entry point + experiment orchestration
-    demo.py                  ← minimal demo (PAL vs. mean-pool on butterfly)
+    pal_experiment.py        ← main CLI entry point: patch-only PAL experiments
+    multimodal_experiments.py← main CLI entry point: image + tabular multimodal experiments
     config.py                ← dataclasses + CLI arg parser (parse_args)
-    data_loading.py          ← dataset loaders: butterfly, RSNA
+    data_loading.py          ← dataset loaders: butterfly, RSNA, petfinder, DVM, PAD-UFES, CBIS-DDSM
     patch_pooling.py         ← core NumPy/sklearn pooling algorithms
     pal_pooler.py            ← PALPooler / IterativePALPooler (sklearn-style API)
+    tabicl_gpu_adapter.py    ← TabICLGPUAdapter: keeps tensors on GPU across ensemble forward pass
     attention_pooling.py     ← learnable attention pooling head + training loop
     frozen_tabicl.py         ← frozen TabICL backbone for episodic training
     patch_visualisation.py   ← matplotlib heatmap generation
-    plot_n_train_sweep.py    ← utility: plot sweep_results.json
+    plot_n_train_sweep.py    ← utility: plot sweep_results.json (n-train sweep)
+    plot_seed_sweep.py       ← utility: plot seed_sweep_results.json (accuracy/AUROC ± std dev)
+    demo.py                  ← minimal demo (PAL vs. mean-pool on butterfly)
     __init__.py              ← re-exports public API
+
+plotting/
+    plot_multimodal_results.py ← grouped bar chart of multimodal_results.json across datasets
 ```
 
 ---
@@ -44,6 +50,11 @@ pal_pooling/
 Default paths (set in `config.py`):
 - `FEATURES_DIR = /scratch/hermanb/temp_datasets/extracted_features`
 - `BUTTERFLY_DATASET_PATH = /project/aip-rahulgk/hermanb/datasets/butterfly-image-classification`
+- `RSNA_DATASET_PATH = /project/aip-rahulgk/hermanb/datasets/rsna-pneumonia`
+- `PETFINDER_DATASET_PATH = /project/aip-rahulgk/image_icl_project/petfinder`
+- `DVM_DATASET_PATH = /project/6101781/image_icl_project/DVM_Dataset`
+- `PAD_UFES_DATASET_PATH = /project/6101781/image_icl_project/pad-ufes-20-copy`
+- `CBIS_DDSM_DATASET_PATH = /project/6101781/image_icl_project/cbis-ddsm/cbis-ddsm-breast-cancer-image-dataset`
 
 Typical feature dimensions: `N ≈ 4800 (train) / 1200 (test)`, `P = 196` patches per image
 (224 px image, 16 px patches), `D = 768` (DINOv2 ViT-B/16).
@@ -109,11 +120,42 @@ kl_div  (label-agnostic, imbalance-aware; requires class_prior)
   KL_i = Σ_c dist[i,c] ln(dist[i,c] / prior_c)
   l_i  = ln(KL_i / max_KL)
   w    = softmax(l / T)
+
+wasserstein  (requires class_prior)
+  W1_i = earth-mover distance between dist[i] and prior
+  l_i  = ln(W1_i / (C-1))
+  w    = softmax(l / T)
+
+js_div  (requires class_prior)
+  JSD_i = Jensen-Shannon divergence between dist[i] and prior
+  l_i   = ln(JSD_i / ln2)
+  w     = softmax(l / T)
+
+tvd  (requires class_prior)
+  TVD_i = total variation distance between dist[i] and prior
+  l_i   = ln(TVD_i)
+  w     = softmax(l / T)
 ```
 
 `T → ∞` → uniform (mean pool). `T → 0` → all weight on the best patch.
 
-`entropy` and `kl_div` are label-agnostic and work for the AoE class (see below).
+`entropy`, `kl_div`, `wasserstein`, `js_div`, and `tvd` are label-agnostic and work for the AoE class (see below).
+
+### `--binary-dist`
+
+For divergence-based and entropy methods, collapse all non-correct classes into one before measuring
+distributional distance. The comparison becomes P(correct) vs P(non-correct) rather than the full class
+distribution, avoiding upweighting patches whose spurious class probabilities shift away from the prior.
+
+### `--prior`
+
+Controls the reference distribution for divergence-based methods:
+
+| Value | Description |
+|-------|-------------|
+| `label_frequency` (default) | Empirical class frequency in training set |
+| `patch_marginal` | Marginal patch prediction distribution |
+| `current_pool_marginal` | Marginal of the current support pool |
 
 ---
 
@@ -123,6 +165,17 @@ For datasets with a "no finding" class, true-class confidence is a poor quality 
 
 - **`--aoe-handling filter`** (default): AoE images excluded from TabICL scoring and Ridge fitting. Still included in the support and pooled at inference.
 - **`--aoe-handling entropy`**: AoE images included but scored with `entropy` regardless of `--weight-method`.
+
+---
+
+## Model selection (`--model-selection`)
+
+Controls which stage is used at inference after iterative refinement:
+
+| Value | Description |
+|-------|-------------|
+| `last_iteration` (default) | Always use the final stage |
+| `masked_train_accuracy` | Evaluate every stage on the training set with a diagonal attention mask; select the best-performing stage |
 
 ---
 
@@ -136,11 +189,14 @@ python pal_pooling/pal_experiment.py [OPTIONS]
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--dataset` | `butterfly` | Dataset: `butterfly` or `rsna` |
+| `--dataset` | `butterfly` | Dataset: `butterfly`, `rsna`, `petfinder`, `dvm`, `pad-ufes`, `cbis-ddsm-mass`, `cbis-ddsm-calc` |
 | `--backbone` | `rad-dino` | Backbone features to load for RSNA (`rad-dino` or `dinov3`); ignored for butterfly |
 | `--features-dir` | see `config.py` | Directory with `.pt` feature files |
 | `--dataset-path` | see `config.py` | Dataset root (CSV + images; needed for visualisation) |
 | `--n-train` | `None` | Limit support set to this many training images |
+| `--n-test` | `None` | Limit test set to this many images (DVM only) |
+| `--n-val` | `None` | Limit validation set to this many images (DVM only) |
+| `--train-val-fraction` | `None` | Fraction of training set to hold out as validation for Ridge fitting (e.g. `0.2`) |
 | `--balance-train` | `False` | Undersample majority classes in the training set |
 | `--balance-test` | `False` | Undersample majority classes in the test set |
 
@@ -152,7 +208,8 @@ python pal_pooling/pal_experiment.py [OPTIONS]
 | `--pca-dim` | `128` | PCA output dimension |
 | `--no-pca` | `False` | Disable PCA; use full 768-D embeddings |
 | `--seed` | `42` | RNG seed for splits, PCA, TabICL |
-| `--output-dir` | `patch_quality_results/` | Root output directory |
+| `--seeds` | `None` | Run once per seed; saves results continuously. Mutually exclusive with `--seed` |
+| `--output-dir` | `results/pal_pooling` | Root output directory |
 
 **PAL refinement**
 
@@ -161,7 +218,7 @@ python pal_pooling/pal_experiment.py [OPTIONS]
 | `--refine` | `False` | Run iterative multi-scale PAL refinement |
 | `--patch-group-sizes` | `1` | Ordered group sizes per stage (perfect squares, e.g. `16 4 1`) |
 | `--patch-size` | `16` | Base patch size in pixels |
-| `--weight-method` | `correct_class_prob` | Pooling weight method: `correct_class_prob`, `entropy`, `kl_div` |
+| `--weight-method` | `correct_class_prob` | Pooling weight method: `correct_class_prob`, `entropy`, `kl_div`, `wasserstein`, `js_div`, `tvd` |
 | `--temperature` | `1.0` | Softmax temperature (one value broadcast to all stages, or one per stage) |
 | `--ridge-alpha` | `1.0` | Ridge regularisation strength (broadcast or per-stage) |
 | `--normalize-features` | `False` | StandardScaler on patches before Ridge fitting |
@@ -171,6 +228,12 @@ python pal_pooling/pal_experiment.py [OPTIONS]
 | `--gpu-ridge` | `False` | Solve Ridge regression on GPU (requires CUDA) |
 | `--aoe-class` | `None` | Absence-of-evidence class (index or name) |
 | `--aoe-handling` | `filter` | AoE handling: `filter` or `entropy` |
+| `--append-cls` | `False` | Append the CLS token as an extra (ungrouped) patch for Ridge fitting and pooling |
+| `--use-global-prior` | `False` | Use global empirical class prior as divergence reference even when context features are provided |
+| `--prior` | `label_frequency` | Prior for divergence methods: `label_frequency`, `patch_marginal`, `current_pool_marginal` |
+| `--use-attn-masking` | `False` | Prevent each image's patches from attending to that image's own support row during TabICL scoring |
+| `--model-selection` | `last_iteration` | Stage to use at inference: `last_iteration` or `masked_train_accuracy` |
+| `--binary-dist` | `False` | Collapse non-correct classes for divergence/entropy methods |
 
 **Attention pooling**
 
@@ -182,7 +245,7 @@ python pal_pooling/pal_experiment.py [OPTIONS]
 | `--attn-lr` | `1e-3` | AdamW learning rate |
 | `--attn-max-step-samples` | `512` | Max training rows per step |
 | `--attn-num-queries` | `1` | Learnable query vectors (1 = CLS-like) |
-| `--attn-num-heads` | `8` | Attention heads (must divide embed_dim=768) |
+| `--attn-num-heads` | `1` | Attention heads (must divide embed_dim=768) |
 | `--device` | `auto` | Torch device: `auto`, `cuda`, or `cpu` |
 
 **Visualisation & sweeps**
@@ -191,6 +254,10 @@ python pal_pooling/pal_experiment.py [OPTIONS]
 |----------|---------|-------------|
 | `--n-sample` | `0` | Images to visualise per split; `0` skips visualisation |
 | `--post-refinement-viz` | `False` | Only produce post-refinement figures (with Ridge weight panel) |
+| `--viz-loo-train` | `False` | Add leave-one-out visual evaluation of train images |
+| `--pred-label-viz` | `False` | Add discrete per-patch predicted-label panel to figures |
+| `--minority-prob-viz` | `False` | Add P(minority class) panel with image-local colour scale |
+| `--per-class-probs-viz` | `False` | Add one P(class k) heatmap per class (only when n_classes ≤ 10) |
 | `--n-train-sweep` | `None` | Run one experiment per value and write `sweep_results.json` (mutually exclusive with `--n-train`) |
 
 ### Example: three-stage PAL refinement
@@ -215,6 +282,16 @@ python pal_pooling/pal_experiment.py \
     --ridge-alpha 1e3 --use-random-subsampling \
     --n-train-sweep 500 1000 2000 4000 \
     --output-dir results/sweep
+```
+
+### Example: multi-seed run
+
+```bash
+python pal_pooling/pal_experiment.py \
+    --refine --patch-group-sizes 16 4 1 \
+    --ridge-alpha 1e3 \
+    --seeds 42 43 44 \
+    --output-dir results/multi_seed
 ```
 
 ---
@@ -242,7 +319,7 @@ python pal_pooling/pal_experiment.py \
 | Function | Purpose |
 |----------|---------|
 | `ButterflyPatchDataset` | Loads pre-extracted DINOv3 patch features from `.pt` files |
-| `_load_features(dataset_cfg, seed)` | Dispatcher: loads patch features + optional CLS features for butterfly or RSNA |
+| `_load_features(dataset_cfg, seed)` | Dispatcher: loads patch features + optional CLS features for butterfly, RSNA, petfinder, DVM, PAD-UFES, CBIS-DDSM |
 
 **`pal_experiment.py`**
 
