@@ -49,6 +49,47 @@ class RefinementConfig:
     binary_dist: bool = False
 
 @dataclass
+class TextRefinementConfig:
+    """Hyperparameters for text token PAL pooling.
+
+    Mirrors :class:`RefinementConfig` for the text modality.  The key
+    difference is ``text_group_modes`` (a per-stage list of grouping strategies)
+    replacing ``patch_group_sizes``.
+
+    Grouping modes
+    --------------
+    ``"none"``
+        Individual non-padding tokens are forwarded as-is (identity grouping).
+    ``"sentence"``
+        Tokens are mean-pooled within each sentence, where sentence boundaries
+        are defined by the ``[SEP]`` token (``sep_token_id``).
+
+    The ``[CLS]`` token is always excluded from pooling by default.  Set
+    ``append_cls=True`` to append its embedding as an extra group (matching
+    the image CLS-token behaviour).
+    """
+    refine: bool
+    text_group_modes: List[str]       # e.g. ["sentence", "none"]; one entry per stage
+    temperature: List[float]
+    ridge_alpha: List[float]
+    weight_method: str
+    normalize_features: bool
+    batch_size: int
+    max_query_rows: Optional[int]
+    use_random_subsampling: bool
+    gpu_ridge: bool
+    tabicl_n_estimators: int
+    tabicl_pca_dim: Optional[int]
+    sep_token_id: int = 102           # BERT [SEP]
+    cls_token_id: int = 101           # BERT [CLS] — excluded from pooling by default
+    append_cls: bool = False          # if True, [CLS] embedding appended as extra group
+    use_global_prior: bool = False
+    use_attn_masking: bool = False
+    model_selection: str = "last_iteration"
+    binary_dist: bool = False
+
+
+@dataclass
 class AttentionPoolConfig:
     attn_pool: bool
     attn_pool_only: bool
