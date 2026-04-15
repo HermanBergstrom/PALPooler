@@ -144,6 +144,7 @@ def compute_patch_pooling_weights(
     temperature:   float = 1.0,
     weight_method: str   = "correct_class_prob",
     class_prior:   Optional[np.ndarray] = None,  # [n_classes]  empirical class frequencies
+    binary_dist:   bool  = False,
 ) -> np.ndarray:                           # [P]  sums to 1
     """Derive per-patch pooling weights from TabICL softmax predictions.
 
@@ -167,7 +168,7 @@ def compute_patch_pooling_weights(
         temperature → ∞  : logits collapse to zero  →  uniform (mean) pooling
         temperature → 0  : all weight on the single lowest-entropy patch
 
-        Note: *true_label* is not used by this method.
+        Note: *true_label* is not used by this method unless *binary_dist* is True.
 
     ``"kl_div"``
         1. Compute KL(Q_i || P_prior) for each patch, where Q_i is the predicted
@@ -183,7 +184,8 @@ def compute_patch_pooling_weights(
         Unlike ``"entropy"``, this method rewards predictions that deviate from the
         base rates, making it sensitive to class imbalance: a patch that confidently
         predicts a rare class receives a higher score than one equally confident about
-        a common class.  Note: *true_label* is not used by this method.
+        a common class.  Note: *true_label* is not used by this method unless
+        *binary_dist* is True.
 
     ``"wasserstein"``
         1. Compute the Wasserstein-1 (Earth Mover's) distance between Q_i and
@@ -196,7 +198,7 @@ def compute_patch_pooling_weights(
         4. Apply temperature-scaled softmax across patches  →  weights w_i.
 
         Requires *class_prior* (empirical class frequencies, shape [n_classes]).
-        Note: *true_label* is not used by this method.
+        Note: *true_label* is not used by this method unless *binary_dist* is True.
 
     ``"tvd"``
         1. Compute the Total Variation Distance (TVD) between Q_i and P_prior
@@ -207,7 +209,7 @@ def compute_patch_pooling_weights(
         4. Apply temperature-scaled softmax across patches  →  weights w_i.
 
         Requires *class_prior* (empirical class frequencies, shape [n_classes]).
-        Note: *true_label* is not used by this method.
+        Note: *true_label* is not used by this method unless *binary_dist* is True.
 
     ``"js_div"``
         1. Compute the Jensen-Shannon divergence JSD(Q_i || P_prior) for each
@@ -218,8 +220,22 @@ def compute_patch_pooling_weights(
         4. Apply temperature-scaled softmax across patches  →  weights w_i.
 
         Requires *class_prior* (empirical class frequencies, shape [n_classes]).
-        Note: *true_label* is not used by this method.
+        Note: *true_label* is not used by this method unless *binary_dist* is True.
+
+    When *binary_dist* is True (and *weight_method* is not ``"correct_class_prob"``),
+    the predicted distribution and prior are collapsed to a 2-class representation
+    ``[P(correct), P(non-correct)]`` before any distance is computed.  This avoids
+    upweighting patches whose spurious shifts among non-correct classes happen to look
+    discriminative, while still rewarding patches whose correct-class probability
+    diverges from the prior.
     """
+    if binary_dist and weight_method != "correct_class_prob":
+        p_correct = patch_probs[:, true_label]                                  # [P]
+        patch_probs = np.stack([p_correct, 1.0 - p_correct], axis=1)           # [P, 2]
+        if class_prior is not None:
+            pc = float(np.asarray(class_prior)[true_label])
+            class_prior = np.array([pc, 1.0 - pc], dtype=np.float64)
+
     if weight_method == "entropy":
         n_classes = patch_probs.shape[1]
         raw_entropy = compute_patch_entropy(patch_probs)          # [P] in [0, ln(C)]
@@ -313,6 +329,7 @@ def compute_patch_quality_logits(
     temperature:   float = 1.0,
     weight_method: str   = "correct_class_prob",
     class_prior:   Optional[np.ndarray] = None,  # [n_classes]  empirical class frequencies
+    binary_dist:   bool  = False,
 ) -> np.ndarray:                           # [P]  pre-normalization scaled logits
     """Return the pre-normalization score for each patch, matching the
     intermediate value computed inside compute_patch_pooling_weights.
@@ -333,7 +350,18 @@ def compute_patch_quality_logits(
                                Requires *class_prior* [n_classes].
     ``"js_div"``             → log(JSD(Q, P_prior) / ln2) / temperature
                                Requires *class_prior* [n_classes].
+
+    When *binary_dist* is True (and *weight_method* is not ``"correct_class_prob"``),
+    distributions are collapsed to ``[P(correct), P(non-correct)]`` before the
+    distance is computed.  See ``compute_patch_pooling_weights`` for details.
     """
+    if binary_dist and weight_method != "correct_class_prob":
+        p_correct = patch_probs[:, true_label]                                  # [P]
+        patch_probs = np.stack([p_correct, 1.0 - p_correct], axis=1)           # [P, 2]
+        if class_prior is not None:
+            pc = float(np.asarray(class_prior)[true_label])
+            class_prior = np.array([pc, 1.0 - pc], dtype=np.float64)
+
     if weight_method == "entropy":
         n_classes = patch_probs.shape[1]
         raw_entropy = compute_patch_entropy(patch_probs)               # [P]
@@ -397,6 +425,7 @@ def compute_patch_quality_logits_gpu(
     temperature:   float = 1.0,
     weight_method: str   = "correct_class_prob",
     class_prior:   Optional["torch.Tensor"] = None,  # [n_classes]  on GPU
+    binary_dist:   bool  = False,
 ) -> "torch.Tensor":                           # [P]  on GPU
     """GPU-native analogue of ``compute_patch_quality_logits``.
 
@@ -404,8 +433,19 @@ def compute_patch_quality_logits_gpu(
     *patch_probs*.  All operations mirror the numpy version exactly.
     Requires *class_prior* to be a tensor on the same device for the
     ``kl_div``, ``wasserstein``, ``js_div``, and ``tvd`` methods.
+
+    When *binary_dist* is True (and *weight_method* is not ``"correct_class_prob"``),
+    distributions are collapsed to ``[P(correct), P(non-correct)]`` before the
+    distance is computed.  See ``compute_patch_pooling_weights`` for details.
     """
     import torch
+
+    if binary_dist and weight_method != "correct_class_prob":
+        p_correct = patch_probs[:, true_label]                                  # [P]
+        patch_probs = torch.stack([p_correct, 1.0 - p_correct], dim=1)         # [P, 2]
+        if class_prior is not None:
+            pc = class_prior[true_label]
+            class_prior = torch.stack([pc, 1.0 - pc])
 
     eps_prob = 1e-9
     eps_clip = 1e-7
@@ -996,6 +1036,8 @@ def refine_dataset_features(
     # Now we assign quality-logit targets using the optionally updated class_prior.
     n_cls_expected = int(train_labels.max()) + 1
 
+    _binary_dist = getattr(refinement_cfg, "binary_dist", False)
+
     if one_pass:
         if use_gpu:
             for idx in range(N_active):
@@ -1006,6 +1048,7 @@ def refine_dataset_features(
                     probs_flat_t[start:end], int(active_labels[idx]),
                     refinement_cfg.temperature, _eff_method(idx),
                     active_tabular_probs_t[idx] if active_tabular_probs_t is not None else class_prior_t,
+                    binary_dist=_binary_dist,
                 )
             all_targets = all_targets_t
         else:
@@ -1017,6 +1060,7 @@ def refine_dataset_features(
                     probs_flat[start:end], int(active_labels[idx]),
                     refinement_cfg.temperature, _eff_method(idx),
                     active_tabular_probs[idx] if active_tabular_probs is not None else class_prior,
+                    binary_dist=_binary_dist,
                 )
 
     else:
@@ -1034,6 +1078,7 @@ def refine_dataset_features(
                         probs_batch[j], int(batch_labels[j]),
                         refinement_cfg.temperature, eff,
                         active_tabular_probs_t[row_ptr + j] if active_tabular_probs_t is not None else class_prior_t,
+                        binary_dist=_binary_dist,
                     )
             else:
                 for j in range(B_a):
@@ -1045,6 +1090,7 @@ def refine_dataset_features(
                         probs_batch[j], int(batch_labels[j]),
                         refinement_cfg.temperature, eff,
                         active_tabular_probs[row_ptr + j] if active_tabular_probs is not None else class_prior,
+                        binary_dist=_binary_dist,
                     )
             row_ptr += B_a
 

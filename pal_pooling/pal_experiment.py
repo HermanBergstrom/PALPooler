@@ -154,6 +154,7 @@ def _run_visual_eval(
     show_minority_prob: bool = False,
     show_per_class_probs: bool = False,
     use_attn_masking:  bool = False,
+    binary_dist:       bool = False,
 ) -> dict[str, float]:
     """Run the patch-quality visual evaluation for one support set variant.
 
@@ -249,6 +250,7 @@ def _run_visual_eval(
                 show_pred_label=show_pred_label,
                 show_minority_prob=show_minority_prob,
                 show_per_class_probs=show_per_class_probs,
+                binary_dist=binary_dist,
             )
             out_path = (
                 split_out_dir
@@ -550,6 +552,7 @@ def _make_stage_callback(
                 show_minority_prob=cfg.run.show_minority_prob,
                 show_per_class_probs=cfg.run.show_per_class_probs,
                 use_attn_masking=cfg.refinement.use_attn_masking,
+                binary_dist=cfg.refinement.binary_dist,
             )
         else:
             iter_mean_probs = {}
@@ -584,6 +587,7 @@ def _make_stage_callback(
                 show_minority_prob=cfg.run.show_minority_prob,
                 show_per_class_probs=cfg.run.show_per_class_probs,
                 use_attn_masking=cfg.refinement.use_attn_masking,
+                binary_dist=cfg.refinement.binary_dist,
             )
 
         # Pool test queries with Ridge and evaluate accuracy.
@@ -880,6 +884,7 @@ def run_pal_experiment(
             show_minority_prob=cfg.run.show_minority_prob,
             show_per_class_probs=cfg.run.show_per_class_probs,
             use_attn_masking=cfg.refinement.use_attn_masking,
+            binary_dist=cfg.refinement.binary_dist,
         )
     else:
         baseline_mean_probs = {}
@@ -981,6 +986,7 @@ def run_pal_experiment(
             show_minority_prob=cfg.run.show_minority_prob,
             show_per_class_probs=cfg.run.show_per_class_probs,
             use_attn_masking=cfg.refinement.use_attn_masking,
+            binary_dist=cfg.refinement.binary_dist,
         )
 
     total_time_s = time.perf_counter() - experiment_start

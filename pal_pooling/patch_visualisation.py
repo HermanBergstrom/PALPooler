@@ -65,6 +65,7 @@ def visualise_image(
     show_pred_label:   bool  = False,                 # add a discrete per-patch predicted-class panel
     show_minority_prob: bool = False,                 # add a P(minority class) panel with image-local scale
     show_per_class_probs: bool = False,               # add one P(class k) panel per class (only when n_classes <= 10)
+    binary_dist:       bool  = False,                 # collapse non-correct classes before computing weights
 ) -> plt.Figure:
     """Figure with overlay panels showing per-patch softmax quality scores.
 
@@ -102,8 +103,8 @@ def visualise_image(
         kl_div, wasserstein, js_div, and tvd panels are shown when class_prior is provided.
         """
         p_true    = dist[:, true_label]
-        w_ccp     = compute_patch_pooling_weights(dist, true_label, temperature, "correct_class_prob")
-        w_entropy = compute_patch_pooling_weights(dist, true_label, temperature, "entropy")
+        w_ccp     = compute_patch_pooling_weights(dist, true_label, temperature, "correct_class_prob", binary_dist=binary_dist)
+        w_entropy = compute_patch_pooling_weights(dist, true_label, temperature, "entropy", binary_dist=binary_dist)
         panels = [
             (f"Original image\n[{label}]", None, {}),
             (f"P(true class)  (mean={p_true.mean():.3f})",
@@ -115,22 +116,22 @@ def visualise_image(
         ]
         if class_prior is not None:
             w_kl = compute_patch_pooling_weights(
-                dist, true_label, temperature, "kl_div", class_prior
+                dist, true_label, temperature, "kl_div", class_prior, binary_dist=binary_dist
             )
             panels.append((_mark("KL-div weights", "kl_div"),
                            w_kl, {"vmin": w_kl.min(), "vmax": w_kl.max()}))
             w_wass = compute_patch_pooling_weights(
-                dist, true_label, temperature, "wasserstein", class_prior
+                dist, true_label, temperature, "wasserstein", class_prior, binary_dist=binary_dist
             )
             panels.append((_mark("Wasserstein weights", "wasserstein"),
                            w_wass, {"vmin": w_wass.min(), "vmax": w_wass.max()}))
             w_js = compute_patch_pooling_weights(
-                dist, true_label, temperature, "js_div", class_prior
+                dist, true_label, temperature, "js_div", class_prior, binary_dist=binary_dist
             )
             panels.append((_mark("JS-div weights", "js_div"),
                            w_js, {"vmin": w_js.min(), "vmax": w_js.max()}))
             w_tvd = compute_patch_pooling_weights(
-                dist, true_label, temperature, "tvd", class_prior
+                dist, true_label, temperature, "tvd", class_prior, binary_dist=binary_dist
             )
             panels.append((_mark("TVD weights", "tvd"),
                            w_tvd, {"vmin": w_tvd.min(), "vmax": w_tvd.max()}))

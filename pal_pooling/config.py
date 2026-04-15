@@ -46,6 +46,7 @@ class RefinementConfig:
     prior: str = "label_frequency"
     use_attn_masking: bool = False
     model_selection: str = "last_iteration"
+    binary_dist: bool = False
 
 @dataclass
 class AttentionPoolConfig:
@@ -174,6 +175,12 @@ def parse_args() -> ExperimentConfig:
                         "'last_iteration' (default) always uses the final stage. "
                         "'masked_train_accuracy' evaluates every stage on the training set with a "
                         "diagonal attention mask and selects the best-performing one.")
+    p.add_argument("--binary-dist", action="store_true",
+                   help="For divergence-based and entropy weight methods, collapse all non-correct "
+                        "classes into one before measuring the distributional distance. The comparison "
+                        "becomes P(correct) vs P(non-correct) rather than the full class distribution, "
+                        "which avoids upweighting patches whose spurious class probabilities happen to "
+                        "shift away from the prior.")
     p.add_argument("--aoe-class", type=str, default=None,
                    help="Absence-of-evidence class.")
     p.add_argument("--aoe-handling", type=str, default="filter",
@@ -253,6 +260,7 @@ def parse_args() -> ExperimentConfig:
         prior=args.prior,
         use_attn_masking=args.use_attn_masking,
         model_selection=args.model_selection,
+        binary_dist=args.binary_dist,
     )
     
     attention_cfg = AttentionPoolConfig(
