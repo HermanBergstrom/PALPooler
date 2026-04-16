@@ -342,10 +342,8 @@ def _load_features(
     dataset_cfg: DatasetConfig,
     seed: int,
     dtype:        torch.dtype = torch.float32,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-           Optional[np.ndarray], dict[int, str],
-           Optional[np.ndarray], Optional[np.ndarray]]:
-    """Load patch and CLS features for the requested dataset.
+) -> tuple:
+    """Load patch/token and CLS features for the requested dataset.
 
     Returns:
         train_patches:   [N_train, P, D]  float32 numpy
@@ -357,11 +355,19 @@ def _load_features(
         idx_to_class:    {int → class_name}
         train_sub_idx:   [N_train] int64 or None
         test_sub_idx:    [N_test]  int64 or None
+        extra_data:      dict — modality-specific arrays.  For text datasets
+                         (e.g. 'imdb') this contains:
+                           'train_token_ids'      [N_train, T_max] int32
+                           'train_attention_mask' [N_train, T_max] bool
+                           'test_token_ids'       [N_test,  T_max] int32
+                           'test_attention_mask'  [N_test,  T_max] bool
+                         For image datasets this is an empty dict.
     """
     features_dir = Path(dataset_cfg.features_dir)
     train_sub_idx: Optional[np.ndarray] = None
     test_sub_idx:  Optional[np.ndarray] = None
     n_train = dataset_cfg.n_train
+    extra_data: dict = {}
 
     if dataset_cfg.dataset == "butterfly":
         train_ds = ButterflyPatchDataset(features_dir, split="train", dtype=dtype)
@@ -455,9 +461,10 @@ def _load_features(
             sys.path.insert(0, str(petfinder_dir))
         from petfinder_dataset_with_dinov3 import load_petfinder_dataset  # type: ignore
 
+        backbone = dataset_cfg.backbone
         train_loader, val_loader, test_loader, metadata = load_petfinder_dataset(
-            processed_dir=petfinder_dir / "extracted_features" / "preprocessed_dinov3_local",
-            feature_source="dinov3_local",
+            #processed_dir=petfinder_dir / "extracted_features" / f"preprocessed_{backbone}",
+            feature_source=backbone,
             use_patches=True,
             use_images=True,
             num_workers=0,
@@ -686,10 +693,104 @@ def _load_features(
               f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] CBIS-DDSM {kind} (test):  N={len(test_labels)}")
 
+    elif dataset_cfg.dataset == "imdb":
+        imdb_module_dir = "/project/aip-rahulgk/image_icl_project/imdb"
+        if imdb_module_dir not in sys.path:
+            sys.path.insert(0, imdb_module_dir)
+        from imdb_dataset import load_imdb_dataset  # type: ignore
+
+        train_loader, _val_loader, test_loader, metadata = load_imdb_dataset(
+            use_token_embeddings=True,
+            max_train=dataset_cfg.n_train,
+            max_val=0,       # val split is unused; skip to avoid loading ~3.9 GB of token embeddings
+            max_test=dataset_cfg.n_test,
+            num_workers=0,
+            batch_size=1,  # we access Dataset objects directly below
+        )
+        train_ds = train_loader.dataset
+        test_ds  = test_loader.dataset
+
+        train_patches = train_ds.token_embeddings.float().numpy()      # [N, T_max, D]
+        train_labels  = train_ds.targets.numpy().astype(np.int64)
+        cls_train     = train_ds.cls_embeddings.float().numpy()        # [N, D]
+        train_token_ids      = train_ds.token_ids.numpy().astype(np.int32)   # [N, T_max]
+        train_attention_mask = train_ds.attention_masks.bool().numpy()       # [N, T_max]
+
+        test_patches         = test_ds.token_embeddings.float().numpy()
+        test_labels          = test_ds.targets.numpy().astype(np.int64)
+        cls_test             = test_ds.cls_embeddings.float().numpy()
+        test_token_ids       = test_ds.token_ids.numpy().astype(np.int32)
+        test_attention_mask  = test_ds.attention_masks.bool().numpy()
+
+        label_map    = metadata["label_map"]   # e.g. {"negative": 0, "positive": 1}
+        idx_to_class = {v: k for k, v in label_map.items()}
+
+        extra_data = {
+            "train_token_ids":      train_token_ids,
+            "train_attention_mask": train_attention_mask,
+            "test_token_ids":       test_token_ids,
+            "test_attention_mask":  test_attention_mask,
+        }
+
+        print(f"[info] IMDB (train): N={len(train_labels)}  "
+              f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] IMDB (test):  N={len(test_labels)}")
+
+        # n_train subsampling already handled by load_imdb_dataset(max_train=...).
+        n_train = None
+
+    elif dataset_cfg.dataset == "20news":
+        news_module_dir = "/project/aip-rahulgk/image_icl_project/20news"
+        if news_module_dir not in sys.path:
+            sys.path.insert(0, news_module_dir)
+        import importlib
+        news_module = importlib.import_module("20news_dataset")  # type: ignore
+        load_20news_dataset = news_module.load_20news_dataset
+
+        train_loader, _val_loader, test_loader, metadata = load_20news_dataset(
+            use_token_embeddings=True,
+            max_train=dataset_cfg.n_train,
+            max_val=0,       # val split is unused; skip to avoid loading ~3.9 GB of token embeddings
+            max_test=dataset_cfg.n_test,
+            num_workers=0,
+            batch_size=1,  # we access Dataset objects directly below
+        )
+        train_ds = train_loader.dataset
+        test_ds  = test_loader.dataset
+
+        train_patches = train_ds.token_embeddings.float().numpy()      # [N, T_max, D]
+        train_labels  = train_ds.targets.numpy().astype(np.int64)
+        cls_train     = train_ds.cls_embeddings.float().numpy()        # [N, D]
+        train_token_ids      = train_ds.token_ids.numpy().astype(np.int32)   # [N, T_max]
+        train_attention_mask = train_ds.attention_masks.bool().numpy()       # [N, T_max]
+
+        test_patches         = test_ds.token_embeddings.float().numpy()
+        test_labels          = test_ds.targets.numpy().astype(np.int64)
+        cls_test             = test_ds.cls_embeddings.float().numpy()
+        test_token_ids       = test_ds.token_ids.numpy().astype(np.int32)
+        test_attention_mask  = test_ds.attention_masks.bool().numpy()
+
+        categories = metadata.get("categories", [f"class_{i}" for i in range(metadata["num_classes"])])
+        idx_to_class = {i: cat for i, cat in enumerate(categories)}
+
+        extra_data = {
+            "train_token_ids":      train_token_ids,
+            "train_attention_mask": train_attention_mask,
+            "test_token_ids":       test_token_ids,
+            "test_attention_mask":  test_attention_mask,
+        }
+
+        print(f"[info] 20NEWS (train): N={len(train_labels)}  "
+              f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] 20NEWS (test):  N={len(test_labels)}")
+
+        # n_train subsampling already handled by load_20news_dataset(max_train=...).
+        n_train = None
+
     else:
         raise ValueError(f"Unknown dataset '{dataset_cfg.dataset}'. "
                          f"Choices: butterfly, rsna, petfinder, dvm, pad-ufes, "
-                         f"cbis-ddsm-mass, cbis-ddsm-calc")
+                         f"cbis-ddsm-mass, cbis-ddsm-calc, imdb, 20news")
 
     # --- Optional n_train subsampling for non-RSNA datasets ---
     if dataset_cfg.n_train is not None and dataset_cfg.n_train < len(train_labels):
@@ -704,7 +805,7 @@ def _load_features(
             cls_train = cls_train[sub_idx]
         print(f"[info] Training set subsampled: {n_train} / {n_orig} images")
 
-    return train_patches, train_labels, test_patches, test_labels, cls_train, cls_test, idx_to_class, train_sub_idx, test_sub_idx
+    return train_patches, train_labels, test_patches, test_labels, cls_train, cls_test, idx_to_class, train_sub_idx, test_sub_idx, extra_data
 
 
 def _balance_classes(

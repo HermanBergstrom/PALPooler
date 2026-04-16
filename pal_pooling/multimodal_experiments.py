@@ -702,9 +702,9 @@ def _parse_args() -> argparse.Namespace:
                         "context features are provided, instead of the per-image P(Y|X_tab).")
     p.add_argument("--use-attn-masking", action=argparse.BooleanOptionalAction, default=True,
                    help="Use attention masking in PALPooler (default: True)")
-    p.add_argument("--prior", type=str, default="label_frequency",
+    p.add_argument("--prior", type=str, default="patch_marginal",
                    choices=["label_frequency", "patch_marginal", "current_pool_marginal"],
-                   help="Prior to use as the divergence reference (default: label_frequency)")
+                   help="Prior to use as the divergence reference (default: patch_marginal)")
     p.add_argument("--model-selection", type=str, default="last_iteration",
                    choices=["last_iteration", "masked_train_accuracy"],
                    help="Which stage to use at inference after iterative refinement. "

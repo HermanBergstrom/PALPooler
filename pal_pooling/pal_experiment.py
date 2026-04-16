@@ -644,7 +644,7 @@ def run_pal_experiment(
     (train_patches, train_labels,
      test_patches,  test_labels,
      cls_train_feats, cls_test_feats,
-     idx_to_class, train_sub_idx, test_sub_idx) = _load_features(
+     idx_to_class, train_sub_idx, test_sub_idx, extra_data) = _load_features(
         dataset_cfg=cfg.dataset,
         seed=cfg.seed,
     )
@@ -686,6 +686,34 @@ def run_pal_experiment(
             
         print(f"[val_split] Held out {n_val_split} images for validation during refinement (fraction={cfg.dataset.train_val_fraction})")
 
+    # --- Apply the same index selections to text-specific arrays (token_ids, attention_mask) ---
+    if extra_data:
+        _tids  = extra_data["train_token_ids"]
+        _tmask = extra_data["train_attention_mask"]
+        _eids  = extra_data["test_token_ids"]
+        _emask = extra_data["test_attention_mask"]
+        if bal_train_keep_idx is not None:
+            _tids  = _tids[bal_train_keep_idx]
+            _tmask = _tmask[bal_train_keep_idx]
+        if bal_test_keep_idx is not None:
+            _eids  = _eids[bal_test_keep_idx]
+            _emask = _emask[bal_test_keep_idx]
+        val_token_ids:      Optional[np.ndarray] = None
+        val_attention_mask: Optional[np.ndarray] = None
+        if val_keep_idx is not None and train_keep_idx is not None:
+            val_token_ids      = _tids[val_keep_idx]
+            val_attention_mask = _tmask[val_keep_idx]
+            _tids  = _tids[train_keep_idx]
+            _tmask = _tmask[train_keep_idx]
+        extra_data = {
+            "train_token_ids":      _tids,
+            "train_attention_mask": _tmask,
+            "test_token_ids":       _eids,
+            "test_attention_mask":  _emask,
+            "val_token_ids":        val_token_ids,
+            "val_attention_mask":   val_attention_mask,
+        }
+
     N_train, _P, D = train_patches.shape
     n_classes      = int(train_labels.max()) + 1
 
@@ -699,6 +727,170 @@ def run_pal_experiment(
     for _i, (_cls_name, _tr, _te) in enumerate(zip(idx_to_class, _counts, _test_counts)):
         print(f"  {str(_cls_name):<8} {_tr:>8d} {100*_tr/_counts.sum():>8.1f}% {_te:>8d} {100*_te/_test_counts.sum():>8.1f}%")
     print(f"  {'TOTAL':<8} {_counts.sum():>8d} {'100.0%':>9} {_test_counts.sum():>8d} {'100.0%':>9}")
+
+    # -----------------------------------------------------------------------
+    # TEXT MODALITY BRANCH — runs the full experiment and returns early.
+    # -----------------------------------------------------------------------
+    if cfg.dataset.modality == "text":
+        text_cfg = cfg.refinement  # already a TextRefinementConfig from parse_args()
+
+        train_token_ids      = extra_data["train_token_ids"]       # [N_train, T_max]
+        train_attention_mask = extra_data["train_attention_mask"]  # [N_train, T_max]
+        test_token_ids       = extra_data["test_token_ids"]
+        test_attention_mask  = extra_data["test_attention_mask"]
+
+        # --- Masked mean-pool baseline (exclude [CLS] and padding) ---
+        _cls_id  = text_cfg.cls_token_id   # 101
+        _valid_tr = (train_token_ids != 0) & (train_token_ids != _cls_id)
+        _valid_te = (test_token_ids  != 0) & (test_token_ids  != _cls_id)
+        _cnts_tr  = _valid_tr.sum(axis=1, keepdims=True).clip(min=1)
+        _cnts_te  = _valid_te.sum(axis=1, keepdims=True).clip(min=1)
+        baseline_support_raw = (
+            (train_patches.astype(np.float32) * _valid_tr[:, :, None]).sum(axis=1) / _cnts_tr
+        )  # [N_train, D]
+        test_mean_pool = (
+            (test_patches.astype(np.float32) * _valid_te[:, :, None]).sum(axis=1) / _cnts_te
+        )  # [N_test, D]
+
+        pca: Optional[PCA] = None
+        if text_cfg.tabicl_pca_dim is not None:
+            n_comp = min(text_cfg.tabicl_pca_dim, N_train, D)
+            pca    = PCA(n_components=n_comp, random_state=cfg.seed)
+            baseline_support = pca.fit_transform(baseline_support_raw).astype(np.float32)
+            test_mean_proj   = pca.transform(test_mean_pool).astype(np.float32)
+            print(f"[info] PCA: {D}D → {n_comp}D")
+        else:
+            baseline_support = baseline_support_raw
+            test_mean_proj   = test_mean_pool
+
+        # CLS token baseline
+        cls_acc:   Optional[float] = None
+        cls_auroc: Optional[float] = None
+        if cls_train_feats is not None and cls_test_feats is not None:
+            cls_pca: Optional[PCA] = None
+            if text_cfg.tabicl_pca_dim is not None:
+                n_cls = min(text_cfg.tabicl_pca_dim, len(cls_train_feats), cls_train_feats.shape[1])
+                cls_pca     = PCA(n_components=n_cls, random_state=cfg.seed)
+                cls_support = cls_pca.fit_transform(cls_train_feats).astype(np.float32)
+                cls_test_q  = cls_pca.transform(cls_test_feats).astype(np.float32)
+            else:
+                cls_support = cls_train_feats
+                cls_test_q  = cls_test_feats
+            cls_acc, cls_auroc = _compute_accuracy_from_features(
+                cls_support, train_labels, cls_test_q, test_labels,
+                n_estimators=text_cfg.tabicl_n_estimators, seed=cfg.seed,
+            )
+
+        baseline_acc, baseline_auroc = _compute_accuracy_from_features(
+            baseline_support, train_labels, test_mean_proj, test_labels,
+            n_estimators=text_cfg.tabicl_n_estimators, seed=cfg.seed,
+        )
+        if cls_acc is not None:
+            print(f"\n[cls-token]  test accuracy: {cls_acc:.4f}  auroc: {cls_auroc:.4f}")
+        else:
+            print("\n[cls-token]  test accuracy: N/A")
+        print(f"[mean-pool]  test accuracy: {baseline_acc:.4f}  auroc: {baseline_auroc:.4f}")
+
+        all_results: list = [
+            ("baseline", baseline_acc, baseline_auroc, {}, 0.0, 0.0, 0.0, 0.0)
+        ]
+
+        if not text_cfg.refine:
+            _save_results(
+                output_dir=output_dir, run_ts=run_ts,
+                total_time_s=time.perf_counter() - experiment_start,
+                train_patches=train_patches, test_labels=test_labels, D=D,
+                n_classes=n_classes, pca=pca,
+                cls_acc=cls_acc, cls_auroc=cls_auroc,
+                baseline_acc=baseline_acc, baseline_auroc=baseline_auroc,
+                all_results=all_results, cfg=cfg, attn_result=None,
+            )
+            return
+
+        # --- Iterative text PAL refinement ---
+        _refine_dev = cfg.device if cfg.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+        if _refine_dev.startswith("cuda") and torch.cuda.is_available():
+            tabicl_clf = TabICLGPUAdapter(n_estimators=text_cfg.tabicl_n_estimators, random_state=cfg.seed)
+            print(f"[refinement] Using TabICLGPUAdapter + RidgeGPU on {_refine_dev}")
+        else:
+            tabicl_clf = TabICLClassifier(n_estimators=text_cfg.tabicl_n_estimators, random_state=cfg.seed)
+            _refine_dev = ""
+            print("[refinement] Using TabICLClassifier + sklearn Ridge (CPU)")
+
+        pal_pooler = IterativePALPooler(
+            tabicl=tabicl_clf, refinement_cfg=text_cfg, modality="text", seed=cfg.seed,
+            gpu_ridge_device=_refine_dev,
+        )
+
+        text_cls_train = cls_train_feats if text_cfg.append_cls else None
+        text_cls_test  = cls_test_feats  if text_cfg.append_cls else None
+
+        pal_pooler.fit(
+            train_patches, train_labels,
+            token_ids=train_token_ids,
+            attention_mask=train_attention_mask,
+            cls_tokens=text_cls_train,
+        )
+
+        # Evaluate each stage on the test set.
+        for k, stage in enumerate(pal_pooler.stages_):
+            tag = f"iter_{k}_mode_{stage.text_group_mode_}"
+            t_eval = time.perf_counter()
+            test_pooled = stage.transform(
+                test_patches, test_token_ids, test_attention_mask, text_cls_test
+            )
+            test_query = (
+                stage._pca_.transform(test_pooled).astype(np.float32)
+                if stage._pca_ is not None else test_pooled
+            )
+            iter_acc, iter_auroc = _compute_accuracy_from_features(
+                stage._support_projected_, train_labels, test_query, test_labels,
+                n_estimators=text_cfg.tabicl_n_estimators, seed=cfg.seed,
+            )
+            eval_time_s = time.perf_counter() - t_eval
+            print(f"[{tag}] test accuracy: {iter_acc:.4f}  auroc: {iter_auroc:.4f}  "
+                  f"(fit {stage.fit_time_s_:.1f}s, pool {stage.pool_time_s_:.1f}s, "
+                  f"eval {eval_time_s:.1f}s)")
+            all_results.append((
+                tag, iter_acc, iter_auroc, {},
+                stage.fit_time_s_ + stage.pool_time_s_, eval_time_s,
+                stage.fit_time_s_, stage.pool_time_s_,
+            ))
+
+        total_time_s = time.perf_counter() - experiment_start
+
+        # Summary table
+        col_w = max(len(r[0]) for r in all_results) + 2
+        print("\n" + "=" * (col_w + 60))
+        print("ITERATIVE TEXT REFINEMENT SUMMARY")
+        print("=" * (col_w + 60))
+        print(f"  {'Stage':<{col_w}}  {'Test Acc':>10}  {'AUROC':>8}  {'Δ Acc':>8}  "
+              f"{'Fit(s)':>8}  {'Pool(s)':>8}  {'Eval(s)':>8}")
+        print("-" * (col_w + 60))
+        for stage_name, acc, auroc, _, refine_s, eval_s, fit_s, pool_s in all_results:
+            delta_str = "" if stage_name == "baseline" else f"{acc - baseline_acc:+.4f}"
+            fit_str   = "-" if stage_name == "baseline" else f"{fit_s:.1f}"
+            pool_str  = "-" if stage_name == "baseline" else f"{pool_s:.1f}"
+            eval_str  = "-" if stage_name == "baseline" else f"{eval_s:.1f}"
+            auroc_str = f"{auroc:.4f}" if not np.isnan(auroc) else "  N/A"
+            print(f"  {stage_name:<{col_w}}  {acc:>10.4f}  {auroc_str:>8}  {delta_str:>8}"
+                  f"  {fit_str:>8}  {pool_str:>8}  {eval_str:>8}")
+        print("=" * (col_w + 60))
+        print(f"  Total wall time: {total_time_s:.1f}s")
+
+        _save_results(
+            output_dir=output_dir, run_ts=run_ts,
+            total_time_s=total_time_s,
+            train_patches=train_patches, test_labels=test_labels, D=D,
+            n_classes=n_classes, pca=pca,
+            cls_acc=cls_acc, cls_auroc=cls_auroc,
+            baseline_acc=baseline_acc, baseline_auroc=baseline_auroc,
+            all_results=all_results, cfg=cfg, attn_result=None,
+        )
+        return
+    # -----------------------------------------------------------------------
+    # END TEXT BRANCH
+    # -----------------------------------------------------------------------
 
     # --- Resolve absence-of-evidence class ---
     aoe_mask: Optional[np.ndarray] = None

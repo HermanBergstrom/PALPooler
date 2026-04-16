@@ -1,7 +1,7 @@
 import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 BUTTERFLY_DATASET_PATH  = Path("/project/aip-rahulgk/hermanb/datasets/butterfly-image-classification")
 RSNA_DATASET_PATH       = Path("/project/aip-rahulgk/hermanb/datasets/rsna-pneumonia")
@@ -9,7 +9,34 @@ PETFINDER_DATASET_PATH  = Path("/project/aip-rahulgk/image_icl_project/petfinder
 DVM_DATASET_PATH        = Path("/project/6101781/image_icl_project/DVM_Dataset")
 PAD_UFES_DATASET_PATH   = Path("/project/6101781/image_icl_project/pad-ufes-20-copy")
 CBIS_DDSM_DATASET_PATH  = Path("/project/6101781/image_icl_project/cbis-ddsm/cbis-ddsm-breast-cancer-image-dataset")
+IMDB_DATASET_PATH       = Path("/project/aip-rahulgk/image_icl_project/imdb")
+TWENTY_NEWS_DATASET_PATH = Path("/project/aip-rahulgk/image_icl_project/20news")
 FEATURES_DIR            = Path("/scratch/hermanb/temp_datasets/extracted_features")
+
+# Maps each dataset name to its modality.  Image datasets default to DINOv3;
+# text datasets default to ELECTRA.
+MODALITY_MAP: Dict[str, str] = {
+    "butterfly":      "image",
+    "rsna":           "image",
+    "petfinder":      "image",
+    "dvm":            "image",
+    "pad-ufes":       "image",
+    "cbis-ddsm-mass": "image",
+    "cbis-ddsm-calc": "image",
+    "imdb":           "text",
+    "20news":         "text",
+}
+
+# Default backbone per modality (used when --backbone is not set by the user).
+DEFAULT_BACKBONE: Dict[str, str] = {
+    "image": "dinov3",
+    "text":  "electra",
+}
+
+
+def get_modality(dataset: str) -> str:
+    """Return ``'image'`` or ``'text'`` for *dataset*."""
+    return MODALITY_MAP.get(dataset, "image")
 
 @dataclass
 class DatasetConfig:
@@ -24,6 +51,11 @@ class DatasetConfig:
     n_sample: int
     balance_train: bool
     balance_test: bool
+
+    @property
+    def modality(self) -> str:
+        """Return ``'image'`` or ``'text'`` based on the dataset name."""
+        return get_modality(self.dataset)
 @dataclass
 class RefinementConfig:
     refine: bool
@@ -87,6 +119,7 @@ class TextRefinementConfig:
     use_attn_masking: bool = False
     model_selection: str = "last_iteration"
     binary_dist: bool = False
+    prior: str = "label_frequency"    # "label_frequency", "token_marginal", or "current_pool_marginal"
 
 
 @dataclass
@@ -116,7 +149,7 @@ class RunConfig:
 @dataclass
 class ExperimentConfig:
     dataset: DatasetConfig
-    refinement: RefinementConfig
+    refinement: Union[RefinementConfig, TextRefinementConfig]
     attention: AttentionPoolConfig
     run: RunConfig
     seed: int
@@ -127,12 +160,13 @@ def parse_args() -> ExperimentConfig:
     p = argparse.ArgumentParser(description="Patch quality evaluation with TabICL")
     p.add_argument("--dataset",       type=str,   default="butterfly",
                    choices=["butterfly", "rsna", "petfinder", "dvm", "pad-ufes",
-                            "cbis-ddsm-mass", "cbis-ddsm-calc"],
+                            "cbis-ddsm-mass", "cbis-ddsm-calc", "imdb", "20news"],
                    help="Which dataset to run on")
-    p.add_argument("--backbone",      type=str,   default="rad-dino",
-                   choices=["rad-dino", "dinov3"],
-                   help="Which backbone's features to load for RSNA "
-                        "(default: rad-dino; ignored for butterfly)")
+    p.add_argument("--backbone",      type=str,   default=None,
+                   choices=["rad-dino", "dinov3", "mae", "ijepa", "electra"],
+                   help="Which backbone's features to load. "
+                        "Defaults to 'dinov3' for image datasets and 'electra' for text datasets. "
+                        "For RSNA the default is 'rad-dino'.")
     p.add_argument("--features-dir",  type=Path,  default=FEATURES_DIR)
     p.add_argument("--dataset-path",  type=Path,  default=None,
                    help="Root path of the raw dataset (images + labels). "
@@ -157,7 +191,13 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--patch-group-sizes", type=int,   nargs="+",  default=[1],
                    help="Ordered list of patch group sizes for iterative refinement "
                         "(must each be a perfect square: 1, 4, 9, 16, …). "
-                        "1 = no grouping (individual patches).")
+                        "1 = no grouping (individual patches). Image datasets only.")
+    p.add_argument("--text-group-modes", type=str,   nargs="+",  default=["none"],
+                   choices=["none", "sentence"],
+                   help="Ordered list of text token grouping modes for iterative refinement. "
+                        "'none' = individual non-padding tokens; "
+                        "'sentence' = mean-pool within sentence spans delimited by [SEP]. "
+                        "Text datasets only.")
     p.add_argument("--refine",        action="store_true",
                    help="Refine support features with patch-quality weighting before eval")
     p.add_argument("--temperature",    type=float, nargs="+",  default=[1.0],
@@ -204,9 +244,10 @@ def parse_args() -> ExperimentConfig:
                    help="Use the global empirical class prior P(Y) as the divergence reference even when "
                         "context (tabular) features are provided, instead of the per-image P(Y|X_tab).")
     p.add_argument("--prior", type=str, default="label_frequency",
-                   choices=["label_frequency", "patch_marginal", "current_pool_marginal"],
+                   choices=["label_frequency", "token_marginal", "current_pool_marginal"],
                    help="Prior to use as the divergence reference: 'label_frequency' (default) uses the "
-                        "empirical class prior; 'patch_marginal' uses the marginal patch prediction distribution.")
+                        "empirical class prior; 'token_marginal' uses the marginal token/patch prediction distribution; "
+                        "'current_pool_marginal' uses the current pooled marginal distribution.")
     p.add_argument("--use-attn-masking", action="store_true",
                    help="During refinement, prevent each image's patches from attending to that image's "
                         "own support row in the TabICL ICL transformer.")
@@ -261,14 +302,25 @@ def parse_args() -> ExperimentConfig:
         "pad-ufes":       PAD_UFES_DATASET_PATH,
         "cbis-ddsm-mass": CBIS_DDSM_DATASET_PATH,
         "cbis-ddsm-calc": CBIS_DDSM_DATASET_PATH,
+        "imdb":           IMDB_DATASET_PATH,
+        "20news":         TWENTY_NEWS_DATASET_PATH,
     }
     dataset_path = args.dataset_path or _dataset_defaults[args.dataset]
-    
+
+    # Resolve backbone default based on modality when not explicitly supplied.
+    modality = get_modality(args.dataset)
+    if args.backbone is not None:
+        backbone = args.backbone
+    elif args.dataset == "rsna":
+        backbone = "rad-dino"
+    else:
+        backbone = DEFAULT_BACKBONE[modality]
+
     pca_dim = None if args.no_pca else args.pca_dim
-    
+
     dataset_cfg = DatasetConfig(
         dataset=args.dataset,
-        backbone=args.backbone,
+        backbone=backbone,
         features_dir=args.features_dir,
         dataset_path=dataset_path,
         n_train=args.n_train,
@@ -280,29 +332,51 @@ def parse_args() -> ExperimentConfig:
         balance_test=args.balance_test
     )
     
-    refinement_cfg = RefinementConfig(
-        refine=args.refine,
-        patch_size=args.patch_size,
-        patch_group_sizes=args.patch_group_sizes,
-        temperature=args.temperature,
-        weight_method=args.weight_method,
-        ridge_alpha=args.ridge_alpha,
-        normalize_features=args.normalize_features,
-        batch_size=args.batch_size,
-        max_query_rows=args.max_query_rows,
-        use_random_subsampling=args.use_random_subsampling,
-        aoe_class=args.aoe_class,
-        aoe_handling=args.aoe_handling,
-        gpu_ridge=args.gpu_ridge,
-        tabicl_n_estimators=args.n_estimators,
-        tabicl_pca_dim=pca_dim,
-        append_cls=args.append_cls,
-        use_global_prior=args.use_global_prior,
-        prior=args.prior,
-        use_attn_masking=args.use_attn_masking,
-        model_selection=args.model_selection,
-        binary_dist=args.binary_dist,
-    )
+    if modality == "text":
+        refinement_cfg: Union[RefinementConfig, TextRefinementConfig] = TextRefinementConfig(
+            refine=args.refine,
+            text_group_modes=args.text_group_modes,
+            temperature=args.temperature,
+            ridge_alpha=args.ridge_alpha,
+            weight_method=args.weight_method,
+            normalize_features=args.normalize_features,
+            batch_size=args.batch_size,
+            max_query_rows=args.max_query_rows,
+            use_random_subsampling=args.use_random_subsampling,
+            gpu_ridge=args.gpu_ridge,
+            tabicl_n_estimators=args.n_estimators,
+            tabicl_pca_dim=pca_dim,
+            append_cls=args.append_cls,
+            use_global_prior=args.use_global_prior,
+            use_attn_masking=args.use_attn_masking,
+            model_selection=args.model_selection,
+            binary_dist=args.binary_dist,
+            prior=args.prior,
+        )
+    else:
+        refinement_cfg = RefinementConfig(
+            refine=args.refine,
+            patch_size=args.patch_size,
+            patch_group_sizes=args.patch_group_sizes,
+            temperature=args.temperature,
+            weight_method=args.weight_method,
+            ridge_alpha=args.ridge_alpha,
+            normalize_features=args.normalize_features,
+            batch_size=args.batch_size,
+            max_query_rows=args.max_query_rows,
+            use_random_subsampling=args.use_random_subsampling,
+            aoe_class=args.aoe_class,
+            aoe_handling=args.aoe_handling,
+            gpu_ridge=args.gpu_ridge,
+            tabicl_n_estimators=args.n_estimators,
+            tabicl_pca_dim=pca_dim,
+            append_cls=args.append_cls,
+            use_global_prior=args.use_global_prior,
+            prior=args.prior,
+            use_attn_masking=args.use_attn_masking,
+            model_selection=args.model_selection,
+            binary_dist=args.binary_dist,
+        )
     
     attention_cfg = AttentionPoolConfig(
         attn_pool=args.attn_pool or args.attn_pool_only,

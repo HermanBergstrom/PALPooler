@@ -1024,7 +1024,7 @@ def refine_dataset_features(
     print(f"[calibration] Empirical label prior:    {np.round(empirical_prior, 4)}")
     print(f"[calibration] Marginal patch predicted: {np.round(mean_probs, 4)}")
 
-    if refinement_cfg.prior == "patch_marginal":
+    if refinement_cfg.prior == "token_marginal":
         class_prior = mean_probs.astype(np.float32)
 
     if use_gpu:

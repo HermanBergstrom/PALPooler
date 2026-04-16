@@ -321,6 +321,34 @@ def refine_text_features(
         empirical_prior if refinement_cfg.weight_method in _divergence_methods else None
     )
 
+    # For current_pool_marginal, compute the prior by running the just-fitted classifier
+    # on the current pooled support with a diagonal attention mask (each sequence cannot
+    # attend to its own support row). This gives a sequence-level marginal that reflects
+    # the actual discriminability of the pooled representation at this stage.
+    if refinement_cfg.prior == "current_pool_marginal" and refinement_cfg.weight_method in _divergence_methods:
+        print("[calibration] Computing current_pool_marginal prior from current pooled features ...")
+        N_supp = len(support_for_clf)
+        n_cls_prior = int(train_labels.max()) + 1
+        blocked_diag_np = np.arange(N_supp)
+        if hasattr(clf, "predict_proba_tensor"):
+            import torch as _torch
+            blocked_diag_t = _torch.from_numpy(blocked_diag_np).long()
+            probs_supp_t = clf.predict_proba_tensor(support_for_clf, blocked_indices=blocked_diag_t)
+            if probs_supp_t.shape[1] != n_cls_prior:
+                cls_t = _torch.tensor(clf.classes_, device=probs_supp_t.device, dtype=_torch.long)
+                full_t = _torch.zeros((N_supp, n_cls_prior), dtype=probs_supp_t.dtype, device=probs_supp_t.device)
+                full_t[:, cls_t] = probs_supp_t
+                probs_supp_t = full_t
+            class_prior = probs_supp_t.mean(dim=0).cpu().numpy().astype(np.float32)
+        else:
+            probs_supp = clf.predict_proba(support_for_clf, blocked_indices=blocked_diag_np)
+            if probs_supp.shape[1] != n_cls_prior:
+                full = np.zeros((N_supp, n_cls_prior), dtype=probs_supp.dtype)
+                full[:, clf.classes_] = probs_supp
+                probs_supp = full
+            class_prior = probs_supp.mean(axis=0).astype(np.float32)
+        print(f"[calibration] current_pool_marginal prior: {np.round(class_prior, 4)}")
+
     # Fit the shared TabICL classifier on the (possibly context-augmented) support.
     if tabicl is not None:
         clf = tabicl
@@ -478,6 +506,17 @@ def refine_text_features(
                 prior_for_s,
                 binary_dist=_binary_dist,
             )
+
+    # Compute token_marginal prior if requested (average prediction across all valid groups).
+    if refinement_cfg.prior == "token_marginal" and refinement_cfg.weight_method in _divergence_methods:
+        print("[calibration] Empirical label prior:    {0}".format(np.round(empirical_prior, 4)))
+        if use_gpu:
+            import torch as _torch
+            mean_probs = probs_flat_t.mean(dim=0).cpu().numpy().astype(np.float32)
+        else:
+            mean_probs = probs_flat.mean(axis=0).astype(np.float32)
+        print("[calibration] Marginal token predicted: {0}".format(np.round(mean_probs, 4)))
+        class_prior = mean_probs
 
     # --- Fit Ridge ---
     feature_scaler: Optional[StandardScaler] = None
