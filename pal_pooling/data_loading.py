@@ -725,11 +725,59 @@ def _load_features(
         label_map    = metadata["label_map"]   # e.g. {"negative": 0, "positive": 1}
         idx_to_class = {v: k for k, v in label_map.items()}
 
+        # Reconstruct display text from tokenization so that text.split() aligns
+        # exactly with word_weights (indexed by word_ids() from the original text).
+        # tokenizer.decode() on the full sequence adds spaces around punctuation,
+        # producing more "words" than word_ids() has entries — causing misalignment.
+        # Instead, group tokens by word_id and decode each group separately.
+        from transformers import AutoTokenizer as _AutoTokenizer
+        _HF_CACHE = "/scratch/hermanb/.cache/huggingface/transformers"
+        _tokenizer = _AutoTokenizer.from_pretrained(
+            metadata.get("model_name", "google/electra-base-discriminator"),
+            cache_dir=_HF_CACHE,
+        )
+
+        def _reconstruct_words(token_ids_row: np.ndarray, token_to_word_row: np.ndarray) -> str:
+            """Decode tokens grouped by word_id so text.split() aligns with word_weights."""
+            from collections import defaultdict
+            word_tokens: dict = defaultdict(list)
+            for tok_id, wid in zip(token_ids_row.tolist(), token_to_word_row.tolist()):
+                if wid >= 0:
+                    word_tokens[wid].append(tok_id)
+            if not word_tokens:
+                return ""
+            n_words = max(word_tokens) + 1
+            parts = []
+            for w in range(n_words):
+                toks = word_tokens.get(w, [])
+                if toks:
+                    tok_strs = _tokenizer.convert_ids_to_tokens(toks)
+                    parts.append(_tokenizer.convert_tokens_to_string(tok_strs).strip())
+                else:
+                    parts.append(f"[w{w}]")
+            return " ".join(parts)
+
+        print("[info] Reconstructing IMDB word-aligned texts ...", flush=True)
+        train_token_to_word = train_ds.token_to_word.numpy().astype(np.int32)
+        test_token_to_word  = test_ds.token_to_word.numpy().astype(np.int32)
+        train_texts = [
+            _reconstruct_words(train_token_ids[i], train_token_to_word[i])
+            for i in range(len(train_token_ids))
+        ]
+        test_texts = [
+            _reconstruct_words(test_token_ids[i], test_token_to_word[i])
+            for i in range(len(test_token_ids))
+        ]
+
         extra_data = {
             "train_token_ids":      train_token_ids,
             "train_attention_mask": train_attention_mask,
+            "train_texts":          train_texts,
+            "train_token_to_word":  train_token_to_word,
             "test_token_ids":       test_token_ids,
             "test_attention_mask":  test_attention_mask,
+            "test_texts":           test_texts,
+            "test_token_to_word":   test_token_to_word,
         }
 
         print(f"[info] IMDB (train): N={len(train_labels)}  "
@@ -773,11 +821,54 @@ def _load_features(
         categories = metadata.get("categories", [f"class_{i}" for i in range(metadata["num_classes"])])
         idx_to_class = {i: cat for i, cat in enumerate(categories)}
 
+        # Reconstruct display text per word_id group (same fix as IMDB above).
+        from transformers import AutoTokenizer as _AutoTokenizer
+        _HF_CACHE = "/scratch/hermanb/.cache/huggingface/transformers"
+        _tokenizer = _AutoTokenizer.from_pretrained(
+            metadata.get("model_name", "google/electra-base-discriminator"),
+            cache_dir=_HF_CACHE,
+        )
+
+        def _reconstruct_words(token_ids_row: np.ndarray, token_to_word_row: np.ndarray) -> str:
+            from collections import defaultdict
+            word_tokens: dict = defaultdict(list)
+            for tok_id, wid in zip(token_ids_row.tolist(), token_to_word_row.tolist()):
+                if wid >= 0:
+                    word_tokens[wid].append(tok_id)
+            if not word_tokens:
+                return ""
+            n_words = max(word_tokens) + 1
+            parts = []
+            for w in range(n_words):
+                toks = word_tokens.get(w, [])
+                if toks:
+                    tok_strs = _tokenizer.convert_ids_to_tokens(toks)
+                    parts.append(_tokenizer.convert_tokens_to_string(tok_strs).strip())
+                else:
+                    parts.append(f"[w{w}]")
+            return " ".join(parts)
+
+        print("[info] Reconstructing 20NEWS word-aligned texts ...", flush=True)
+        train_token_to_word = train_ds.token_to_word.numpy().astype(np.int32)
+        test_token_to_word  = test_ds.token_to_word.numpy().astype(np.int32)
+        train_texts = [
+            _reconstruct_words(train_token_ids[i], train_token_to_word[i])
+            for i in range(len(train_token_ids))
+        ]
+        test_texts = [
+            _reconstruct_words(test_token_ids[i], test_token_to_word[i])
+            for i in range(len(test_token_ids))
+        ]
+
         extra_data = {
             "train_token_ids":      train_token_ids,
             "train_attention_mask": train_attention_mask,
+            "train_texts":          train_texts,
+            "train_token_to_word":  train_token_to_word,
             "test_token_ids":       test_token_ids,
             "test_attention_mask":  test_attention_mask,
+            "test_texts":           test_texts,
+            "test_token_to_word":   test_token_to_word,
         }
 
         print(f"[info] 20NEWS (train): N={len(train_labels)}  "

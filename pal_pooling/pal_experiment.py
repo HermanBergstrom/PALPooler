@@ -42,6 +42,7 @@ from pal_pooling.patch_pooling import (
     refine_dataset_features,
 )
 from pal_pooling.patch_visualisation import summary_figure, visualise_image
+from pal_pooling.text_visualisation import visualise_text_batch, visualise_text
 from pal_pooling.config import DatasetConfig, RefinementConfig, AttentionPoolConfig, RunConfig, ExperimentConfig, parse_args
 from pal_pooling.data_loading import (
     _get_image_paths,
@@ -272,8 +273,118 @@ def _run_visual_eval(
 
 
 # ---------------------------------------------------------------------------
-# Main experiment
+# Visual evaluation loop (Text modality)
 # ---------------------------------------------------------------------------
+
+def _run_text_visual_eval(
+    tag:              str,
+    support_features: np.ndarray,      # [N_train, d]
+    train_labels:     np.ndarray,      # [N_train]
+    split_configs:    list,            # list of (split_name, texts, patches, labels, token_ids, token_to_word, sample_idx)
+    idx_to_class:     dict[int, str],
+    pca:              Optional[PCA],
+    n_estimators:     int,
+    seed:             int,
+    output_dir:       Path,
+    temperature:      float = 1.0,
+    ridge_model:      Optional[Ridge] = None,
+    feature_scaler:   Optional[StandardScaler] = None,
+    class_prior:      Optional[np.ndarray] = None,   # [n_classes] empirical class frequencies
+    weight_method:     str  = "correct_class_prob",
+    binary_dist:       bool = False,
+) -> dict[str, float]:
+    """Run the text-token quality visual evaluation for one support set variant.
+
+    Saves per-text visualization figures under output_dir/tag/<split>/.
+    Returns a dict mapping split_name → mean correct-class probability.
+    """
+    n_classes = int(train_labels.max()) + 1
+    mean_probs: dict[str, float] = {}
+
+    clf = TabICLClassifier(n_estimators=n_estimators, random_state=seed)
+    clf.fit(support_features, train_labels)
+
+    for split_name, texts_all, patches_all, labels_all, token_ids_all, token_to_word_all, sample_idx in split_configs:
+        split_out_dir = output_dir / tag / split_name
+        split_out_dir.mkdir(parents=True, exist_ok=True)
+
+        if len(sample_idx) == 0:
+            mean_probs[split_name] = 0.0
+            continue
+
+        # --- Batch forward pass for plotting speed ---
+        sampled_texts       = [texts_all[i] for i in sample_idx]
+        sampled_patches     = patches_all[sample_idx]      # [N_s, T_max, D]
+        sampled_token_ids   = token_ids_all[sample_idx]    # [N_s, T_max]
+        sampled_token_to_word = token_to_word_all[sample_idx]  # [N_s, T_max]
+        N_s, T_max, D_dim = sampled_patches.shape
+
+        # Reshape for batch forward pass: [N_s * T_max, D]
+        flat_query = sampled_patches.reshape(N_s * T_max, D_dim)
+        if pca is not None:
+            flat_query = pca.transform(flat_query)
+
+        # Get per-token predictions
+        probs_all = clf.predict_proba(flat_query)  # [N_s * T_max, n_classes]
+        probs_all = probs_all.reshape(N_s, T_max, n_classes)
+
+        ridge_pred_weights_all = None
+        if ridge_model is not None:
+            ridge_pred_weights_all = _ridge_pool_weights(
+                sampled_patches, ridge_model, feature_scaler
+            )  # [N_s, T_max]
+
+        results: list[dict] = []
+        bar = tqdm(enumerate(sample_idx), total=len(sample_idx),
+                   desc=f"[{tag}] {split_name}", unit="text")
+        for i, text_idx in bar:
+            true_label = int(labels_all[text_idx])
+            class_name = idx_to_class[true_label]
+
+            # Get this text's data
+            text = sampled_texts[i]
+            text_probs = probs_all[i]           # [T_max, n_classes]
+            token_ids = sampled_token_ids[i]    # [T_max]
+            token_to_word = sampled_token_to_word[i]  # [T_max]
+
+            correct_probs     = text_probs[:, true_label]
+            mean_correct_prob = float(correct_probs.mean())
+
+            bar.set_postfix(
+                true=class_name,
+                P_true=f"{mean_correct_prob:.3f}",
+            )
+
+            results.append(
+                dict(text_idx=text_idx, label=true_label, class_name=class_name,
+                     mean_correct_prob=mean_correct_prob)
+            )
+
+            ridge_weights = ridge_pred_weights_all[i] if ridge_pred_weights_all is not None else None
+
+            # Generate visualization figure
+            fig = visualise_text(
+                text, token_to_word, token_ids, text_probs, true_label, idx_to_class,
+                n_classes=n_classes,
+                temperature=temperature,
+                ridge_weights=ridge_weights,
+                class_prior=class_prior,
+                weight_method=weight_method,
+                binary_dist=binary_dist,
+            )
+            out_path = (
+                split_out_dir
+                / f"text_quality_{i:02d}_idx{text_idx}_{class_name.replace(' ', '_')}.png"
+            )
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        mean_prob = float(np.mean([r["mean_correct_prob"] for r in results]))
+        mean_probs[split_name] = mean_prob
+        tqdm.write(f"[{tag}] {split_name}  mean P(true)={mean_prob:.3f}  figures → {split_out_dir}")
+
+    return mean_probs
+
 
 def _cfg_to_args_dict(cfg: ExperimentConfig) -> dict:
     """Convert ExperimentConfig to a JSON-serializable dict for provenance logging."""
@@ -686,32 +797,68 @@ def run_pal_experiment(
             
         print(f"[val_split] Held out {n_val_split} images for validation during refinement (fraction={cfg.dataset.train_val_fraction})")
 
-    # --- Apply the same index selections to text-specific arrays (token_ids, attention_mask) ---
+    # --- Apply the same index selections to text-specific arrays (token_ids, attention_mask, texts, token_to_word) ---
     if extra_data:
-        _tids  = extra_data["train_token_ids"]
-        _tmask = extra_data["train_attention_mask"]
-        _eids  = extra_data["test_token_ids"]
-        _emask = extra_data["test_attention_mask"]
+        _tids  = extra_data.get("train_token_ids")
+        _tmask = extra_data.get("train_attention_mask")
+        _texts = extra_data.get("train_texts")
+        _t2w   = extra_data.get("train_token_to_word")
+        _eids  = extra_data.get("test_token_ids")
+        _emask = extra_data.get("test_attention_mask")
+        _etexts = extra_data.get("test_texts")
+        _et2w  = extra_data.get("test_token_to_word")
+
         if bal_train_keep_idx is not None:
-            _tids  = _tids[bal_train_keep_idx]
-            _tmask = _tmask[bal_train_keep_idx]
+            if _tids is not None:
+                _tids  = _tids[bal_train_keep_idx]
+            if _tmask is not None:
+                _tmask = _tmask[bal_train_keep_idx]
+            if _texts is not None:
+                _texts = [_texts[i] for i in bal_train_keep_idx]
+            if _t2w is not None:
+                _t2w   = _t2w[bal_train_keep_idx]
         if bal_test_keep_idx is not None:
-            _eids  = _eids[bal_test_keep_idx]
-            _emask = _emask[bal_test_keep_idx]
+            if _eids is not None:
+                _eids  = _eids[bal_test_keep_idx]
+            if _emask is not None:
+                _emask = _emask[bal_test_keep_idx]
+            if _etexts is not None:
+                _etexts = [_etexts[i] for i in bal_test_keep_idx]
+            if _et2w is not None:
+                _et2w  = _et2w[bal_test_keep_idx]
+
         val_token_ids:      Optional[np.ndarray] = None
         val_attention_mask: Optional[np.ndarray] = None
+        val_texts:          Optional[list] = None
+        val_token_to_word:  Optional[np.ndarray] = None
+
         if val_keep_idx is not None and train_keep_idx is not None:
-            val_token_ids      = _tids[val_keep_idx]
-            val_attention_mask = _tmask[val_keep_idx]
-            _tids  = _tids[train_keep_idx]
-            _tmask = _tmask[train_keep_idx]
+            if _tids is not None:
+                val_token_ids      = _tids[val_keep_idx]
+                _tids  = _tids[train_keep_idx]
+            if _tmask is not None:
+                val_attention_mask = _tmask[val_keep_idx]
+                _tmask = _tmask[train_keep_idx]
+            if _texts is not None:
+                val_texts = [_texts[i] for i in val_keep_idx]
+                _texts = [_texts[i] for i in train_keep_idx]
+            if _t2w is not None:
+                val_token_to_word = _t2w[val_keep_idx]
+                _t2w   = _t2w[train_keep_idx]
+
         extra_data = {
             "train_token_ids":      _tids,
             "train_attention_mask": _tmask,
+            "train_texts":          _texts,
+            "train_token_to_word":  _t2w,
             "test_token_ids":       _eids,
             "test_attention_mask":  _emask,
+            "test_texts":           _etexts,
+            "test_token_to_word":   _et2w,
             "val_token_ids":        val_token_ids,
             "val_attention_mask":   val_attention_mask,
+            "val_texts":            val_texts,
+            "val_token_to_word":    val_token_to_word,
         }
 
     N_train, _P, D = train_patches.shape
@@ -795,6 +942,58 @@ def run_pal_experiment(
             ("baseline", baseline_acc, baseline_auroc, {}, 0.0, 0.0, 0.0, 0.0)
         ]
 
+        # --- Text visualizations (when n_sample > 0) ---
+        if cfg.dataset.n_sample > 0:
+            # Load and subsample texts and token_to_word mappings (use local copies for visualization)
+            vis_train_texts           = extra_data.get("train_texts", [f"text_{i}" for i in range(len(train_labels))])
+            vis_test_texts            = extra_data.get("test_texts", [f"text_{i}" for i in range(len(test_labels))])
+            vis_train_token_to_word   = extra_data.get("train_token_to_word", np.zeros((len(train_labels), train_token_ids.shape[1]), dtype=np.int32))
+            vis_test_token_to_word    = extra_data.get("test_token_to_word", np.zeros((len(test_labels), test_token_ids.shape[1]), dtype=np.int32))
+
+            # Create visualization copies (don't modify originals which are used for refinement)
+            vis_train_token_ids = train_token_ids.copy()
+            vis_test_token_ids  = test_token_ids.copy()
+            vis_train_patches   = train_patches.copy()
+            vis_test_patches    = test_patches.copy()
+
+            # Apply same subsampling that was applied to patches
+            if bal_train_keep_idx is not None:
+                vis_train_texts = [vis_train_texts[i] for i in bal_train_keep_idx]
+                vis_train_token_to_word = vis_train_token_to_word[bal_train_keep_idx]
+                vis_train_token_ids = vis_train_token_ids[bal_train_keep_idx]
+                vis_train_patches = vis_train_patches[bal_train_keep_idx]
+            if bal_test_keep_idx is not None:
+                vis_test_texts = [vis_test_texts[i] for i in bal_test_keep_idx]
+                vis_test_token_to_word = vis_test_token_to_word[bal_test_keep_idx]
+                vis_test_token_ids = vis_test_token_ids[bal_test_keep_idx]
+                vis_test_patches = vis_test_patches[bal_test_keep_idx]
+            if val_keep_idx is not None and train_keep_idx is not None:
+                # Note: for visualization, we only use train/test, not val
+                vis_train_texts = [vis_train_texts[i] for i in train_keep_idx]
+                vis_train_token_to_word = vis_train_token_to_word[train_keep_idx]
+                vis_train_token_ids = vis_train_token_ids[train_keep_idx]
+                vis_train_patches = vis_train_patches[train_keep_idx]
+
+            # Sample indices for visualization
+            rng              = np.random.RandomState(cfg.seed)
+            train_sample_idx = rng.choice(len(train_labels), size=min(cfg.dataset.n_sample, len(train_labels)), replace=False)
+            test_sample_idx  = rng.choice(len(test_labels),  size=min(cfg.dataset.n_sample, len(test_labels)),  replace=False)
+
+            split_configs_baseline = [
+                ("train", vis_train_texts, vis_train_patches, train_labels, vis_train_token_ids, vis_train_token_to_word, train_sample_idx),
+                ("test",  vis_test_texts,  vis_test_patches,  test_labels,  vis_test_token_ids,  vis_test_token_to_word,  test_sample_idx),
+            ]
+
+            _run_text_visual_eval(
+                "baseline", baseline_support, train_labels, split_configs_baseline, idx_to_class,
+                pca=pca, n_estimators=text_cfg.tabicl_n_estimators,
+                seed=cfg.seed, output_dir=output_dir,
+                temperature=1.0, ridge_model=None, feature_scaler=None,
+                class_prior=class_prior, weight_method=text_cfg.weight_method,
+                binary_dist=text_cfg.binary_dist,
+            )
+
+
         if not text_cfg.refine:
             _save_results(
                 output_dir=output_dir, run_ts=run_ts,
@@ -856,6 +1055,66 @@ def run_pal_experiment(
                 stage.fit_time_s_ + stage.pool_time_s_, eval_time_s,
                 stage.fit_time_s_, stage.pool_time_s_,
             ))
+
+            # Per-stage visualisation (mirrors the image-modality stage callback).
+            if cfg.dataset.n_sample > 0:
+                active_class_prior = getattr(stage, 'class_prior_', class_prior)
+                split_configs_stage = [
+                    ("train", vis_train_texts, train_patches, train_labels,
+                     vis_train_token_ids, vis_train_token_to_word, train_sample_idx),
+                    ("test",  vis_test_texts,  test_patches,  test_labels,
+                     vis_test_token_ids,  vis_test_token_to_word,  test_sample_idx),
+                ]
+                if not cfg.run.post_refinement_viz:
+                    _run_text_visual_eval(
+                        tag, stage._support_projected_, train_labels,
+                        split_configs_stage, idx_to_class,
+                        pca=stage._pca_, n_estimators=text_cfg.tabicl_n_estimators,
+                        seed=cfg.seed, output_dir=output_dir,
+                        temperature=stage.refinement_cfg.temperature,
+                        ridge_model=None, feature_scaler=None,
+                        class_prior=active_class_prior,
+                        weight_method=text_cfg.weight_method,
+                        binary_dist=text_cfg.binary_dist,
+                    )
+                else:
+                    _run_text_visual_eval(
+                        tag, stage._support_projected_, train_labels,
+                        split_configs_stage, idx_to_class,
+                        pca=stage._pca_, n_estimators=text_cfg.tabicl_n_estimators,
+                        seed=cfg.seed, output_dir=output_dir,
+                        temperature=stage.refinement_cfg.temperature,
+                        ridge_model=stage.ridge_model_,
+                        feature_scaler=stage.feature_scaler_,
+                        class_prior=active_class_prior,
+                        weight_method=text_cfg.weight_method,
+                        binary_dist=text_cfg.binary_dist,
+                    )
+
+        # Final post-stage visualisation with trained pooler weights (last stage).
+        # Runs only when --post-refinement-viz is off, mirroring the image modality.
+        if cfg.dataset.n_sample > 0 and not cfg.run.post_refinement_viz and pal_pooler.stages_:
+            last_stage = pal_pooler.stages_[-1]
+            last_tag   = f"iter_{len(pal_pooler.stages_) - 1}_mode_{last_stage.text_group_mode_}"
+            active_class_prior = getattr(last_stage, 'class_prior_', class_prior)
+            split_configs_final = [
+                ("train", vis_train_texts, train_patches, train_labels,
+                 vis_train_token_ids, vis_train_token_to_word, train_sample_idx),
+                ("test",  vis_test_texts,  test_patches,  test_labels,
+                 vis_test_token_ids,  vis_test_token_to_word,  test_sample_idx),
+            ]
+            _run_text_visual_eval(
+                f"{last_tag}_post", last_stage._support_projected_, train_labels,
+                split_configs_final, idx_to_class,
+                pca=last_stage._pca_, n_estimators=text_cfg.tabicl_n_estimators,
+                seed=cfg.seed, output_dir=output_dir,
+                temperature=last_stage.refinement_cfg.temperature,
+                ridge_model=last_stage.ridge_model_,
+                feature_scaler=last_stage.feature_scaler_,
+                class_prior=active_class_prior,
+                weight_method=text_cfg.weight_method,
+                binary_dist=text_cfg.binary_dist,
+            )
 
         total_time_s = time.perf_counter() - experiment_start
 

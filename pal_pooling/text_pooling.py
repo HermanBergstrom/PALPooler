@@ -427,6 +427,9 @@ def refine_text_features(
 
     n_cls_expected = n_cls
 
+    # Compute token_marginal prior if requested (must happen after getting probs but before using them).
+    _compute_token_marginal = refinement_cfg.prior == "token_marginal" and refinement_cfg.weight_method in _divergence_methods
+
     if use_gpu:
         import torch as _torch
         _dev = clf.device_
@@ -445,6 +448,15 @@ def refine_text_features(
             )
             full_t[:, cls_t] = probs_flat_t
             probs_flat_t = full_t
+
+        # Compute token_marginal from GPU probs
+        if _compute_token_marginal:
+            print("[calibration] Empirical label prior:    {0}".format(np.round(empirical_prior, 4)))
+            mean_probs = probs_flat_t.mean(dim=0).cpu().numpy().astype(np.float32)
+            print("[calibration] Marginal token predicted: {0}".format(np.round(mean_probs, 4)))
+            class_prior = mean_probs
+            class_prior_t = _torch.from_numpy(class_prior).to(_dev)
+
         # Build targets
         all_targets_t = _torch.empty(len(fit_features), dtype=_torch.float32, device=_dev)
         # Per-valid-group tabular prior slicing
@@ -485,6 +497,13 @@ def refine_text_features(
             full[:, clf.classes_] = probs_flat
             probs_flat = full
 
+        # Compute token_marginal from CPU probs
+        if _compute_token_marginal:
+            print("[calibration] Empirical label prior:    {0}".format(np.round(empirical_prior, 4)))
+            mean_probs = probs_flat.mean(axis=0).astype(np.float32)
+            print("[calibration] Marginal token predicted: {0}".format(np.round(mean_probs, 4)))
+            class_prior = mean_probs
+
         all_targets = np.empty(len(fit_features), dtype=np.float32)
         if tabular_probs is not None:
             active_tab = tabular_probs[fit_sample_idx].astype(np.float32)
@@ -506,17 +525,6 @@ def refine_text_features(
                 prior_for_s,
                 binary_dist=_binary_dist,
             )
-
-    # Compute token_marginal prior if requested (average prediction across all valid groups).
-    if refinement_cfg.prior == "token_marginal" and refinement_cfg.weight_method in _divergence_methods:
-        print("[calibration] Empirical label prior:    {0}".format(np.round(empirical_prior, 4)))
-        if use_gpu:
-            import torch as _torch
-            mean_probs = probs_flat_t.mean(dim=0).cpu().numpy().astype(np.float32)
-        else:
-            mean_probs = probs_flat.mean(axis=0).astype(np.float32)
-        print("[calibration] Marginal token predicted: {0}".format(np.round(mean_probs, 4)))
-        class_prior = mean_probs
 
     # --- Fit Ridge ---
     feature_scaler: Optional[StandardScaler] = None
