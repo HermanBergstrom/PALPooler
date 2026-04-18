@@ -240,6 +240,9 @@ def refine_text_features(
     tabicl:             Optional[TabICLClassifier] = None,
     context_features:   Optional[np.ndarray] = None,  # [N, D_context]
     tabular_probs:      Optional[np.ndarray] = None,  # [N, n_classes]
+    val_tokens:         Optional[np.ndarray] = None,  # [N_val, T_max, D]
+    val_token_ids:      Optional[np.ndarray] = None,  # [N_val, T_max]
+    val_labels:         Optional[np.ndarray] = None,  # [N_val]
 ) -> tuple:
     """Refine mean-pooled text support features with Ridge-predicted quality-weighted pooling.
 
@@ -311,6 +314,28 @@ def refine_text_features(
     # group_mask: [N, G_max]  bool
     G_max = grouped.shape[1]
 
+    # When val tokens are provided, use them as the Ridge query source (mirrors
+    # image path in refine_dataset_features).  The TabICL support is always the
+    # train set; val tokens are forwarded as queries so the Ridge model sees
+    # out-of-support signal.  Attention masking is disabled because val samples
+    # are not in the support.
+    if val_tokens is not None and val_labels is not None:
+        val_grouped, val_group_mask = group_text_tokens(
+            val_tokens, val_token_ids,
+            mode=text_group_mode,
+            sep_token_id=refinement_cfg.sep_token_id,
+            cls_token_id=refinement_cfg.cls_token_id,
+        )
+        source_grouped    = val_grouped
+        source_group_mask = val_group_mask
+        source_labels     = val_labels
+        _apply_attn_mask  = False
+    else:
+        source_grouped    = grouped
+        source_group_mask = group_mask
+        source_labels     = train_labels
+        _apply_attn_mask  = refinement_cfg.use_attn_masking
+
     # Precompute empirical class prior.
     n_cls = int(train_labels.max()) + 1
     counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls)
@@ -365,18 +390,18 @@ def refine_text_features(
 
     use_gpu = hasattr(clf, "predict_proba_tensor")
 
-    _apply_attn_mask = refinement_cfg.use_attn_masking
-    _binary_dist     = getattr(refinement_cfg, "binary_dist", False)
+    _binary_dist = getattr(refinement_cfg, "binary_dist", False)
 
     # Collect (group_embedding, quality_logit) pairs for Ridge fitting.
-    # Only valid groups (group_mask == True) are forwarded.
+    # Only valid groups (source_group_mask == True) are forwarded.
     # We flatten all valid groups across samples into a single query batch.
 
     # Build flat index arrays: which sample and which group position each row belongs to.
+    N_source = source_grouped.shape[0]
     valid_sample_idx = []  # sample index for each valid group
     valid_group_idx  = []  # group position for each valid group
-    for i in range(N):
-        gidx = np.where(group_mask[i])[0]
+    for i in range(N_source):
+        gidx = np.where(source_group_mask[i])[0]
         valid_sample_idx.extend([i] * len(gidx))
         valid_group_idx.extend(gidx.tolist())
     valid_sample_idx = np.array(valid_sample_idx, dtype=np.int64)
@@ -385,7 +410,7 @@ def refine_text_features(
     n_valid = len(valid_sample_idx)  # total valid groups across all sequences
 
     # Flat features for Ridge fitting: [n_valid, D]
-    all_features = grouped[valid_sample_idx, valid_group_idx].astype(np.float32)  # [n_valid, D]
+    all_features = source_grouped[valid_sample_idx, valid_group_idx].astype(np.float32)  # [n_valid, D]
 
     # Build query features for TabICL: project via PCA and optionally append context.
     query_raw = all_features  # [n_valid, D]
@@ -482,7 +507,7 @@ def refine_text_features(
             )
             all_targets_t[start:end] = compute_patch_quality_logits_gpu(
                 probs_flat_t[start:end],
-                int(train_labels[s_global]),
+                int(source_labels[s_global]),
                 refinement_cfg.temperature,
                 refinement_cfg.weight_method,
                 prior_for_s,
@@ -519,12 +544,25 @@ def refine_text_features(
             )
             all_targets[start:end] = compute_patch_quality_logits(
                 probs_flat[start:end],
-                int(train_labels[s_global]),
+                int(source_labels[s_global]),
                 refinement_cfg.temperature,
                 refinement_cfg.weight_method,
                 prior_for_s,
                 binary_dist=_binary_dist,
             )
+
+    # --- Importance weights (optional) ---
+    # Correct for length-proportional sampling bias: tokens from sequence i have
+    # weight 1/len_i, normalized so weights sum to n_fit (mean = 1), keeping the
+    # effective Ridge alpha comparable to the unweighted case.
+    ridge_sample_weight: Optional[np.ndarray] = None
+    if getattr(refinement_cfg, "use_length_importance_weights", False):
+        seq_lengths = source_group_mask.sum(axis=1).astype(np.float32)  # [N_source]
+        raw_w = 1.0 / seq_lengths[fit_sample_idx]                 # [n_fit]
+        n_fit = len(fit_sample_idx)
+        ridge_sample_weight = raw_w * (n_fit / raw_w.sum())       # normalize to mean=1
+        print(f"[text_ridge] Using length importance weights "
+              f"(min={ridge_sample_weight.min():.3f}, max={ridge_sample_weight.max():.3f})")
 
     # --- Fit Ridge ---
     feature_scaler: Optional[StandardScaler] = None
@@ -542,7 +580,7 @@ def refine_text_features(
         )
     else:
         ridge_model = Ridge(alpha=refinement_cfg.ridge_alpha)
-    ridge_model.fit(fit_features, all_targets)
+    ridge_model.fit(fit_features, all_targets, sample_weight=ridge_sample_weight)
     print(f"[text_ridge] Train R²: {ridge_model.score(fit_features, all_targets):.4f}")
 
     t_fit_done = time.perf_counter()

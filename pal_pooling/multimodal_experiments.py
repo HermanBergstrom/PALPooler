@@ -42,7 +42,12 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score
 from tabicl import TabICLClassifier
 
-from pal_pooling.config import CBIS_DDSM_DATASET_PATH, DVM_DATASET_PATH, PAD_UFES_DATASET_PATH, PETFINDER_DATASET_PATH, RefinementConfig
+from pal_pooling.config import (
+    CBIS_DDSM_DATASET_PATH, CLOTHING_DATASET_PATH, DatasetConfig, DVM_DATASET_PATH,
+    FEATURES_DIR, PAD_UFES_DATASET_PATH, PETFINDER_DATASET_PATH, RefinementConfig,
+    SALARY_INDIA_DATASET_PATH, TextRefinementConfig, get_modality,
+)
+from pal_pooling.data_loading import _load_features
 from pal_pooling.pal_pooler import IterativePALPooler, pooler_factory
 
 
@@ -121,241 +126,47 @@ def _load_dataset(
     np.ndarray, np.ndarray,   # cls_train, cls_test
     np.ndarray, np.ndarray,   # tab_train, tab_test
     dict,                      # idx_to_class
+    dict,                      # extra_data
 ]:
-    """Load dataset patch, CLS, and tabular features.
+    """Load dataset patch, CLS, and tabular features via data_loading._load_features.
 
-    Merges train + val splits as the support set.
-    Returns arrays in [N, P, D], [N], [N, D], [N, F] shapes.
+    ``max_train`` / ``max_test`` limit how many samples are loaded; ``n_train``
+    is an optional post-hoc subsample applied after loading.
     """
-    dataset_dir = Path(dataset_path)
-    if str(dataset_dir) not in sys.path:
-        sys.path.insert(0, str(dataset_dir))
+    _BACKBONE: dict[str, str] = {
+        "petfinder":      "dinov3",
+        "dvm":            "dinov3_local",
+        "pad-ufes":       "dinov3_local",
+        "cbis-ddsm-mass": "dinov3_local",
+        "cbis-ddsm-calc": "dinov3_local",
+        "clothing":       "electra",
+        "salary":         "electra",
+    }
+    _SUPPORTS_TEXT = {"petfinder"}
+    dataset_cfg = DatasetConfig(
+        dataset=dataset_name,
+        backbone=_BACKBONE.get(dataset_name, "dinov3_local"),
+        features_dir=FEATURES_DIR,
+        dataset_path=Path(dataset_path),
+        n_train=max_train,
+        n_test=max_test,
+        n_val=None,
+        train_val_fraction=None,
+        n_sample=0,
+        balance_train=False,
+        balance_test=False,
+    )
 
-    if dataset_name == "petfinder":
-        from petfinder_dataset_with_dinov3 import load_petfinder_dataset  # type: ignore
+    (train_patches, train_labels, test_patches, test_labels,
+     cls_train, cls_test, idx_to_class, _, _, extra_data) = _load_features(
+        dataset_cfg, seed=seed, load_tabular=True,
+        load_text=(dataset_name in _SUPPORTS_TEXT),
+    )
 
-        train_loader, val_loader, test_loader, metadata = load_petfinder_dataset(
-            feature_source="dinov3_local",
-            use_patches=True,
-            use_images=True,
-            num_workers=0,
-        )
-    elif dataset_name == "dvm":
-        from dvm_dataset_with_dinov3 import load_dvm_dataset  # type: ignore
+    tab_train = extra_data["tab_train"]
+    tab_test  = extra_data["tab_test"]
 
-        train_loader, val_loader, test_loader, metadata = load_dvm_dataset(
-            feature_source="dinov3_local",
-            feature_dir="/scratch/hermanb/temp_datasets/extracted_features/dvm/dvm_dinov3_local_features",
-            use_patches=True,
-            use_images=True,
-            num_workers=0,
-            data_dir=dataset_dir
-        )
-    elif dataset_name == "pad-ufes":
-        from pad_ufes_dataset import PADUFESDataset, load_metadata  # type: ignore
-        from sklearn.model_selection import train_test_split
-        from tqdm import tqdm
-
-        metadata = load_metadata(data_dir=str(dataset_dir))
-        df_full  = metadata["df"]
-        df_tr, df_te = train_test_split(
-            df_full, test_size=0.2, random_state=seed, stratify=df_full["diagnostic"]
-        )
-        train_ds_pad = PADUFESDataset(df_tr, metadata, use_patches=True, use_images=True)
-        test_ds_pad  = PADUFESDataset(df_te, metadata, use_patches=True, use_images=True)
-
-        def _collect_pad(ds, n_limit, desc):
-            total_n = len(ds)
-            if n_limit is not None and n_limit < total_n:
-                rng  = np.random.RandomState(seed)
-                idxs = rng.choice(total_n, size=n_limit, replace=False)
-                idxs.sort()
-            else:
-                idxs = np.arange(total_n)
-            patches, cls_emb, labels, tab_feat = [], [], [], []
-            for i in tqdm(idxs, desc=desc):
-                s = ds[int(i)]
-                patches.append(s["patch_embedding"].float().numpy())
-                cls_emb.append(s["image_embedding"].float().numpy())
-                labels.append(s["target"].item())
-                tab_feat.append(s["tabular"].float().numpy())
-            return (
-                np.stack(patches,   axis=0),
-                np.stack(cls_emb,   axis=0),
-                np.array(labels,    dtype=np.int64),
-                np.stack(tab_feat,  axis=0),
-            )
-
-        train_patches, cls_train, train_labels, tab_train = _collect_pad(
-            train_ds_pad, max_train, f"Loading pad-ufes (train)"
-        )
-        test_patches, cls_test, test_labels, tab_test = _collect_pad(
-            test_ds_pad, max_test, f"Loading pad-ufes (test)"
-        )
-        target_encoder = metadata["target_encoder"]
-        idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
-
-        # Optional n_train subsampling.
-        if n_train is not None and n_train < len(train_labels):
-            rng = np.random.RandomState(seed)
-            idx = rng.choice(len(train_labels), size=n_train, replace=False)
-            idx.sort()
-            train_patches = train_patches[idx]
-            train_labels  = train_labels[idx]
-            cls_train     = cls_train[idx]
-            tab_train     = tab_train[idx]
-
-        print(
-            f"[info] pad-ufes (train): N={len(train_labels)}  "
-            f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}  "
-            f"tab_dim={tab_train.shape[1]}"
-        )
-        print(f"[info] pad-ufes (test):  N={len(test_labels)}")
-        return (
-            train_patches, train_labels,
-            test_patches,  test_labels,
-            cls_train, cls_test,
-            tab_train, tab_test,
-            idx_to_class,
-        )
-
-    elif dataset_name in ("cbis-ddsm-mass", "cbis-ddsm-calc"):
-        cbis_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/cbis-ddsm"
-        if cbis_module_dir not in sys.path:
-            sys.path.insert(0, cbis_module_dir)
-        from cbis_ddsm import CBISDDSMDataset, load_metadata  # type: ignore
-        from tqdm import tqdm
-
-        kind = "mass" if dataset_name == "cbis-ddsm-mass" else "calc"
-        metadata = load_metadata(kind, data_dir=str(dataset_dir))
-        df = metadata["df"]
-
-        df_train = df[df["split"] == "train"].reset_index(drop=True)
-        df_test  = df[df["split"] == "test"].reset_index(drop=True)
-
-        train_ds_cbis = CBISDDSMDataset(df_train, metadata, image_type="crop",
-                                        use_images=True, use_patches=True)
-        test_ds_cbis  = CBISDDSMDataset(df_test,  metadata, image_type="crop",
-                                        use_images=True, use_patches=True)
-
-        def _collect_cbis_mm(ds, n_limit, desc):
-            total_n = len(ds)
-            if n_limit is not None and n_limit < total_n:
-                rng  = np.random.RandomState(seed)
-                idxs = rng.choice(total_n, size=n_limit, replace=False)
-                idxs.sort()
-            else:
-                idxs = np.arange(total_n)
-            patches, cls_emb, labels, tab_feat = [], [], [], []
-            for i in tqdm(idxs, desc=desc):
-                s = ds[int(i)]
-                patches.append(s["patch_embedding"].float().numpy())
-                cls_emb.append(s["image_embedding"].float().numpy())
-                labels.append(s["target"].item())
-                tab_feat.append(s["tabular"].float().numpy())
-            return (
-                np.stack(patches,  axis=0),
-                np.stack(cls_emb,  axis=0),
-                np.array(labels,   dtype=np.int64),
-                np.stack(tab_feat, axis=0),
-            )
-
-        train_patches, cls_train, train_labels, tab_train = _collect_cbis_mm(
-            train_ds_cbis, max_train, f"Loading {dataset_name} (train)")
-        test_patches, cls_test, test_labels, tab_test = _collect_cbis_mm(
-            test_ds_cbis, max_test, f"Loading {dataset_name} (test)")
-
-        target_encoder = metadata["target_encoder"]
-        idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
-
-        # Optional n_train subsampling.
-        if n_train is not None and n_train < len(train_labels):
-            rng = np.random.RandomState(seed)
-            idx = rng.choice(len(train_labels), size=n_train, replace=False)
-            idx.sort()
-            train_patches = train_patches[idx]
-            train_labels  = train_labels[idx]
-            cls_train     = cls_train[idx]
-            tab_train     = tab_train[idx]
-
-        print(
-            f"[info] {dataset_name} (train): N={len(train_labels)}  "
-            f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}  "
-            f"tab_dim={tab_train.shape[1]}"
-        )
-        print(f"[info] {dataset_name} (test):  N={len(test_labels)}")
-        return (
-            train_patches, train_labels,
-            test_patches,  test_labels,
-            cls_train, cls_test,
-            tab_train, tab_test,
-            idx_to_class,
-        )
-
-    else:
-        raise ValueError(f"Unknown multimodal dataset: {dataset_name}")
-
-    train_ds = train_loader.dataset
-    val_ds   = val_loader.dataset
-    test_ds  = test_loader.dataset
-
-    def get_subset(ds_list, n_limit=None, desc="Loading Data"):
-        lengths = [len(ds) for ds in ds_list]
-        total_n = sum(lengths)
-        
-        if n_limit is not None and n_limit < total_n:
-            rng = np.random.RandomState(seed)
-            sub_idx = rng.choice(total_n, size=n_limit, replace=False)
-            sub_idx.sort()
-        else:
-            sub_idx = np.arange(total_n)
-            
-        from tqdm import tqdm
-        patches, cls_emb, labels, tab_feat = [], [], [], []
-        if dataset_name == "petfinder":
-            for ds in ds_list:
-                patches.append(ds.patch_embeddings.float().numpy())
-                cls_emb.append(ds.image_embeddings.float().numpy())
-                labels.append(ds.targets.numpy().astype(np.int64))
-                tab_feat.append(ds.tabular.float().numpy())
-            
-            # Concat all arrays
-            all_patches = np.concatenate(patches, axis=0)
-            all_cls_emb = np.concatenate(cls_emb, axis=0)
-            all_labels = np.concatenate(labels, axis=0)
-            all_tab_feat = np.concatenate(tab_feat, axis=0)
-            
-            # Apply limit if needed
-            if n_limit is not None and n_limit < total_n:
-                all_patches = all_patches[sub_idx]
-                all_cls_emb = all_cls_emb[sub_idx]
-                all_labels = all_labels[sub_idx]
-                all_tab_feat = all_tab_feat[sub_idx]
-                
-            return all_patches, all_cls_emb, all_labels, all_tab_feat
-        else:
-            for i in tqdm(sub_idx, desc=desc):
-                offset = 0
-                ds_idx = i
-                for l, ds in zip(lengths, ds_list):
-                    if ds_idx < l:
-                        sample = ds[ds_idx]
-                        break
-                    ds_idx -= l
-                patches.append(sample["patch_embedding"].float().numpy())
-                cls_emb.append(sample["image_embedding"].float().numpy())
-                labels.append(sample["target"])
-                tab_feat.append(sample["tabular"].float().numpy())
-            return np.stack(patches, axis=0), np.stack(cls_emb, axis=0), np.array(labels, dtype=np.int64), np.stack(tab_feat, axis=0)
-
-    # Merge train + val → support set.
-    train_patches, cls_train, train_labels, tab_train = get_subset([train_ds, val_ds], n_limit=max_train, desc=f"Loading {dataset_name} (train+val)")
-    test_patches, cls_test, test_labels, tab_test = get_subset([test_ds], n_limit=max_test, desc=f"Loading {dataset_name} (test)")
-
-    target_encoder = metadata["target_encoder"]
-    idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
-
-    # Optional n_train subsampling.
+    # Optional post-hoc n_train subsampling (separate from max_train loading limit).
     if n_train is not None and n_train < len(train_labels):
         rng = np.random.RandomState(seed)
         idx = rng.choice(len(train_labels), size=n_train, replace=False)
@@ -364,19 +175,17 @@ def _load_dataset(
         train_labels  = train_labels[idx]
         cls_train     = cls_train[idx]
         tab_train     = tab_train[idx]
+        for k in ["text_train", "text_train_token_ids", "text_train_attn_mask", "text_cls_train"]:
+            if extra_data.get(k) is not None:
+                extra_data[k] = extra_data[k][idx]
 
-    print(
-        f"[info] {dataset_name} (train+val): N={len(train_labels)}  "
-        f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}  "
-        f"tab_dim={tab_train.shape[1]}"
-    )
-    print(f"[info] {dataset_name} (test):  N={len(test_labels)}")
     return (
         train_patches, train_labels,
         test_patches,  test_labels,
         cls_train, cls_test,
         tab_train, tab_test,
         idx_to_class,
+        extra_data,   # NEW: contains text_train, text_test, etc. when available
     )
 
 
@@ -400,7 +209,8 @@ def _run_single_seed(
      test_patches,  test_labels,
      cls_train, cls_test,
      tab_train, tab_test,
-     idx_to_class) = _load_dataset(
+     idx_to_class,
+     extra_data) = _load_dataset(
         dataset_name=args.dataset,
         dataset_path=dataset_path,
         n_train=args.n_train,
@@ -408,6 +218,32 @@ def _run_single_seed(
         max_test=args.max_test,
         seed=seed,
     )
+
+    # For text-primary datasets (clothing, salary) the token embeddings live in
+    # train_patches / extra_data["train_token_ids"] rather than extra_data["text_train"].
+    # Normalise both cases into a single set of text_* variables so the text
+    # conditions block below can run unchanged.
+    is_text_primary = get_modality(args.dataset) == "text" and extra_data.get("text_train") is None
+    if is_text_primary:
+        has_text           = True
+        text_train         = train_patches.astype(np.float32)
+        text_test          = test_patches.astype(np.float32)
+        text_train_tok_ids = extra_data["train_token_ids"]
+        text_test_tok_ids  = extra_data["test_token_ids"]
+        text_train_attn    = extra_data["train_attention_mask"]
+        text_test_attn     = extra_data["test_attention_mask"]
+        text_cls_train     = cls_train
+        text_cls_test      = cls_test
+    else:
+        has_text            = extra_data.get("text_train") is not None
+        text_train          = extra_data.get("text_train")
+        text_test           = extra_data.get("text_test")
+        text_train_tok_ids  = extra_data.get("text_train_token_ids")
+        text_test_tok_ids   = extra_data.get("text_test_token_ids")
+        text_train_attn     = extra_data.get("text_train_attn_mask")
+        text_test_attn      = extra_data.get("text_test_attn_mask")
+        text_cls_train      = extra_data.get("text_cls_train")
+        text_cls_test       = extra_data.get("text_cls_test")
 
     N_train, P, D = train_patches.shape
     n_classes = len(idx_to_class)
@@ -449,118 +285,234 @@ def _run_single_seed(
     print("\n--- tabular_only ---")
     _eval("tabular_only", tab_train, tab_test)
 
-    # ── Baseline: mean-pool image only ───────────────────────────────────────
-    print("\n--- mean_pool_img ---")
-    mean_train_raw = train_patches.astype(np.float32).mean(axis=1)  # [N, D]
-    mean_test_raw  = test_patches.astype(np.float32).mean(axis=1)
-    mean_train, mean_test, mean_pca = _pca_project(mean_train_raw, mean_test_raw, pca_dim, seed)
-    _eval("mean_pool_img", mean_train, mean_test)
+    if not is_text_primary:
+        # ── Baseline: mean-pool image only ───────────────────────────────────
+        print("\n--- mean_pool_img ---")
+        mean_train_raw = train_patches.astype(np.float32).mean(axis=1)  # [N, D]
+        mean_test_raw  = test_patches.astype(np.float32).mean(axis=1)
+        mean_train, mean_test, mean_pca = _pca_project(mean_train_raw, mean_test_raw, pca_dim, seed)
+        _eval("mean_pool_img", mean_train, mean_test)
 
-    # ── Baseline: CLS token image only ──────────────────────────────────────
-    print("\n--- cls_img ---")
-    cls_train_proj, cls_test_proj, cls_pca = _pca_project(cls_train, cls_test, pca_dim, seed)
-    _eval("cls_img", cls_train_proj, cls_test_proj)
+        # ── Baseline: CLS token image only ──────────────────────────────────
+        print("\n--- cls_img ---")
+        cls_train_proj, cls_test_proj, cls_pca = _pca_project(cls_train, cls_test, pca_dim, seed)
+        _eval("cls_img", cls_train_proj, cls_test_proj)
 
-    # ── Baseline: mean-pool image + tabular ──────────────────────────────────
-    print("\n--- mean_pool_img+tab ---")
-    _eval("mean_pool_img+tab",
-          _concat_tabular(mean_train, tab_train),
-          _concat_tabular(mean_test,  tab_test))
+        # ── Baseline: mean-pool image + tabular ──────────────────────────────
+        print("\n--- mean_pool_img+tab ---")
+        _eval("mean_pool_img+tab",
+              _concat_tabular(mean_train, tab_train),
+              _concat_tabular(mean_test,  tab_test))
 
-    # ── Baseline: CLS + tabular ──────────────────────────────────────────────
-    print("\n--- cls_img+tab ---")
-    _eval("cls_img+tab",
-          _concat_tabular(cls_train_proj, tab_train),
-          _concat_tabular(cls_test_proj,  tab_test))
+        # ── Baseline: CLS + tabular ──────────────────────────────────────────
+        print("\n--- cls_img+tab ---")
+        _eval("cls_img+tab",
+              _concat_tabular(cls_train_proj, tab_train),
+              _concat_tabular(cls_test_proj,  tab_test))
 
-    # ── PALPool: fit on image patches only ───────────────────────────────────
-    print("\n--- Fitting IterativePALPooler (image-only) ---")
-    refinement_cfg = RefinementConfig(
-        refine=True,
-        patch_size=16,
-        patch_group_sizes=args.patch_group_sizes,
-        temperature=args.temperature,
-        weight_method=args.weight_method,
-        ridge_alpha=args.ridge_alpha,
-        normalize_features=args.normalize_features,
-        batch_size=args.batch_size,
-        max_query_rows=args.max_query_rows,
-        use_random_subsampling=True,
-        aoe_class=None,
-        aoe_handling="filter",
-        gpu_ridge=args.gpu_ridge,
-        tabicl_n_estimators=args.n_estimators,
-        tabicl_pca_dim=pca_dim,
-        append_cls=False,
-        use_global_prior=args.use_global_prior,
-        use_attn_masking=args.use_attn_masking,
-        prior=args.prior,
-        model_selection=args.model_selection,
-    )
+    # ── Text conditions (gated on has_text) ────────────────────────────────
+    if has_text:
+        # ── Baseline: text mean-pool (exclude CLS at pos 0) -────────────────
+        print("\n--- mean_pool_text ---")
+        valid_mask_tr = text_train_attn.copy(); valid_mask_tr[:, 0] = False
+        valid_mask_te = text_test_attn.copy();  valid_mask_te[:, 0] = False
+        counts_tr = valid_mask_tr.sum(axis=1, keepdims=True).clip(min=1)
+        counts_te = valid_mask_te.sum(axis=1, keepdims=True).clip(min=1)
+        mean_text_raw_tr = (text_train * valid_mask_tr[:, :, None]).sum(axis=1) / counts_tr
+        mean_text_raw_te = (text_test  * valid_mask_te[:, :, None]).sum(axis=1) / counts_te
+        mean_text_tr, mean_text_te, _ = _pca_project(mean_text_raw_tr, mean_text_raw_te, pca_dim, seed)
+        _eval("mean_pool_text", mean_text_tr, mean_text_te)
 
-    pooler = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
-    t_fit = time.perf_counter()
-    pooler.fit(train_patches, train_labels)
-    fit_time_s = time.perf_counter() - t_fit
-    print(f"[pal] Pooler fit in {fit_time_s:.1f}s")
+        # ── Baseline: text CLS ───────────────────────────────────────────────
+        print("\n--- cls_text ---")
+        cls_text_tr, cls_text_te, _ = _pca_project(text_cls_train, text_cls_test, pca_dim, seed)
+        _eval("cls_text", cls_text_tr, cls_text_te)
 
-    # Pool train and test patches → raw D-dimensional image embeddings.
-    pal_train_raw = pooler.transform(train_patches)   # [N_train, D]
-    pal_test_raw  = pooler.transform(test_patches)    # [N_test, D]
+        # ── Baselines with tabular ────────────────────────────────────────────
+        _eval("mean_pool_text+tab", _concat_tabular(mean_text_tr, tab_train), _concat_tabular(mean_text_te, tab_test))
+        _eval("cls_text+tab",       _concat_tabular(cls_text_tr, tab_train),  _concat_tabular(cls_text_te, tab_test))
 
-    # Project to PCA space (same pca_dim used internally by the pooler).
-    # The pooler's internal _pca_ was fit on pooled train embeddings; reuse it
-    # so image features are in the same space used by the pooler's TabICL scorer.
-    best_stage = pooler.stages_[pooler.best_stage_idx_]
-    pal_pca = best_stage._pca_
+        # ── Build TextRefinementConfig ────────────────────────────────────────
+        text_refinement_cfg = TextRefinementConfig(
+            refine=True,
+            text_group_modes=args.text_group_modes,
+            temperature=args.temperature,
+            weight_method=args.text_weight_method or args.weight_method,
+            ridge_alpha=args.ridge_alpha,
+            normalize_features=args.normalize_features,
+            batch_size=args.batch_size,
+            max_query_rows=args.max_query_rows,
+            use_random_subsampling=True,
+            gpu_ridge=args.gpu_ridge,
+            tabicl_n_estimators=args.n_estimators,
+            tabicl_pca_dim=pca_dim,
+            append_cls=False,
+            use_global_prior=args.use_global_prior,
+            use_attn_masking=args.use_attn_masking,
+            prior=args.prior,
+            model_selection=args.model_selection,
+            use_length_importance_weights = True
+        )
 
-    if pal_pca is not None:
-        pal_train_proj = pal_pca.transform(pal_train_raw).astype(np.float32)
-        pal_test_proj  = pal_pca.transform(pal_test_raw).astype(np.float32)
-    else:
-        pal_train_proj = pal_train_raw.astype(np.float32)
-        pal_test_proj  = pal_test_raw.astype(np.float32)
+        # ── Fit text PAL pooler (no tabular context) ──────────────────────────
+        print("\n--- Fitting text IterativePALPooler (text-only) ---")
+        pooler_text = pooler_factory(refinement_cfg=text_refinement_cfg, seed=seed, modality="text")
+        pooler_text.fit(text_train, train_labels,
+                        token_ids=text_train_tok_ids,
+                        attention_mask=text_train_attn)
+        pal_text_tr_raw = pooler_text.transform(text_train, token_ids=text_train_tok_ids, attention_mask=text_train_attn)
+        pal_text_te_raw = pooler_text.transform(text_test,  token_ids=text_test_tok_ids,  attention_mask=text_test_attn)
+        best_stage_txt  = pooler_text.stages_[pooler_text.best_stage_idx_]
+        pal_text_pca    = best_stage_txt._pca_
+        if pal_text_pca is not None:
+            pal_text_tr = pal_text_pca.transform(pal_text_tr_raw).astype(np.float32)
+            pal_text_te = pal_text_pca.transform(pal_text_te_raw).astype(np.float32)
+        else:
+            pal_text_tr = pal_text_tr_raw.astype(np.float32)
+            pal_text_te = pal_text_te_raw.astype(np.float32)
+        _eval("pal_text",     pal_text_tr, pal_text_te)
+        _eval("pal_text+tab", _concat_tabular(pal_text_tr, tab_train), _concat_tabular(pal_text_te, tab_test))
 
-    # ── PALPool image only ───────────────────────────────────────────────────
-    print("\n--- pal_img ---")
-    _eval("pal_img", pal_train_proj, pal_test_proj)
+        # ── Fit text PAL pooler (tabular context) ────────────────────────────
+        print("\n--- Fitting text IterativePALPooler (tabular context) ---")
+        pooler_text_ctx = pooler_factory(refinement_cfg=text_refinement_cfg, seed=seed, modality="text")
+        pooler_text_ctx.fit(text_train, train_labels,
+                            token_ids=text_train_tok_ids,
+                            attention_mask=text_train_attn,
+                            context_features=tab_train)
+        pal_ctx_text_tr_raw = pooler_text_ctx.transform(text_train, token_ids=text_train_tok_ids, attention_mask=text_train_attn)
+        pal_ctx_text_te_raw = pooler_text_ctx.transform(text_test,  token_ids=text_test_tok_ids,  attention_mask=text_test_attn)
+        best_stage_txt_ctx  = pooler_text_ctx.stages_[pooler_text_ctx.best_stage_idx_]
+        pal_ctx_text_pca    = best_stage_txt_ctx._pca_
+        if pal_ctx_text_pca is not None:
+            pal_ctx_text_tr = pal_ctx_text_pca.transform(pal_ctx_text_tr_raw).astype(np.float32)
+            pal_ctx_text_te = pal_ctx_text_pca.transform(pal_ctx_text_te_raw).astype(np.float32)
+        else:
+            pal_ctx_text_tr = pal_ctx_text_tr_raw.astype(np.float32)
+            pal_ctx_text_te = pal_ctx_text_te_raw.astype(np.float32)
+        _eval("pal_context_text",     pal_ctx_text_tr, pal_ctx_text_te)
+        _eval("pal_context_text+tab", _concat_tabular(pal_ctx_text_tr, tab_train), _concat_tabular(pal_ctx_text_te, tab_test))
 
-    # ── PALPool image + tabular ──────────────────────────────────────────────
-    print("\n--- pal_img+tab ---")
-    _eval("pal_img+tab",
-          _concat_tabular(pal_train_proj, tab_train),
-          _concat_tabular(pal_test_proj,  tab_test))
+    if not is_text_primary:
+        # ── PALPool: fit on image patches only ───────────────────────────────
+        print("\n--- Fitting IterativePALPooler (image-only) ---")
+        refinement_cfg = RefinementConfig(
+            refine=True,
+            patch_size=16,
+            patch_group_sizes=args.patch_group_sizes,
+            temperature=args.temperature,
+            weight_method=args.weight_method,
+            ridge_alpha=args.ridge_alpha,
+            normalize_features=args.normalize_features,
+            batch_size=args.batch_size,
+            max_query_rows=args.max_query_rows,
+            use_random_subsampling=True,
+            aoe_class=None,
+            aoe_handling="filter",
+            gpu_ridge=args.gpu_ridge,
+            tabicl_n_estimators=args.n_estimators,
+            tabicl_pca_dim=pca_dim,
+            append_cls=False,
+            use_global_prior=args.use_global_prior,
+            use_attn_masking=args.use_attn_masking,
+            prior=args.prior,
+            model_selection=args.model_selection,
+        )
 
-    # ── Context-aware PALPool: fit with tabular as scoring context ───────────
-    # The pooler sees tabular features during TabICL scoring (quality targets are
-    # tabular-informed), but the Ridge model and pooling weights are still DINO-only.
-    print("\n--- Fitting IterativePALPooler (tabular context) ---")
-    pooler_ctx = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
-    t_fit_ctx = time.perf_counter()
-    pooler_ctx.fit(train_patches, train_labels, context_features=tab_train)
-    fit_time_ctx_s = time.perf_counter() - t_fit_ctx
-    print(f"[pal_ctx] Pooler fit in {fit_time_ctx_s:.1f}s")
+        pooler = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
+        t_fit = time.perf_counter()
+        pooler.fit(train_patches, train_labels)
+        fit_time_s = time.perf_counter() - t_fit
+        print(f"[pal] Pooler fit in {fit_time_s:.1f}s")
 
-    pal_ctx_train_raw = pooler_ctx.transform(train_patches)
-    pal_ctx_test_raw  = pooler_ctx.transform(test_patches)
+        pal_train_raw = pooler.transform(train_patches)
+        pal_test_raw  = pooler.transform(test_patches)
 
-    best_stage_ctx = pooler_ctx.stages_[pooler_ctx.best_stage_idx_]
-    pal_ctx_pca = best_stage_ctx._pca_
+        best_stage = pooler.stages_[pooler.best_stage_idx_]
+        pal_pca = best_stage._pca_
 
-    if pal_ctx_pca is not None:
-        pal_ctx_train_proj = pal_ctx_pca.transform(pal_ctx_train_raw).astype(np.float32)
-        pal_ctx_test_proj  = pal_ctx_pca.transform(pal_ctx_test_raw).astype(np.float32)
-    else:
-        pal_ctx_train_proj = pal_ctx_train_raw.astype(np.float32)
-        pal_ctx_test_proj  = pal_ctx_test_raw.astype(np.float32)
+        if pal_pca is not None:
+            pal_train_proj = pal_pca.transform(pal_train_raw).astype(np.float32)
+            pal_test_proj  = pal_pca.transform(pal_test_raw).astype(np.float32)
+        else:
+            pal_train_proj = pal_train_raw.astype(np.float32)
+            pal_test_proj  = pal_test_raw.astype(np.float32)
 
-    print("\n--- pal_context_img ---")
-    _eval("pal_context_img", pal_ctx_train_proj, pal_ctx_test_proj)
+        print("\n--- pal_img ---")
+        _eval("pal_img", pal_train_proj, pal_test_proj)
 
-    print("\n--- pal_context_img+tab ---")
-    _eval("pal_context_img+tab",
-          _concat_tabular(pal_ctx_train_proj, tab_train),
-          _concat_tabular(pal_ctx_test_proj,  tab_test))
+        print("\n--- pal_img+tab ---")
+        _eval("pal_img+tab",
+              _concat_tabular(pal_train_proj, tab_train),
+              _concat_tabular(pal_test_proj,  tab_test))
+
+        # ── Context-aware image PALPool ───────────────────────────────────────
+        print("\n--- Fitting IterativePALPooler (tabular context) ---")
+        pooler_ctx = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
+        t_fit_ctx = time.perf_counter()
+
+        ctx_features_train = tab_train
+        if has_text and args.image_context_text:
+            print("[info] Using text+tabular as context for image pooler (text fitted with tabular context)")
+            text_pool_pca_tr, text_pool_pca_te, _ = _pca_project(pal_ctx_text_tr_raw, pal_ctx_text_te_raw, pca_dim, seed)
+            ctx_features_train = np.concatenate([text_pool_pca_tr, tab_train], axis=1)
+
+        pooler_ctx.fit(train_patches, train_labels, context_features=ctx_features_train)
+        fit_time_ctx_s = time.perf_counter() - t_fit_ctx
+        print(f"[pal_ctx] Pooler fit in {fit_time_ctx_s:.1f}s")
+
+        pal_ctx_train_raw = pooler_ctx.transform(train_patches)
+        pal_ctx_test_raw  = pooler_ctx.transform(test_patches)
+
+        best_stage_ctx = pooler_ctx.stages_[pooler_ctx.best_stage_idx_]
+        pal_ctx_pca = best_stage_ctx._pca_
+
+        if pal_ctx_pca is not None:
+            pal_ctx_train_proj = pal_ctx_pca.transform(pal_ctx_train_raw).astype(np.float32)
+            pal_ctx_test_proj  = pal_ctx_pca.transform(pal_ctx_test_raw).astype(np.float32)
+        else:
+            pal_ctx_train_proj = pal_ctx_train_raw.astype(np.float32)
+            pal_ctx_test_proj  = pal_ctx_test_raw.astype(np.float32)
+
+        print("\n--- pal_context_img ---")
+        _eval("pal_context_img", pal_ctx_train_proj, pal_ctx_test_proj)
+
+        print("\n--- pal_context_img+tab ---")
+        _eval("pal_context_img+tab",
+              _concat_tabular(pal_ctx_train_proj, tab_train),
+              _concat_tabular(pal_ctx_test_proj,  tab_test))
+
+    # ── Combined image + text conditions (only when both modalities present) ──
+    if has_text and not is_text_primary:
+        print("\n--- Combined image + text conditions ---")
+        # mean+mean
+        _eval("mean_pool_img+mean_pool_text",
+              np.concatenate([mean_train, mean_text_tr], axis=1),
+              np.concatenate([mean_test,  mean_text_te], axis=1))
+        _eval("mean_pool_img+mean_pool_text+tab",
+              _concat_tabular(np.concatenate([mean_train, mean_text_tr], axis=1), tab_train),
+              _concat_tabular(np.concatenate([mean_test,  mean_text_te], axis=1), tab_test))
+        # cls+cls
+        _eval("cls_img+cls_text",
+              np.concatenate([cls_train_proj, cls_text_tr], axis=1),
+              np.concatenate([cls_test_proj,  cls_text_te], axis=1))
+        _eval("cls_img+cls_text+tab",
+              _concat_tabular(np.concatenate([cls_train_proj, cls_text_tr], axis=1), tab_train),
+              _concat_tabular(np.concatenate([cls_test_proj,  cls_text_te], axis=1), tab_test))
+        # pal+pal
+        _eval("pal_img+pal_text",
+              np.concatenate([pal_train_proj, pal_text_tr], axis=1),
+              np.concatenate([pal_test_proj,  pal_text_te], axis=1))
+        _eval("pal_img+pal_text+tab",
+              _concat_tabular(np.concatenate([pal_train_proj, pal_text_tr], axis=1), tab_train),
+              _concat_tabular(np.concatenate([pal_test_proj,  pal_text_te], axis=1), tab_test))
+        # pal_context+pal_context
+        _eval("pal_context_img+pal_context_text",
+              np.concatenate([pal_ctx_train_proj, pal_ctx_text_tr], axis=1),
+              np.concatenate([pal_ctx_test_proj,  pal_ctx_text_te], axis=1))
+        _eval("pal_context_img+pal_context_text+tab",
+              _concat_tabular(np.concatenate([pal_ctx_train_proj, pal_ctx_text_tr], axis=1), tab_train),
+              _concat_tabular(np.concatenate([pal_ctx_test_proj,  pal_ctx_text_te], axis=1), tab_test))
 
     total_time_s = time.perf_counter() - t_start
     record = {
@@ -574,9 +526,12 @@ def _run_single_seed(
             "n_estimators":       args.n_estimators,
             "pca_dim":            pca_dim,
             "patch_group_sizes":  args.patch_group_sizes,
+            "text_group_modes":   args.text_group_modes,
             "temperature":        args.temperature,
             "ridge_alpha":        args.ridge_alpha,
             "weight_method":      args.weight_method,
+            "text_weight_method": args.text_weight_method or args.weight_method,
+            "image_context_text": args.image_context_text,
             "seed":               seed,
         },
         "dataset_info": {
@@ -586,7 +541,7 @@ def _run_single_seed(
             "embed_dim": int(D),
             "tab_dim":   int(tab_train.shape[1]),
             "n_classes": int(n_classes),
-            "pca_dim":   int(pal_pca.n_components_) if pal_pca is not None else None,
+            "pca_dim":   int(pal_pca.n_components_) if (not is_text_primary and pal_pca is not None) else None,
         },
         "results": results,
     }
@@ -607,6 +562,8 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
             "pad-ufes":       PAD_UFES_DATASET_PATH,
             "cbis-ddsm-mass": CBIS_DDSM_DATASET_PATH,
             "cbis-ddsm-calc": CBIS_DDSM_DATASET_PATH,
+            "clothing":       CLOTHING_DATASET_PATH,
+            "salary":         SALARY_INDIA_DATASET_PATH,
         }[args.dataset]
 
     output_dir = Path(args.output_dir) if args.output_dir is not None else Path("results/multimodal") / args.dataset
@@ -663,7 +620,8 @@ def _parse_args() -> argparse.Namespace:
         description="Multimodal experiment: PALPool image features + tabular (PetFinder or DVM)"
     )
     p.add_argument("--dataset",        type=str,   default="petfinder",
-                   choices=["petfinder", "dvm", "pad-ufes", "cbis-ddsm-mass", "cbis-ddsm-calc"],
+                   choices=["petfinder", "dvm", "pad-ufes", "cbis-ddsm-mass", "cbis-ddsm-calc",
+                            "clothing", "salary"],
                    help="Dataset to run multimodal experiment on")
     p.add_argument("--dataset-path",   type=Path,  default=None,
                    help="Root directory of the dataset (defaults to config value)")
@@ -681,6 +639,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Disable PCA; use full 768-D image embeddings")
     p.add_argument("--patch-group-sizes", type=int, nargs="+", default=[1],
                    help="Patch group sizes for IterativePALPooler (default: [1])")
+    p.add_argument("--text-group-modes", type=str, nargs="+", default=["none"],
+                   choices=["none", "sentence"],
+                   help="Token grouping modes for the text PAL pooler (default: ['none'])")
     p.add_argument("--temperature",    type=float, nargs="+", default=[1.0],
                    help="Softmax temperature(s) for patch pooling (default: [1.0])")
     p.add_argument("--ridge-alpha",    type=float, nargs="+", default=[1.0],
@@ -689,6 +650,10 @@ def _parse_args() -> argparse.Namespace:
                    choices=["correct_class_prob", "entropy", "kl_div",
                             "wasserstein", "js_div", "tvd"],
                    help="Patch quality weight method (default: correct_class_prob)")
+    p.add_argument("--text-weight-method", type=str, default=None,
+                   choices=["correct_class_prob", "entropy", "kl_div",
+                            "wasserstein", "js_div", "tvd"],
+                   help="Weight method for text PAL pooler (default: same as --weight-method)")
     p.add_argument("--normalize-features", action="store_true",
                    help="Fit a StandardScaler on patches before Ridge fitting")
     p.add_argument("--batch-size",     type=int,   default=1000,
@@ -711,6 +676,9 @@ def _parse_args() -> argparse.Namespace:
                         "'last_iteration' (default) always uses the final stage. "
                         "'masked_train_accuracy' evaluates every stage on the training set "
                         "with a diagonal attention mask and selects the best-performing one.")
+    p.add_argument("--image-context-text", action="store_true",
+                   help="When fitting image PAL pooler with context, include text+tabular features "
+                        "(only for datasets with text support, e.g., petfinder)")
     p.add_argument("--seeds",          type=int,   nargs="+", default=[42],
                    help="One or more random seeds, e.g. --seeds 42 123 456. "
                         "Results are saved after every seed. (default: 42)")

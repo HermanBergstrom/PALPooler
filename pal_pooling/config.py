@@ -9,8 +9,12 @@ PETFINDER_DATASET_PATH  = Path("/project/aip-rahulgk/image_icl_project/petfinder
 DVM_DATASET_PATH        = Path("/project/6101781/image_icl_project/DVM_Dataset")
 PAD_UFES_DATASET_PATH   = Path("/project/6101781/image_icl_project/pad-ufes-20-copy")
 CBIS_DDSM_DATASET_PATH  = Path("/project/6101781/image_icl_project/cbis-ddsm/cbis-ddsm-breast-cancer-image-dataset")
-IMDB_DATASET_PATH       = Path("/project/aip-rahulgk/image_icl_project/imdb")
+IMDB_DATASET_PATH        = Path("/project/aip-rahulgk/image_icl_project/imdb")
 TWENTY_NEWS_DATASET_PATH = Path("/project/aip-rahulgk/image_icl_project/20news")
+AG_NEWS_DATASET_PATH     = Path("/project/aip-rahulgk/image_icl_project/ag_news")
+YELP_DATASET_PATH        = Path("/project/aip-rahulgk/image_icl_project/yelp")
+CLOTHING_DATASET_PATH    = Path("/project/aip-rahulgk/image_icl_project/womens-ecommerce-clothing-reviews")
+SALARY_INDIA_DATASET_PATH = Path("/project/aip-rahulgk/image_icl_project/predict-the-data-scientists-salary-in-india")
 FEATURES_DIR            = Path("/scratch/hermanb/temp_datasets/extracted_features")
 
 # Maps each dataset name to its modality.  Image datasets default to DINOv3;
@@ -25,6 +29,10 @@ MODALITY_MAP: Dict[str, str] = {
     "cbis-ddsm-calc": "image",
     "imdb":           "text",
     "20news":         "text",
+    "ag_news":        "text",
+    "yelp":           "text",
+    "clothing":       "text",
+    "salary":         "text",
 }
 
 # Default backbone per modality (used when --backbone is not set by the user).
@@ -120,6 +128,8 @@ class TextRefinementConfig:
     model_selection: str = "last_iteration"
     binary_dist: bool = False
     prior: str = "label_frequency"    # "label_frequency", "token_marginal", or "current_pool_marginal"
+    use_length_importance_weights: bool = False  # upweight tokens from shorter sequences when subsampling
+    train_val_fraction: Optional[float] = None   # if set, split internally per stage instead of in the experiment script
 
 
 @dataclass
@@ -160,7 +170,8 @@ def parse_args() -> ExperimentConfig:
     p = argparse.ArgumentParser(description="Patch quality evaluation with TabICL")
     p.add_argument("--dataset",       type=str,   default="butterfly",
                    choices=["butterfly", "rsna", "petfinder", "dvm", "pad-ufes",
-                            "cbis-ddsm-mass", "cbis-ddsm-calc", "imdb", "20news"],
+                            "cbis-ddsm-mass", "cbis-ddsm-calc", "imdb", "20news",
+                            "ag_news", "yelp", "clothing", "salary"],
                    help="Which dataset to run on")
     p.add_argument("--backbone",      type=str,   default=None,
                    choices=["rad-dino", "dinov3", "mae", "ijepa", "electra"],
@@ -215,6 +226,10 @@ def parse_args() -> ExperimentConfig:
                    help="Cap on the total number of patch-group rows forwarded through TabICL.")
     p.add_argument("--use-random-subsampling", action="store_true",
                    help="Enable random subsampling of patch-group rows for Ridge fitting.")
+    p.add_argument("--use-length-importance-weights", action="store_true",
+                   help="When subsampling text tokens for Ridge fitting, upweight tokens from shorter "
+                        "sequences (weight ∝ 1/seq_len, normalized to mean=1) so each sequence "
+                        "contributes equally regardless of length. Text datasets only.")
     p.add_argument("--balance-train", action="store_true",
                    help="Undersample majority classes in the training set.")
     p.add_argument("--balance-test", action="store_true",
@@ -304,6 +319,10 @@ def parse_args() -> ExperimentConfig:
         "cbis-ddsm-calc": CBIS_DDSM_DATASET_PATH,
         "imdb":           IMDB_DATASET_PATH,
         "20news":         TWENTY_NEWS_DATASET_PATH,
+        "ag_news":        AG_NEWS_DATASET_PATH,
+        "yelp":           YELP_DATASET_PATH,
+        "clothing":       CLOTHING_DATASET_PATH,
+        "salary":         SALARY_INDIA_DATASET_PATH,
     }
     dataset_path = args.dataset_path or _dataset_defaults[args.dataset]
 
@@ -352,6 +371,8 @@ def parse_args() -> ExperimentConfig:
             model_selection=args.model_selection,
             binary_dist=args.binary_dist,
             prior=args.prior,
+            use_length_importance_weights=args.use_length_importance_weights,
+            train_val_fraction=args.train_val_fraction,
         )
     else:
         refinement_cfg = RefinementConfig(

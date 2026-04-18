@@ -778,23 +778,28 @@ def run_pal_experiment(
     val_keep_idx: Optional[np.ndarray] = None
     train_keep_idx: Optional[np.ndarray] = None
     
-    if cfg.dataset.train_val_fraction is not None and cfg.dataset.train_val_fraction > 0.0:
+    # For text modality, train_val_fraction is handled internally by IterativePALPooler
+    # (a different random split is drawn at each stage).  Only apply the explicit split
+    # here for the image modality, where val data is also used for visualisation.
+    if (cfg.dataset.train_val_fraction is not None
+            and cfg.dataset.train_val_fraction > 0.0
+            and cfg.dataset.modality != "text"):
         split_rng = np.random.RandomState(cfg.seed + 2)
         n_val_split = int(len(train_labels) * cfg.dataset.train_val_fraction)
         perm = split_rng.permutation(len(train_labels))
         val_keep_idx = perm[:n_val_split]
         train_keep_idx = perm[n_val_split:]
-        
+
         val_patches = train_patches[val_keep_idx]
         val_labels = train_labels[val_keep_idx]
         if cls_train_feats is not None:
             cls_val_feats = cls_train_feats[val_keep_idx]
-        
+
         train_patches = train_patches[train_keep_idx]
         train_labels = train_labels[train_keep_idx]
         if cls_train_feats is not None:
             cls_train_feats = cls_train_feats[train_keep_idx]
-            
+
         print(f"[val_split] Held out {n_val_split} images for validation during refinement (fraction={cfg.dataset.train_val_fraction})")
 
     # --- Apply the same index selections to text-specific arrays (token_ids, attention_mask, texts, token_to_word) ---
@@ -885,6 +890,8 @@ def run_pal_experiment(
         train_attention_mask = extra_data["train_attention_mask"]  # [N_train, T_max]
         test_token_ids       = extra_data["test_token_ids"]
         test_attention_mask  = extra_data["test_attention_mask"]
+        # val_token_ids / val_attention_mask are never set for text: splitting is
+        # handled internally by IterativePALPooler (see TextRefinementConfig.train_val_fraction).
 
         # --- Masked mean-pool baseline (exclude [CLS] and padding) ---
         _cls_id  = text_cfg.cls_token_id   # 101
@@ -928,6 +935,8 @@ def run_pal_experiment(
                 n_estimators=text_cfg.tabicl_n_estimators, seed=cfg.seed,
             )
 
+        # The baseline uses the full train set as support (train_patches is never split
+        # for text; val splitting is handled internally by IterativePALPooler).
         baseline_acc, baseline_auroc = _compute_accuracy_from_features(
             baseline_support, train_labels, test_mean_proj, test_labels,
             n_estimators=text_cfg.tabicl_n_estimators, seed=cfg.seed,
@@ -1032,6 +1041,8 @@ def run_pal_experiment(
         )
 
         # Evaluate each stage on the test set.
+        # stage._support_projected_ already contains all N train samples (internal val
+        # fold is pooled through Ridge and merged back by IterativePALPooler._fit_stages).
         for k, stage in enumerate(pal_pooler.stages_):
             tag = f"iter_{k}_mode_{stage.text_group_mode_}"
             t_eval = time.perf_counter()
@@ -1043,7 +1054,7 @@ def run_pal_experiment(
                 if stage._pca_ is not None else test_pooled
             )
             iter_acc, iter_auroc = _compute_accuracy_from_features(
-                stage._support_projected_, train_labels, test_query, test_labels,
+                stage._support_projected_, stage.support_labels_, test_query, test_labels,
                 n_estimators=text_cfg.tabicl_n_estimators, seed=cfg.seed,
             )
             eval_time_s = time.perf_counter() - t_eval

@@ -546,6 +546,9 @@ class TextPALPooler(PALPooler):
         initial_pca: Optional[PCA] = None,
         context_features: Optional[np.ndarray] = None,
         tabular_probs: Optional[np.ndarray] = None,
+        val_tokens: Optional[np.ndarray] = None,      # [N_val, T_max, D]
+        val_token_ids: Optional[np.ndarray] = None,   # [N_val, T_max]
+        val_labels: Optional[np.ndarray] = None,      # [N_val]
     ) -> "TextPALPooler":
         """Fit the Ridge quality model on BERT token embeddings.
 
@@ -629,6 +632,9 @@ class TextPALPooler(PALPooler):
             tabicl=self.tabicl,
             context_features=context_features,
             tabular_probs=tabular_probs,
+            val_tokens=val_tokens,
+            val_token_ids=val_token_ids,
+            val_labels=val_labels,
         )
 
         # Re-pool in original D-space for raw support (same as image path).
@@ -916,7 +922,10 @@ class IterativePALPooler:
             auto-compute from context_features currently).
         stage_callback : callable or None
             Called after each image stage (image modality only).
-        context_features, val_* : image-modality arguments, see ImagePALPooler.fit.
+        val_patches, val_labels, val_cls_tokens, val_context_features :
+            Image-modality validation arguments, see ImagePALPooler.fit.
+            For text, train/val splitting is handled internally via
+            TextRefinementConfig.train_val_fraction.
         """
         if self.modality == "text" and (token_ids is None or attention_mask is None):
             raise ValueError(
@@ -1199,13 +1208,14 @@ class IterativePALPooler:
         self,
         stage_items: list,
         make_stage,        # fn(iter_cfg, item) → PALPooler subclass
-        fit_stage,         # fn(stage, initial_support, initial_pca) → None
+        fit_stage,         # fn(stage, initial_support, initial_pca, k) → None
         eval_transform,    # fn(stage) → np.ndarray [N, D]  (for masked acc)
         labels: np.ndarray,
         context_features: Optional[np.ndarray],
         initial_support: np.ndarray,
         initial_pca: Optional[PCA],
         stage_callback=None,   # fn(k, stage, item, pre_sup, pre_pca) → None
+        post_fit=None,         # fn(k, stage) → None  — called after fit_stage, before chaining
         stage_key_label: str = "stage",
     ) -> "IterativePALPooler":
         n_stages = len(stage_items)
@@ -1229,7 +1239,11 @@ class IterativePALPooler:
             pre_sup, pre_pca = initial_support, initial_pca
 
             stage = make_stage(iter_cfg, item)
-            fit_stage(stage, initial_support, initial_pca)
+            fit_stage(stage, initial_support, initial_pca, k)
+
+            if post_fit is not None:
+                post_fit(k, stage)
+
             stages.append(stage)
 
             if stage_callback is not None:
@@ -1306,6 +1320,26 @@ class IterativePALPooler:
         
         initial_support, initial_pca = self._init_pca(support_raw, N, D)
         
+        # For text modality: optionally split data per stage so each iteration
+        # uses a fresh independent validation fold as Ridge query rows.
+        text_tvf = (
+            getattr(self.refinement_cfg, "train_val_fraction", None)
+            if not is_image else None
+        )
+        text_splits: Optional[list] = None
+        if text_tvf is not None and text_tvf > 0.0:
+            text_splits = []
+            for _k in range(len(stage_items)):
+                _rng = np.random.RandomState(self.seed + _k)
+                _n_val = int(N * text_tvf)
+                _perm = _rng.permutation(N)
+                text_splits.append((_perm[_n_val:], _perm[:_n_val]))  # (train_idx, val_idx)
+            print(
+                f"[IterativePALPooler] train_val_fraction={text_tvf}: "
+                f"using {int(N * text_tvf)} val / {N - int(N * text_tvf)} train samples per stage "
+                f"(different random split per stage)"
+            )
+
         def make_stage(iter_cfg, item):
             if is_image:
                 iter_cfg.patch_group_sizes = item
@@ -1320,8 +1354,8 @@ class IterativePALPooler:
                     text_group_mode=item,
                     seed=self.seed, gpu_ridge_device=self.gpu_ridge_device,
                 )
-                
-        def fit_stage(stage, init_sup, init_pca):
+
+        def fit_stage(stage, init_sup, init_pca, k):
             if is_image:
                 stage.fit(
                     data, labels, cls_tokens=cls_tokens,
@@ -1332,6 +1366,21 @@ class IterativePALPooler:
                     val_context_features=val_context_features,
                     val_tabular_probs=val_tabular_probs,
                 )
+            elif text_splits is not None:
+                # Per-stage random split: val as query rows, train as support for Ridge fitting.
+                train_idx, val_idx = text_splits[k]
+                _cls_tr = cls_tokens[train_idx] if cls_tokens is not None else None
+                # init_sup from the previous stage has N rows; index to the current train fold.
+                _init_sup = init_sup[train_idx] if (init_sup is not None and len(init_sup) == N) else init_sup
+                stage.fit(
+                    data[train_idx], token_ids[train_idx], attention_mask[train_idx], labels[train_idx],
+                    cls_tokens=_cls_tr,
+                    initial_support=_init_sup, initial_pca=init_pca,
+                    context_features=context_features, tabular_probs=tabular_probs,
+                    val_tokens=data[val_idx],
+                    val_token_ids=token_ids[val_idx],
+                    val_labels=labels[val_idx],
+                )
             else:
                 stage.fit(
                     data, token_ids, attention_mask, labels,
@@ -1339,12 +1388,33 @@ class IterativePALPooler:
                     initial_support=init_sup, initial_pca=init_pca,
                     context_features=context_features, tabular_probs=tabular_probs,
                 )
-        
+
+        def post_fit(k, stage):
+            """After fitting on the train fold, pool val fold and rebuild full-N support."""
+            if text_splits is None:
+                return
+            train_idx, val_idx = text_splits[k]
+            _cls_val = cls_tokens[val_idx] if cls_tokens is not None else None
+            val_pooled = stage.transform(
+                data[val_idx], token_ids[val_idx], attention_mask[val_idx], _cls_val
+            )
+            val_proj = (
+                stage._pca_.transform(val_pooled).astype(np.float32)
+                if stage._pca_ is not None else val_pooled.astype(np.float32)
+            )
+            # Reconstruct full-N projected support so evaluation and chaining see all samples.
+            D_proj = stage._support_projected_.shape[1]
+            full_support = np.empty((N, D_proj), dtype=np.float32)
+            full_support[train_idx] = stage._support_projected_
+            full_support[val_idx]   = val_proj
+            stage._support_projected_ = full_support
+            stage.support_labels_     = labels  # all N
+
         def eval_transform(stage):
             if is_image:
                 return stage.transform(data, cls_tokens=cls_tokens)
             return stage.transform(data, token_ids, attention_mask, cls_tokens)
-        
+
         _cb = None
         if stage_callback is not None and is_image:
             def _cb(k, stage, item, pre_sup, pre_pca):
@@ -1353,11 +1423,13 @@ class IterativePALPooler:
                     pre_refine_support=pre_sup, pre_refine_pca=pre_pca,
                     train_grouped=group_patches(data, item),
                 )
-                
+
         return self._fit_loop(
             stage_items, make_stage, fit_stage, eval_transform,
             labels, context_features, initial_support, initial_pca,
-            stage_callback=_cb, stage_key_label="patch_group_size" if is_image else "text_group_mode",
+            stage_callback=_cb,
+            post_fit=post_fit if text_splits is not None else None,
+            stage_key_label="patch_group_size" if is_image else "text_group_mode",
         )
 
     # ------------------------------------------------------------------

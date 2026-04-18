@@ -59,12 +59,22 @@ class RidgeGPU:
             dev = torch.device("cpu")
         return dev
 
-    def fit(self, X: "Union[np.ndarray, torch.Tensor]", y: "Union[np.ndarray, torch.Tensor]") -> "RidgeGPU":
+    def fit(
+        self,
+        X: "Union[np.ndarray, torch.Tensor]",
+        y: "Union[np.ndarray, torch.Tensor]",
+        sample_weight: "Optional[Union[np.ndarray, torch.Tensor]]" = None,
+    ) -> "RidgeGPU":
         """Fit Ridge on GPU.  X: [N, D], y: [N].
 
         Accepts either numpy arrays or torch tensors.  Tensors already on the
         target device are used in-place (no copy); tensors on a different device
         are moved with ``.to()``.
+
+        sample_weight : array [N], optional
+            Per-sample weights.  Should sum to N (mean = 1) so that the
+            effective regularisation strength is comparable to the unweighted
+            case.  When None, uniform weights are used.
         """
         import torch
         dev = self._get_device()
@@ -77,17 +87,31 @@ class RidgeGPU:
         else:
             yt = torch.from_numpy(np.asarray(y, dtype=np.float32)).to(dev)
 
-        # Mean-centre to absorb the intercept
-        X_mean = Xt.mean(0)   # [D]
-        y_mean = yt.mean()    # scalar
-        Xc = Xt - X_mean
-        yc = yt - y_mean
+        if sample_weight is not None:
+            if isinstance(sample_weight, torch.Tensor):
+                wt = sample_weight.to(dev).float()
+            else:
+                wt = torch.from_numpy(np.asarray(sample_weight, dtype=np.float32)).to(dev)
+            w_sum = wt.sum()
+            X_mean = (wt[:, None] * Xt).sum(0) / w_sum
+            y_mean = (wt * yt).sum() / w_sum
+            Xc = Xt - X_mean
+            yc = yt - y_mean
+            # Weighted normal equations: (Xc^T W Xc + alpha I) w = Xc^T W yc
+            WXc = wt[:, None] * Xc
+            A     = Xc.T @ WXc
+            b_vec = Xc.T @ (wt * yc)
+        else:
+            # Mean-centre to absorb the intercept
+            X_mean = Xt.mean(0)   # [D]
+            y_mean = yt.mean()    # scalar
+            Xc = Xt - X_mean
+            yc = yt - y_mean
+            # Normal equations: (Xc^T Xc + alpha * I) w = Xc^T yc
+            A     = Xc.T @ Xc                     # [D, D]
+            b_vec = Xc.T @ yc                     # [D]
 
-        # Normal equations: (Xc^T Xc + alpha * I) w = Xc^T yc
-        A = Xc.T @ Xc                     # [D, D]
         A.diagonal().add_(self.alpha)     # in-place ridge penalty
-        b_vec = Xc.T @ yc                 # [D]
-
         w = torch.linalg.solve(A, b_vec)  # [D]
         intercept = y_mean - X_mean @ w
 
