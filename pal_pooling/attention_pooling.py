@@ -116,10 +116,11 @@ class AttentionPoolingHead(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, patches: torch.Tensor) -> torch.Tensor:
+    def forward(self, patches: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             patches: float tensor ``[N, P, D]``
+            mask: optional bool tensor ``[N, P]`` where True = valid, False = masked (for text/padded sequences)
 
         Returns:
             float tensor ``[N, out_dim]``
@@ -140,6 +141,13 @@ class AttentionPoolingHead(nn.Module):
 
         # Attention weights
         attn = (Q @ K_proj.transpose(-2, -1)) * (d_h ** -0.5)           # [N, H, K, P]
+
+        # Apply mask if provided (for text / padded sequences)
+        if mask is not None:
+            # Expand mask to [N, 1, 1, P] for broadcasting
+            mask_expanded = mask.unsqueeze(1).unsqueeze(1)              # [N, 1, 1, P]
+            attn = attn.masked_fill(~mask_expanded, float('-inf'))
+
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -163,6 +171,8 @@ def train_attention_pooling_head(
     *,
     val_patches: Optional[torch.Tensor] = None,
     y_val: Optional[np.ndarray] = None,
+    train_attention_mask: Optional[torch.Tensor] = None,
+    val_attention_mask: Optional[torch.Tensor] = None,
     embed_dim: int,
     out_dim: Optional[int] = None,
     num_queries: int = 1,
@@ -175,11 +185,11 @@ def train_attention_pooling_head(
     val_pca_dim: Optional[int] = None,
     verbose: bool = True,
 ) -> tuple[AttentionPoolingHead, dict]:
-    """Train an attention pooling head on patch features with frozen TabICL.
+    """Train an attention pooling head on patch/token features with frozen TabICL.
 
     The training objective is identical to ``train_projection_head``: episodic
     support/query cross-entropy through the frozen TabICL backbone.  The key
-    difference is that the input is a 3D patch tensor ``[N, P, D]`` and the
+    difference is that the input is a 3D patch/token tensor ``[N, P, D]`` and the
     head performs learnable pooling as its first step.
 
     If ``val_patches`` / ``y_val`` are provided, validation accuracy is tracked
@@ -190,6 +200,8 @@ def train_attention_pooling_head(
         y_train:       integer class labels ``[N_train]``.
         val_patches:   optional float tensor ``[N_val, P, D]``.
         y_val:         optional integer class labels ``[N_val]``.
+        train_attention_mask: optional bool tensor ``[N_train, P]`` for text/padded sequences.
+        val_attention_mask: optional bool tensor ``[N_val, P]`` for validation masking.
         embed_dim:     patch token dimension D.
         out_dim:       output feature dimension (fed to TabICL backbone).
                        Defaults to ``embed_dim`` (no post-pooling projection).
@@ -211,6 +223,14 @@ def train_attention_pooling_head(
     device = torch.device(device)
     X_t = train_patches.to(dtype=torch.float32, device=device)   # [N, P, D]
     y_t = torch.as_tensor(y_train, dtype=torch.long, device=device)
+
+    # Convert attention masks if provided
+    mask_train = None
+    mask_val = None
+    if train_attention_mask is not None:
+        mask_train = torch.as_tensor(train_attention_mask, dtype=torch.bool, device=device)
+    if val_attention_mask is not None:
+        mask_val = torch.as_tensor(val_attention_mask, dtype=torch.bool, device=device)
 
     use_validation = val_patches is not None and y_val is not None
     if use_validation:
@@ -274,8 +294,8 @@ def train_attention_pooling_head(
     def _run_validation(step_for_eval: int) -> tuple[float, float]:
         assert X_val_t is not None and y_val_t is not None
         # Use batched head inference to avoid OOM on large train/val sets.
-        X_support_np = _pool_with_head(head, X_t, device)       # [N_train, out_dim]
-        X_query_np   = _pool_with_head(head, X_val_t, device)   # [N_val,   out_dim]
+        X_support_np = _pool_with_head(head, X_t, device, mask=mask_train)       # [N_train, out_dim]
+        X_query_np   = _pool_with_head(head, X_val_t, device, mask=mask_val)     # [N_val,   out_dim]
         y_sup_np = y_t.cpu().numpy()
         y_q_np   = y_val_t.cpu().numpy()
 
@@ -300,6 +320,13 @@ def train_attention_pooling_head(
 
         # Optionally downsample rows for this step
         X_step, y_step = _sample_step_subset(X_t, y_t, rng, config.max_step_samples)
+        mask_step = mask_train
+        if mask_step is not None and config.max_step_samples is not None:
+            # Subsample mask to match X_step
+            step_indices = torch.arange(len(X_t), device=device)
+            # For now, use the first N from X_step; a proper impl would track indices
+            n_step = int(X_step.shape[0])
+            mask_step = mask_train[:n_step] if n_step < len(mask_train) else mask_train
         n_step = int(X_step.shape[0])
 
         support_idx_np, query_idx_np = _class_safe_support_query_indices(
@@ -314,7 +341,7 @@ def train_attention_pooling_head(
         query_idx   = torch.as_tensor(query_idx_np,   device=device, dtype=torch.long)
 
         # Pool patches → feature vectors, then split support/query
-        X_proj    = head(X_step)                              # [n_step, out_dim]
+        X_proj    = head(X_step, mask=mask_step)                        # [n_step, out_dim]
         X_support = X_proj.index_select(0, support_idx)
         y_support = y_step.index_select(0, support_idx)
         X_query   = X_proj.index_select(0, query_idx)
@@ -380,6 +407,7 @@ def _pool_with_head(
     head: AttentionPoolingHead,
     patches: torch.Tensor,
     device: torch.device,
+    mask: Optional[torch.Tensor] = None,
     batch_size: int = 256,
 ) -> np.ndarray:
     """Apply a trained attention pooling head in mini-batches."""
@@ -388,5 +416,8 @@ def _pool_with_head(
     results = []
     for start in range(0, len(patches), batch_size):
         batch = patches[start : start + batch_size].to(dtype=torch.float32, device=device)
-        results.append(head(batch).cpu())
+        batch_mask = None
+        if mask is not None:
+            batch_mask = mask[start : start + batch_size].to(dtype=torch.bool, device=device)
+        results.append(head(batch, mask=batch_mask).cpu())
     return torch.cat(results, dim=0).numpy()

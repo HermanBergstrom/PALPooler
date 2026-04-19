@@ -277,11 +277,11 @@ class ImagePALPooler(PALPooler):
         initial_pca: Optional[PCA] = None,
         context_features: Optional[np.ndarray] = None,
         tabular_probs: Optional[np.ndarray] = None,
-        val_patches: Optional[np.ndarray] = None,
-        val_labels: Optional[np.ndarray] = None,
-        val_cls_tokens: Optional[np.ndarray] = None,
-        val_context_features: Optional[np.ndarray] = None,
-        val_tabular_probs: Optional[np.ndarray] = None,
+        val_patches: Optional[np.ndarray] = None,           # [N_val, P, D]
+        val_labels: Optional[np.ndarray] = None,            # [N_val]
+        val_cls_tokens: Optional[np.ndarray] = None,        # [N_val, D]
+        val_context_features: Optional[np.ndarray] = None,  # [N_val, D_ctx]
+        val_tabular_probs: Optional[np.ndarray] = None,     # [N_val, n_cls]
     ) -> "ImagePALPooler":
         """Fit the Ridge quality model on image patch embeddings.
 
@@ -322,14 +322,10 @@ class ImagePALPooler(PALPooler):
             aoe_mask = (labels == self.refinement_cfg.aoe_class)
 
         val_grouped = None
-        val_aoe_mask = None
         if val_patches is not None and val_labels is not None:
-            val_patches  = np.asarray(val_patches, dtype=np.float32)
-            val_labels   = np.asarray(val_labels)
-            val_grouped  = group_patches(val_patches, self.refinement_cfg.patch_group_sizes)
-            val_grouped  = _append_cls(val_grouped, val_cls_tokens)
-            if self.refinement_cfg.aoe_class is not None:
-                val_aoe_mask = (val_labels == self.refinement_cfg.aoe_class)
+            _vp = np.asarray(val_patches, dtype=np.float32)
+            val_grouped = group_patches(_vp, self.refinement_cfg.patch_group_sizes)
+            val_grouped = _append_cls(val_grouped, val_cls_tokens)
 
         (refined_support, new_pca, weights_ridge, ridge_model, feature_scaler,
          scoring_clf, fit_time_s, pool_time_s, updated_class_prior) = refine_dataset_features(
@@ -348,7 +344,6 @@ class ImagePALPooler(PALPooler):
             val_labels=val_labels,
             val_context_features=val_context_features,
             val_tabular_probs=val_tabular_probs,
-            val_aoe_mask=val_aoe_mask,
         )
 
         repooled_raw = (
@@ -366,6 +361,37 @@ class ImagePALPooler(PALPooler):
         self.fit_time_s_           = fit_time_s
         self.pool_time_s_          = pool_time_s
         return self
+
+    def _fit_from_indices(self, data, labels, cls_tokens, init_sup, init_pca,
+                          context_features, tabular_probs, val_tabular_probs,
+                          train_idx, val_idx, **kw):
+        tr = train_idx
+        vl = val_idx
+        patches = data[tr] if tr is not None else data
+        _cls    = cls_tokens[tr] if (cls_tokens is not None and tr is not None) else cls_tokens
+        _sup    = init_sup[tr] if (init_sup is not None and tr is not None and len(init_sup) == len(data)) else init_sup
+        _ctx    = context_features[tr] if (context_features is not None and tr is not None) else context_features
+        _tab    = tabular_probs[tr] if (tabular_probs is not None and tr is not None) else tabular_probs
+        _val_patches = data[vl]              if vl is not None else None
+        _val_labels  = labels[vl]            if vl is not None else None
+        _val_cls     = cls_tokens[vl]        if (cls_tokens is not None and vl is not None) else None
+        _val_ctx     = context_features[vl]  if (context_features is not None and vl is not None) else None
+        _val_tab     = tabular_probs[vl]     if (tabular_probs is not None and vl is not None) else None
+        self.fit(patches, labels[tr] if tr is not None else labels,
+                 cls_tokens=_cls, initial_support=_sup, initial_pca=init_pca,
+                 context_features=_ctx, tabular_probs=_tab,
+                 val_patches=_val_patches, val_labels=_val_labels,
+                 val_cls_tokens=_val_cls, val_context_features=_val_ctx,
+                 val_tabular_probs=_val_tab)
+
+    def _transform_subset(self, data, idx, cls_tokens, token_ids=None, attention_mask=None):
+        """Pool data[idx] (or all data if idx is None)."""
+        patches = data[idx] if idx is not None else data
+        _cls    = cls_tokens[idx] if (cls_tokens is not None and idx is not None) else cls_tokens
+        return self.transform(patches, cls_tokens=_cls)
+
+    def _transform_all(self, data, cls_tokens, token_ids=None, attention_mask=None):
+        return self.transform(data, cls_tokens=cls_tokens)
 
     def transform(
         self,
@@ -546,9 +572,9 @@ class TextPALPooler(PALPooler):
         initial_pca: Optional[PCA] = None,
         context_features: Optional[np.ndarray] = None,
         tabular_probs: Optional[np.ndarray] = None,
-        val_tokens: Optional[np.ndarray] = None,      # [N_val, T_max, D]
-        val_token_ids: Optional[np.ndarray] = None,   # [N_val, T_max]
-        val_labels: Optional[np.ndarray] = None,      # [N_val]
+        val_tokens: Optional[np.ndarray] = None,     # [N_val, T_max, D]
+        val_token_ids: Optional[np.ndarray] = None,  # [N_val, T_max]
+        val_labels: Optional[np.ndarray] = None,     # [N_val]
     ) -> "TextPALPooler":
         """Fit the Ridge quality model on BERT token embeddings.
 
@@ -653,6 +679,39 @@ class TextPALPooler(PALPooler):
         self.fit_time_s_         = fit_time_s
         self.pool_time_s_        = pool_time_s
         return self
+
+    def _fit_from_indices(self, data, labels, cls_tokens, init_sup, init_pca,
+                          context_features, tabular_probs, val_tabular_probs,
+                          train_idx, val_idx, token_ids=None, attention_mask=None, **kw):
+        tr = train_idx
+        vl = val_idx
+        _cls  = cls_tokens[tr] if (cls_tokens is not None and tr is not None) else cls_tokens
+        _sup  = init_sup[tr] if (init_sup is not None and tr is not None and len(init_sup) == len(data)) else init_sup
+        _ctx  = context_features[tr] if (context_features is not None and tr is not None) else context_features
+        _tab  = tabular_probs[tr] if (tabular_probs is not None and tr is not None) else tabular_probs
+        _val_tokens    = data[vl]       if (vl is not None) else None
+        _val_token_ids = token_ids[vl]  if (token_ids is not None and vl is not None) else None
+        _val_labels    = labels[vl]     if (vl is not None) else None
+        self.fit(
+            data[tr] if tr is not None else data,
+            token_ids[tr] if (token_ids is not None and tr is not None) else token_ids,
+            attention_mask[tr] if (attention_mask is not None and tr is not None) else attention_mask,
+            labels[tr] if tr is not None else labels,
+            cls_tokens=_cls,
+            initial_support=_sup, initial_pca=init_pca,
+            context_features=_ctx, tabular_probs=_tab,
+            val_tokens=_val_tokens, val_token_ids=_val_token_ids, val_labels=_val_labels,
+        )
+
+    def _transform_subset(self, data, idx, cls_tokens, token_ids=None, attention_mask=None):
+        _d   = data[idx] if idx is not None else data
+        _ids = token_ids[idx] if (token_ids is not None and idx is not None) else token_ids
+        _msk = attention_mask[idx] if (attention_mask is not None and idx is not None) else attention_mask
+        _cls = cls_tokens[idx] if (cls_tokens is not None and idx is not None) else cls_tokens
+        return self.transform(_d, _ids, _msk, _cls)
+
+    def _transform_all(self, data, cls_tokens, token_ids=None, attention_mask=None):
+        return self.transform(data, token_ids, attention_mask, cls_tokens)
 
     def transform(
         self,
@@ -891,10 +950,6 @@ class IterativePALPooler:
         cls_tokens: Optional[np.ndarray] = None,
         stage_callback: Optional[Callable] = None,
         context_features: Optional[np.ndarray] = None,
-        val_patches: Optional[np.ndarray] = None,
-        val_labels: Optional[np.ndarray] = None,
-        val_cls_tokens: Optional[np.ndarray] = None,
-        val_context_features: Optional[np.ndarray] = None,
         # text-specific
         token_ids: Optional[np.ndarray] = None,
         attention_mask: Optional[np.ndarray] = None,
@@ -922,10 +977,8 @@ class IterativePALPooler:
             auto-compute from context_features currently).
         stage_callback : callable or None
             Called after each image stage (image modality only).
-        val_patches, val_labels, val_cls_tokens, val_context_features :
-            Image-modality validation arguments, see ImagePALPooler.fit.
-            For text, train/val splitting is handled internally via
-            TextRefinementConfig.train_val_fraction.
+        context_features : np.ndarray or None
+            Optional side features for divergence weight methods.
         """
         if self.modality == "text" and (token_ids is None or attention_mask is None):
             raise ValueError(
@@ -939,10 +992,6 @@ class IterativePALPooler:
             stage_callback=stage_callback,
             context_features=context_features,
             tabular_probs=tabular_probs,
-            val_data=val_patches,
-            val_labels=val_labels,
-            val_cls_tokens=val_cls_tokens,
-            val_context_features=val_context_features,
         )
 
     def transform(
@@ -978,10 +1027,6 @@ class IterativePALPooler:
         *,
         cls_tokens: Optional[np.ndarray] = None,
         context_features: Optional[np.ndarray] = None,
-        val_patches: Optional[np.ndarray] = None,
-        val_labels: Optional[np.ndarray] = None,
-        val_cls_tokens: Optional[np.ndarray] = None,
-        val_context_features: Optional[np.ndarray] = None,
         token_ids: Optional[np.ndarray] = None,
         attention_mask: Optional[np.ndarray] = None,
         tabular_probs: Optional[np.ndarray] = None,
@@ -991,19 +1036,10 @@ class IterativePALPooler:
             data, labels,
             cls_tokens=cls_tokens,
             context_features=context_features,
-            val_patches=val_patches,
-            val_labels=val_labels,
-            val_cls_tokens=val_cls_tokens,
-            val_context_features=val_context_features,
             token_ids=token_ids,
             attention_mask=attention_mask,
             tabular_probs=tabular_probs,
-        ).transform(
-            data,
-            cls_tokens=cls_tokens,
-            token_ids=token_ids,
-            attention_mask=attention_mask,
-        )
+        ).transform(data, cls_tokens=cls_tokens, token_ids=token_ids, attention_mask=attention_mask)
 
     # ------------------------------------------------------------------
     # Convenience delegations to selected stage
@@ -1139,8 +1175,6 @@ class IterativePALPooler:
         self,
         context_features: Optional[np.ndarray],
         labels: np.ndarray,
-        val_context_features: Optional[np.ndarray] = None,
-        val_labels: Optional[np.ndarray] = None,
         provided_tabular_probs: Optional[np.ndarray] = None,
     ) -> tuple:
         """Return P(Y|X_tab) for divergence weight methods.
@@ -1149,7 +1183,7 @@ class IterativePALPooler:
         (caller pre-computed it).  Otherwise, if *context_features* is
         available and the weight method is divergence-based, a TabICL
         classifier is fit once on context_features and used to produce
-        train (and optionally val) probabilities.
+        train probabilities.
 
         Returns
         -------
@@ -1187,16 +1221,6 @@ class IterativePALPooler:
                 tabular_probs[:, _clf_tab.classes_] = raw_tab
             else:
                 tabular_probs = raw_tab
-
-            if val_context_features is not None and val_labels is not None:
-                raw_vtab = _clf_tab.predict_proba(val_context_features).astype(np.float32)
-                if raw_vtab.shape[1] != n_cls_local:
-                    val_tabular_probs = np.zeros(
-                        (raw_vtab.shape[0], n_cls_local), dtype=np.float32
-                    )
-                    val_tabular_probs[:, _clf_tab.classes_] = raw_vtab
-                else:
-                    val_tabular_probs = raw_vtab
 
         return tabular_probs, val_tabular_probs
 
@@ -1273,15 +1297,11 @@ class IterativePALPooler:
         data: np.ndarray,
         labels: np.ndarray,
         cls_tokens=None,
-        token_ids=None,
-        attention_mask=None,
+        token_ids=None,         # text only
+        attention_mask=None,    # text only
         stage_callback=None,
         context_features=None,
         tabular_probs=None,
-        val_data=None,
-        val_labels=None,
-        val_cls_tokens=None,
-        val_context_features=None,
     ) -> "IterativePALPooler":
         is_image = self.modality == "image"
         stage_items = self.patch_group_sizes if is_image else self.text_group_modes
@@ -1302,8 +1322,7 @@ class IterativePALPooler:
             else:
                 support_raw = data.mean(axis=1)
             tabular_probs, val_tabular_probs = self._maybe_compute_tabular_probs(
-                context_features, labels, val_context_features, val_labels,
-                provided_tabular_probs=tabular_probs,
+                context_features, labels, provided_tabular_probs=tabular_probs
             )
         else:
             token_ids = np.asarray(token_ids)
@@ -1319,26 +1338,22 @@ class IterativePALPooler:
             )
         
         initial_support, initial_pca = self._init_pca(support_raw, N, D)
-        
-        # For text modality: optionally split data per stage so each iteration
-        # uses a fresh independent validation fold as Ridge query rows.
-        text_tvf = (
-            getattr(self.refinement_cfg, "train_val_fraction", None)
-            if not is_image else None
-        )
-        text_splits: Optional[list] = None
-        if text_tvf is not None and text_tvf > 0.0:
-            text_splits = []
+
+        # Optionally split data per stage so each iteration uses a fresh independent
+        # validation fold for both image and text modalities.
+        tvf = getattr(self.refinement_cfg, "train_val_fraction", None)
+        splits: Optional[list] = None
+        if tvf is not None and tvf > 0.0:
+            splits = []
             for _k in range(len(stage_items)):
-                _rng = np.random.RandomState(self.seed + _k)
-                _n_val = int(N * text_tvf)
-                _perm = _rng.permutation(N)
-                text_splits.append((_perm[_n_val:], _perm[:_n_val]))  # (train_idx, val_idx)
-            print(
-                f"[IterativePALPooler] train_val_fraction={text_tvf}: "
-                f"using {int(N * text_tvf)} val / {N - int(N * text_tvf)} train samples per stage "
-                f"(different random split per stage)"
-            )
+                _rng  = np.random.RandomState(self.seed + _k)
+                _n_val = int(N * tvf)
+                _perm  = _rng.permutation(N)
+                splits.append((_perm[_n_val:], _perm[:_n_val]))  # (train_idx, val_idx)
+            print(f"[IterativePALPooler] train_val_fraction={tvf}: "
+                  f"{int(N*tvf)} val / {N - int(N*tvf)} train per stage (fresh split each stage)")
+
+        _stage_val_accs: List[Optional[float]] = []
 
         def make_stage(iter_cfg, item):
             if is_image:
@@ -1356,64 +1371,45 @@ class IterativePALPooler:
                 )
 
         def fit_stage(stage, init_sup, init_pca, k):
-            if is_image:
-                stage.fit(
-                    data, labels, cls_tokens=cls_tokens,
-                    initial_support=init_sup, initial_pca=init_pca,
-                    context_features=context_features, tabular_probs=tabular_probs,
-                    val_patches=val_data, val_labels=val_labels,
-                    val_cls_tokens=val_cls_tokens,
-                    val_context_features=val_context_features,
-                    val_tabular_probs=val_tabular_probs,
-                )
-            elif text_splits is not None:
-                # Per-stage random split: val as query rows, train as support for Ridge fitting.
-                train_idx, val_idx = text_splits[k]
-                _cls_tr = cls_tokens[train_idx] if cls_tokens is not None else None
-                # init_sup from the previous stage has N rows; index to the current train fold.
-                _init_sup = init_sup[train_idx] if (init_sup is not None and len(init_sup) == N) else init_sup
-                stage.fit(
-                    data[train_idx], token_ids[train_idx], attention_mask[train_idx], labels[train_idx],
-                    cls_tokens=_cls_tr,
-                    initial_support=_init_sup, initial_pca=init_pca,
-                    context_features=context_features, tabular_probs=tabular_probs,
-                    val_tokens=data[val_idx],
-                    val_token_ids=token_ids[val_idx],
-                    val_labels=labels[val_idx],
-                )
-            else:
-                stage.fit(
-                    data, token_ids, attention_mask, labels,
-                    cls_tokens=cls_tokens,
-                    initial_support=init_sup, initial_pca=init_pca,
-                    context_features=context_features, tabular_probs=tabular_probs,
-                )
+            train_idx, val_idx = splits[k] if splits is not None else (None, None)
+            stage._fit_from_indices(
+                data, labels, cls_tokens, init_sup, init_pca,
+                context_features, tabular_probs, val_tabular_probs=None,
+                train_idx=train_idx, val_idx=val_idx,
+                token_ids=token_ids, attention_mask=attention_mask,
+            )
 
         def post_fit(k, stage):
             """After fitting on the train fold, pool val fold and rebuild full-N support."""
-            if text_splits is None:
+            if splits is None:
                 return
-            train_idx, val_idx = text_splits[k]
-            _cls_val = cls_tokens[val_idx] if cls_tokens is not None else None
-            val_pooled = stage.transform(
-                data[val_idx], token_ids[val_idx], attention_mask[val_idx], _cls_val
-            )
+            train_idx, val_idx = splits[k]
+            val_pooled = stage._transform_subset(data, val_idx, cls_tokens,
+                                                 token_ids=token_ids, attention_mask=attention_mask)
             val_proj = (
                 stage._pca_.transform(val_pooled).astype(np.float32)
                 if stage._pca_ is not None else val_pooled.astype(np.float32)
             )
-            # Reconstruct full-N projected support so evaluation and chaining see all samples.
+            # Evaluate val accuracy now: support is still train-only, which is correct.
+            # Pass val_pooled (raw D-space) — score_tabicl applies PCA internally.
+            val_acc, val_auroc = PALPooler.score_tabicl(stage, val_pooled, labels[val_idx])
+            stage._val_accuracy_ = val_acc
+            stage._val_auroc_    = val_auroc
+            _stage_val_accs.append(val_acc)
+            print(
+                f"[IterativePALPooler] Stage {k} val accuracy: {val_acc:.4f}  "
+                f"auroc: {val_auroc:.4f}"
+            )
+
             D_proj = stage._support_projected_.shape[1]
             full_support = np.empty((N, D_proj), dtype=np.float32)
             full_support[train_idx] = stage._support_projected_
             full_support[val_idx]   = val_proj
             stage._support_projected_ = full_support
-            stage.support_labels_     = labels  # all N
+            stage.support_labels_     = labels
 
         def eval_transform(stage):
-            if is_image:
-                return stage.transform(data, cls_tokens=cls_tokens)
-            return stage.transform(data, token_ids, attention_mask, cls_tokens)
+            return stage._transform_all(data, cls_tokens, token_ids=token_ids, attention_mask=attention_mask)
 
         _cb = None
         if stage_callback is not None and is_image:
@@ -1424,13 +1420,15 @@ class IterativePALPooler:
                     train_grouped=group_patches(data, item),
                 )
 
-        return self._fit_loop(
+        self._fit_loop(
             stage_items, make_stage, fit_stage, eval_transform,
             labels, context_features, initial_support, initial_pca,
             stage_callback=_cb,
-            post_fit=post_fit if text_splits is not None else None,
+            post_fit=post_fit if splits is not None else None,
             stage_key_label="patch_group_size" if is_image else "text_group_mode",
         )
+        self.stage_val_accuracies_ = _stage_val_accs if _stage_val_accs else None
+        return self
 
     # ------------------------------------------------------------------
     # Internal: shared finalisation + masked-accuracy helpers
@@ -1442,6 +1440,7 @@ class IterativePALPooler:
         stage_train_accuracies: list,
     ) -> "IterativePALPooler":
         self.stages_ = stages
+        self.stage_val_accuracies_ = None  # overwritten by _fit_stages when splits exist
         if self.refinement_cfg.model_selection == "masked_train_accuracy":
             self.best_stage_idx_        = int(np.argmax(stage_train_accuracies))
             self.stage_train_accuracies_ = stage_train_accuracies

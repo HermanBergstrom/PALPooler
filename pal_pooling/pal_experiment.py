@@ -445,6 +445,7 @@ def _save_results(
                 "tag":             stage_name,
                 "test_accuracy":   round(float(acc), 6),
                 "test_auroc":      _fmt(auroc),
+                "val_accuracy":    round(float(val_acc), 6) if val_acc is not None else None,
                 "delta_acc":       round(float(acc - baseline_acc), 6),
                 "delta_auroc":     _fmt(auroc - baseline_auroc) if not np.isnan(auroc) and not np.isnan(baseline_auroc) else None,
                 "mean_prob_train": round(float(mean_probs.get("train", float("nan"))), 6),
@@ -454,13 +455,115 @@ def _save_results(
                 "refine_time_s":   round(refine_s, 2),
                 "eval_time_s":     round(eval_s,   2),
             }
-            for stage_name, acc, auroc, mean_probs, refine_s, eval_s, fit_s, pool_s in all_results
+            for stage_name, acc, auroc, mean_probs, refine_s, eval_s, fit_s, pool_s, val_acc in all_results
         ],
     }
     results_path = output_dir / "results.json"
     with results_path.open("w") as f:
         json.dump(record, f, indent=2)
     print(f"\n[results] Saved → {results_path}")
+
+
+def _run_attn_only_text(
+    train_tokens:        np.ndarray,       # [N_train, T_max, D]
+    train_token_ids:     np.ndarray,       # [N_train, T_max]
+    train_attention_mask: np.ndarray,      # [N_train, T_max] bool
+    train_labels:        np.ndarray,
+    test_tokens:         np.ndarray,       # [N_test, T_max, D]
+    test_token_ids:      np.ndarray,
+    test_attention_mask: np.ndarray,
+    test_labels:         np.ndarray,
+    D:                   int,
+    output_dir:          Path,
+    attn_cfg:            AttentionPoolConfig,
+    seed:                int,
+    cfg:                 ExperimentConfig,
+) -> dict:
+    """Train attention pooling head on text tokens (with masking support).
+
+    Returns:
+        dict with keys: test_acc, test_auroc, best_val_acc_raw, best_val_step,
+        time_to_best_s, total_train_time_s.
+    """
+    import torch as _torch
+    from pal_pooling.attention_pooling import train_attention_pooling_head, _pool_with_head
+    from pal_pooling.frozen_tabicl import EpisodicTrainingConfig
+
+    if attn_cfg.device == "auto":
+        _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+    else:
+        _device = _torch.device(attn_cfg.device)
+
+    training_cfg = EpisodicTrainingConfig(
+        num_steps=attn_cfg.attn_steps,
+        learning_rate=attn_cfg.attn_lr,
+        max_step_samples=attn_cfg.attn_max_step_samples,
+        seed=seed,
+        log_every=50
+    )
+    print(f"\n[attn-pool-text]  Training attention head  "
+          f"(steps={attn_cfg.attn_steps}  lr={attn_cfg.attn_lr}  device={_device}  "
+          f"n_queries={attn_cfg.attn_num_queries}  n_heads={attn_cfg.attn_num_heads}  "
+          f"n_train={len(train_labels)})")
+
+    t_start = time.perf_counter()
+    head, attn_history = train_attention_pooling_head(
+        train_patches=_torch.from_numpy(train_tokens),
+        y_train=train_labels,
+        val_patches=_torch.from_numpy(test_tokens),
+        y_val=test_labels,
+        train_attention_mask=_torch.from_numpy(train_attention_mask),
+        val_attention_mask=_torch.from_numpy(test_attention_mask),
+        embed_dim=D,
+        out_dim=None,
+        num_queries=attn_cfg.attn_num_queries,
+        num_heads=attn_cfg.attn_num_heads,
+        device=_device,
+        config=training_cfg,
+    )
+    total_time_s = time.perf_counter() - t_start
+
+    best_val_acc_raw = max(attn_history["val_accuracy"]) if attn_history["val_accuracy"] else float("nan")
+    time_to_best_s   = attn_history.get("time_to_best_s", float("nan"))
+    best_val_step    = attn_history.get("best_val_step", 0)
+
+    # Post-hoc evaluation: pool with best checkpoint → PCA (if used) → TabICLClassifier
+    print(f"[attn-pool-text]  Evaluating best checkpoint (step {best_val_step}) with PCA={attn_cfg.tabicl_pca_dim} ...")
+    train_pooled = _pool_with_head(head, _torch.from_numpy(train_tokens), _device, mask=_torch.from_numpy(train_attention_mask))
+    test_pooled  = _pool_with_head(head, _torch.from_numpy(test_tokens),  _device, mask=_torch.from_numpy(test_attention_mask))
+    if attn_cfg.tabicl_pca_dim is not None:
+        n_comp_attn = min(attn_cfg.tabicl_pca_dim, len(train_labels), train_pooled.shape[1])
+        attn_pca    = PCA(n_components=n_comp_attn, random_state=seed)
+        train_pooled = attn_pca.fit_transform(train_pooled).astype(np.float32)
+        test_pooled  = attn_pca.transform(test_pooled).astype(np.float32)
+    test_acc, test_auroc = _compute_accuracy_from_features(
+        train_pooled, train_labels, test_pooled, test_labels,
+        n_estimators=attn_cfg.tabicl_n_estimators, seed=seed,
+    )
+
+    attn_result = {
+        "test_acc":           round(test_acc, 6),
+        "test_auroc":         round(test_auroc, 6) if not np.isnan(test_auroc) else None,
+        "best_val_acc_raw":   round(best_val_acc_raw, 6),
+        "best_val_step":      best_val_step,
+        "time_to_best_s":     time_to_best_s,
+        "total_train_time_s": round(total_time_s, 2),
+    }
+    print(f"[attn-pool-text]  test acc (PCA={attn_cfg.tabicl_pca_dim}): {test_acc:.4f}  auroc: {test_auroc:.4f}  "
+          f"(best train val: {best_val_acc_raw:.4f}  "
+          f"step {best_val_step}/{attn_cfg.attn_steps}  time_to_best={time_to_best_s:.1f}s)")
+
+    record = {
+        "run_timestamp": datetime.now(timezone.utc).isoformat(),
+        "args": _cfg_to_args_dict(cfg),
+        "dataset": {"n_train": int(len(train_labels)), "n_test": int(len(test_labels)), "embed_dim": int(D)},
+        "attn_pool": attn_result,
+    }
+    attn_path = output_dir / "attn_pool_text_results.json"
+    with attn_path.open("w") as f:
+        json.dump(record, f, indent=2)
+    print(f"[attn-pool-text]  Saved → {attn_path}")
+    return attn_result
 
 
 def _run_attn_only(
@@ -595,10 +698,6 @@ def _make_stage_callback(
     test_image_paths: list,
     train_sample_idx: np.ndarray,
     test_sample_idx: np.ndarray,
-    val_patches: Optional[np.ndarray],
-    val_labels: Optional[np.ndarray],
-    val_image_paths: Optional[list],
-    val_sample_idx: Optional[np.ndarray],
     idx_to_class: dict,
     open_image,
     class_prior: np.ndarray,
@@ -630,7 +729,6 @@ def _make_stage_callback(
         tag          = f"iter_{stage_idx}_g{group_size}"
 
         test_grouped   = group_patches(test_patches, group_size)  # [N_test, P', D]
-        val_grouped    = group_patches(val_patches, group_size) if val_patches is not None else None
         ridge_model    = stage.ridge_model_
         feature_scaler = stage.feature_scaler_
         fit_time_s     = stage.fit_time_s_
@@ -644,8 +742,6 @@ def _make_stage_callback(
                 ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
                 ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
             ]
-            if val_grouped is not None:
-                split_configs_iter.append(("val", val_grouped, val_labels, val_image_paths, val_sample_idx))
             if cfg.run.viz_loo_train:
                 split_configs_iter.append(("train_loo", train_grouped, train_labels, train_image_paths, train_sample_idx))
             
@@ -679,8 +775,6 @@ def _make_stage_callback(
                 ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
                 ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
             ]
-            if val_grouped is not None:
-                split_configs_post.append(("val", val_grouped, val_labels, val_image_paths, val_sample_idx))
             if cfg.run.viz_loo_train:
                 split_configs_post.append(("train_loo", train_grouped, train_labels, train_image_paths, train_sample_idx))
             
@@ -724,13 +818,12 @@ def _make_stage_callback(
         print(f"[{tag}] test accuracy (quality-pooled queries): {iter_acc:.4f}  auroc: {iter_auroc:.4f}  "
               f"(fit {fit_time_s:.1f}s, pool {pool_time_s:.1f}s, eval {eval_time_s:.1f}s)")
 
-        all_results.append((tag, iter_acc, iter_auroc, iter_mean_probs, refine_time_s, eval_time_s, fit_time_s, pool_time_s))
+        all_results.append((tag, iter_acc, iter_auroc, iter_mean_probs, refine_time_s, eval_time_s, fit_time_s, pool_time_s, getattr(stage, '_val_accuracy_', None)))
 
         # Persist state needed by the post-loop final-visualisation block.
         last_stage_data.update(
             tag=tag, eff_patch_sz=eff_patch_sz,
             train_grouped=train_grouped, test_grouped=test_grouped,
-            val_grouped=val_grouped,
             ridge_model=ridge_model, feature_scaler=feature_scaler,
             pre_refine_support=pre_refine_support, pre_refine_pca=pre_refine_pca,
             temperature=stage.refinement_cfg.temperature,
@@ -775,96 +868,9 @@ def run_pal_experiment(
     val_patches: Optional[np.ndarray] = None
     val_labels: Optional[np.ndarray] = None
     cls_val_feats: Optional[np.ndarray] = None
-    val_keep_idx: Optional[np.ndarray] = None
-    train_keep_idx: Optional[np.ndarray] = None
-    
-    # For text modality, train_val_fraction is handled internally by IterativePALPooler
-    # (a different random split is drawn at each stage).  Only apply the explicit split
-    # here for the image modality, where val data is also used for visualisation.
-    if (cfg.dataset.train_val_fraction is not None
-            and cfg.dataset.train_val_fraction > 0.0
-            and cfg.dataset.modality != "text"):
-        split_rng = np.random.RandomState(cfg.seed + 2)
-        n_val_split = int(len(train_labels) * cfg.dataset.train_val_fraction)
-        perm = split_rng.permutation(len(train_labels))
-        val_keep_idx = perm[:n_val_split]
-        train_keep_idx = perm[n_val_split:]
 
-        val_patches = train_patches[val_keep_idx]
-        val_labels = train_labels[val_keep_idx]
-        if cls_train_feats is not None:
-            cls_val_feats = cls_train_feats[val_keep_idx]
-
-        train_patches = train_patches[train_keep_idx]
-        train_labels = train_labels[train_keep_idx]
-        if cls_train_feats is not None:
-            cls_train_feats = cls_train_feats[train_keep_idx]
-
-        print(f"[val_split] Held out {n_val_split} images for validation during refinement (fraction={cfg.dataset.train_val_fraction})")
-
-    # --- Apply the same index selections to text-specific arrays (token_ids, attention_mask, texts, token_to_word) ---
-    if extra_data:
-        _tids  = extra_data.get("train_token_ids")
-        _tmask = extra_data.get("train_attention_mask")
-        _texts = extra_data.get("train_texts")
-        _t2w   = extra_data.get("train_token_to_word")
-        _eids  = extra_data.get("test_token_ids")
-        _emask = extra_data.get("test_attention_mask")
-        _etexts = extra_data.get("test_texts")
-        _et2w  = extra_data.get("test_token_to_word")
-
-        if bal_train_keep_idx is not None:
-            if _tids is not None:
-                _tids  = _tids[bal_train_keep_idx]
-            if _tmask is not None:
-                _tmask = _tmask[bal_train_keep_idx]
-            if _texts is not None:
-                _texts = [_texts[i] for i in bal_train_keep_idx]
-            if _t2w is not None:
-                _t2w   = _t2w[bal_train_keep_idx]
-        if bal_test_keep_idx is not None:
-            if _eids is not None:
-                _eids  = _eids[bal_test_keep_idx]
-            if _emask is not None:
-                _emask = _emask[bal_test_keep_idx]
-            if _etexts is not None:
-                _etexts = [_etexts[i] for i in bal_test_keep_idx]
-            if _et2w is not None:
-                _et2w  = _et2w[bal_test_keep_idx]
-
-        val_token_ids:      Optional[np.ndarray] = None
-        val_attention_mask: Optional[np.ndarray] = None
-        val_texts:          Optional[list] = None
-        val_token_to_word:  Optional[np.ndarray] = None
-
-        if val_keep_idx is not None and train_keep_idx is not None:
-            if _tids is not None:
-                val_token_ids      = _tids[val_keep_idx]
-                _tids  = _tids[train_keep_idx]
-            if _tmask is not None:
-                val_attention_mask = _tmask[val_keep_idx]
-                _tmask = _tmask[train_keep_idx]
-            if _texts is not None:
-                val_texts = [_texts[i] for i in val_keep_idx]
-                _texts = [_texts[i] for i in train_keep_idx]
-            if _t2w is not None:
-                val_token_to_word = _t2w[val_keep_idx]
-                _t2w   = _t2w[train_keep_idx]
-
-        extra_data = {
-            "train_token_ids":      _tids,
-            "train_attention_mask": _tmask,
-            "train_texts":          _texts,
-            "train_token_to_word":  _t2w,
-            "test_token_ids":       _eids,
-            "test_attention_mask":  _emask,
-            "test_texts":           _etexts,
-            "test_token_to_word":   _et2w,
-            "val_token_ids":        val_token_ids,
-            "val_attention_mask":   val_attention_mask,
-            "val_texts":            val_texts,
-            "val_token_to_word":    val_token_to_word,
-        }
+    # Train/val splitting is now handled internally by IterativePALPooler
+    # (a fresh random split is drawn at each stage for both modalities).
 
     N_train, _P, D = train_patches.shape
     n_classes      = int(train_labels.max()) + 1
@@ -947,8 +953,27 @@ def run_pal_experiment(
             print("\n[cls-token]  test accuracy: N/A")
         print(f"[mean-pool]  test accuracy: {baseline_acc:.4f}  auroc: {baseline_auroc:.4f}")
 
+        # --- Attention pooling for text (if enabled) ---
+        attn_result: Optional[dict] = None
+        if cfg.attention.attn_pool:
+            attn_result = _run_attn_only_text(
+                train_tokens=train_patches,
+                train_token_ids=train_token_ids,
+                train_attention_mask=train_attention_mask,
+                train_labels=train_labels,
+                test_tokens=test_patches,
+                test_token_ids=test_token_ids,
+                test_attention_mask=test_attention_mask,
+                test_labels=test_labels,
+                D=D,
+                output_dir=output_dir,
+                attn_cfg=cfg.attention,
+                seed=cfg.seed,
+                cfg=cfg,
+            )
+
         all_results: list = [
-            ("baseline", baseline_acc, baseline_auroc, {}, 0.0, 0.0, 0.0, 0.0)
+            ("baseline", baseline_acc, baseline_auroc, {}, 0.0, 0.0, 0.0, 0.0, None)
         ]
 
         # --- Text visualizations (when n_sample > 0) ---
@@ -1011,7 +1036,7 @@ def run_pal_experiment(
                 n_classes=n_classes, pca=pca,
                 cls_acc=cls_acc, cls_auroc=cls_auroc,
                 baseline_acc=baseline_acc, baseline_auroc=baseline_auroc,
-                all_results=all_results, cfg=cfg, attn_result=None,
+                all_results=all_results, cfg=cfg, attn_result=attn_result,
             )
             return
 
@@ -1019,15 +1044,17 @@ def run_pal_experiment(
         _refine_dev = cfg.device if cfg.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
         if _refine_dev.startswith("cuda") and torch.cuda.is_available():
             tabicl_clf = TabICLGPUAdapter(n_estimators=text_cfg.tabicl_n_estimators, random_state=cfg.seed)
-            print(f"[refinement] Using TabICLGPUAdapter + RidgeGPU on {_refine_dev}")
+            _ridge_dev = _refine_dev if text_cfg.gpu_ridge else ""
+            ridge_backend = f"RidgeGPU on {_refine_dev}" if text_cfg.gpu_ridge else "sklearn Ridge (CPU)"
+            print(f"[refinement] Using TabICLGPUAdapter + {ridge_backend}")
         else:
             tabicl_clf = TabICLClassifier(n_estimators=text_cfg.tabicl_n_estimators, random_state=cfg.seed)
-            _refine_dev = ""
+            _ridge_dev = ""
             print("[refinement] Using TabICLClassifier + sklearn Ridge (CPU)")
 
         pal_pooler = IterativePALPooler(
             tabicl=tabicl_clf, refinement_cfg=text_cfg, modality="text", seed=cfg.seed,
-            gpu_ridge_device=_refine_dev,
+            gpu_ridge_device=_ridge_dev,
         )
 
         text_cls_train = cls_train_feats if text_cfg.append_cls else None
@@ -1065,6 +1092,7 @@ def run_pal_experiment(
                 tag, iter_acc, iter_auroc, {},
                 stage.fit_time_s_ + stage.pool_time_s_, eval_time_s,
                 stage.fit_time_s_, stage.pool_time_s_,
+                getattr(stage, '_val_accuracy_', None),
             ))
 
             # Per-stage visualisation (mirrors the image-modality stage callback).
@@ -1137,7 +1165,7 @@ def run_pal_experiment(
         print(f"  {'Stage':<{col_w}}  {'Test Acc':>10}  {'AUROC':>8}  {'Δ Acc':>8}  "
               f"{'Fit(s)':>8}  {'Pool(s)':>8}  {'Eval(s)':>8}")
         print("-" * (col_w + 60))
-        for stage_name, acc, auroc, _, refine_s, eval_s, fit_s, pool_s in all_results:
+        for stage_name, acc, auroc, _, refine_s, eval_s, fit_s, pool_s, _val in all_results:
             delta_str = "" if stage_name == "baseline" else f"{acc - baseline_acc:+.4f}"
             fit_str   = "-" if stage_name == "baseline" else f"{fit_s:.1f}"
             pool_str  = "-" if stage_name == "baseline" else f"{pool_s:.1f}"
@@ -1155,7 +1183,7 @@ def run_pal_experiment(
             n_classes=n_classes, pca=pca,
             cls_acc=cls_acc, cls_auroc=cls_auroc,
             baseline_acc=baseline_acc, baseline_auroc=baseline_auroc,
-            all_results=all_results, cfg=cfg, attn_result=None,
+            all_results=all_results, cfg=cfg, attn_result=attn_result,
         )
         return
     # -----------------------------------------------------------------------
@@ -1288,11 +1316,7 @@ def run_pal_experiment(
             train_image_paths = [train_image_paths[i] for i in train_sub_idx]
         if bal_train_keep_idx is not None:
             train_image_paths = [train_image_paths[i] for i in bal_train_keep_idx]
-        
-        if val_keep_idx is not None and train_keep_idx is not None:
-            val_image_paths = [train_image_paths[i] for i in val_keep_idx]
-            train_image_paths = [train_image_paths[i] for i in train_keep_idx]
-        
+
         if test_sub_idx is not None:
             test_image_paths = [test_image_paths[i] for i in test_sub_idx]
         if bal_test_keep_idx is not None:
@@ -1301,9 +1325,6 @@ def run_pal_experiment(
     rng              = np.random.RandomState(cfg.seed)
     train_sample_idx = rng.choice(len(train_labels), size=min(cfg.dataset.n_sample, len(train_labels)), replace=False)
     test_sample_idx  = rng.choice(len(test_labels),  size=min(cfg.dataset.n_sample, len(test_labels)),  replace=False)
-    val_sample_idx   = None
-    if val_labels is not None:
-        val_sample_idx = rng.choice(len(val_labels), size=min(cfg.dataset.n_sample, len(val_labels)), replace=False)
 
     # --- Baseline: accuracy + visual eval at original patch resolution ---
     baseline_acc, baseline_auroc = _compute_accuracy(
@@ -1331,8 +1352,6 @@ def run_pal_experiment(
             ("train", train_patches, train_labels, train_image_paths, train_sample_idx),
             ("test",  test_patches,  test_labels,  test_image_paths,  test_sample_idx),
         ]
-        if val_patches is not None:
-            split_configs_orig.append(("val", val_patches, val_labels, val_image_paths, val_sample_idx))
         if cfg.run.viz_loo_train:
             split_configs_orig.append(("train_loo", train_patches, train_labels, train_image_paths, train_sample_idx))
         baseline_mean_probs = _run_visual_eval(
@@ -1359,7 +1378,7 @@ def run_pal_experiment(
             n_classes=n_classes, pca=pca,
             cls_acc=cls_acc, cls_auroc=cls_auroc,
             baseline_acc=baseline_acc, baseline_auroc=baseline_auroc,
-            all_results=[("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0, 0.0, 0.0)],
+            all_results=[("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0, 0.0, 0.0, None)],
             cfg=cfg,
             attn_result=attn_result,
         )
@@ -1376,7 +1395,7 @@ def run_pal_experiment(
     # ---------------------------------------------------------------------------
 
     all_results: list[tuple[str, float, float, dict, float, float]] = [
-        ("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0, 0.0, 0.0)
+        ("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0, 0.0, 0.0, None)
     ]
 
     stage_callback, _last_stage_data = _make_stage_callback(
@@ -1389,10 +1408,6 @@ def run_pal_experiment(
         test_image_paths=test_image_paths,
         train_sample_idx=train_sample_idx,
         test_sample_idx=test_sample_idx,
-        val_patches=val_patches,
-        val_labels=val_labels,
-        val_image_paths=val_image_paths,
-        val_sample_idx=val_sample_idx,
         idx_to_class=idx_to_class,
         open_image=open_image,
         class_prior=class_prior,
@@ -1403,24 +1418,20 @@ def run_pal_experiment(
     _refine_dev = cfg.device if cfg.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
     if _refine_dev.startswith("cuda") and torch.cuda.is_available():
         tabicl_clf = TabICLGPUAdapter(n_estimators=cfg.refinement.tabicl_n_estimators, random_state=cfg.seed)
-        print(f"[refinement] Using TabICLGPUAdapter + RidgeGPU on {_refine_dev}")
+        _ridge_dev = _refine_dev if cfg.refinement.gpu_ridge else ""
+        ridge_backend = f"RidgeGPU on {_refine_dev}" if cfg.refinement.gpu_ridge else "sklearn Ridge (CPU)"
+        print(f"[refinement] Using TabICLGPUAdapter + {ridge_backend}")
     else:
         tabicl_clf = TabICLClassifier(n_estimators=cfg.refinement.tabicl_n_estimators, random_state=cfg.seed)
-        _refine_dev = ""   # signal to PALPooler/RidgeGPU to use CPU sklearn Ridge
+        _ridge_dev = ""
         print("[refinement] Using TabICLClassifier + sklearn Ridge (CPU)")
     pal_pooler = IterativePALPooler(
         tabicl=tabicl_clf, refinement_cfg=cfg.refinement, seed=cfg.seed,
-        gpu_ridge_device=_refine_dev,
+        gpu_ridge_device=_ridge_dev,
     )
     train_cls = cls_train_feats if cfg.refinement.append_cls else None
-    fit_kwargs = {}
-    if val_patches is not None:
-        fit_kwargs["val_patches"] = val_patches
-        fit_kwargs["val_labels"] = val_labels
-        if cfg.refinement.append_cls:
-            fit_kwargs["val_cls_tokens"] = cls_val_feats
 
-    pal_pooler.fit(train_patches, train_labels, cls_tokens=train_cls, stage_callback=stage_callback, **fit_kwargs)
+    pal_pooler.fit(train_patches, train_labels, cls_tokens=train_cls, stage_callback=stage_callback)
 
     # -- Final post-all-refinement visualisation (only when --post-refinement-viz is off) --
     # Produces Ridge-weight figures for the last refinement stage, giving you the quality
@@ -1431,8 +1442,6 @@ def run_pal_experiment(
             ("train", _last_stage_data["train_grouped"], train_labels, train_image_paths, train_sample_idx),
             ("test",  _last_stage_data["test_grouped"],  test_labels,  test_image_paths,  test_sample_idx),
         ]
-        if _last_stage_data.get("val_grouped") is not None:
-            split_configs_final.append(("val", _last_stage_data["val_grouped"], val_labels, val_image_paths, val_sample_idx))
         if cfg.run.viz_loo_train:
             split_configs_final.append(("train_loo", _last_stage_data["train_grouped"], train_labels, train_image_paths, train_sample_idx))
         _run_visual_eval(
@@ -1461,7 +1470,7 @@ def run_pal_experiment(
     print(f"  {'Stage':<{col_w}}  {'Test Acc':>10}  {'AUROC':>8}  {'Δ Acc':>8}  "
           f"{'P(true)/train':>14}  {'P(true)/test':>13}  {'Fit(s)':>8}  {'Pool(s)':>8}  {'Eval(s)':>8}")
     print("-" * (col_w + 78))
-    for stage_name, acc, auroc, mean_probs, refine_s, eval_s, fit_s, pool_s in all_results:
+    for stage_name, acc, auroc, mean_probs, refine_s, eval_s, fit_s, pool_s, _val in all_results:
         delta_str = "" if stage_name == "baseline" else f"{acc - baseline_acc:+.4f}"
         fit_str   = "-" if stage_name == "baseline" else f"{fit_s:.1f}"
         pool_str  = "-" if stage_name == "baseline" else f"{pool_s:.1f}"

@@ -552,16 +552,40 @@ def refine_text_features(
             )
 
     # --- Importance weights (optional) ---
-    # Correct for length-proportional sampling bias: tokens from sequence i have
-    # weight 1/len_i, normalized so weights sum to n_fit (mean = 1), keeping the
-    # effective Ridge alpha comparable to the unweighted case.
+    # Correct for length-proportional sampling bias so each sequence contributes
+    # equally regardless of how many tokens it contributes to the Ridge fit.
+    # Weights are normalized to mean=1 to keep the effective Ridge alpha stable.
     ridge_sample_weight: Optional[np.ndarray] = None
-    if getattr(refinement_cfg, "use_length_importance_weights", False):
+    _iw_basis = getattr(refinement_cfg, "length_importance_weight_basis", "none")
+    if _iw_basis == "full_length":
+        # 1/sqrt(L_full): downweights tokens from long sequences regardless of
+        # how many were actually sampled.
         seq_lengths = source_group_mask.sum(axis=1).astype(np.float32)  # [N_source]
-        raw_w = 1.0 / seq_lengths[fit_sample_idx]                 # [n_fit]
+        raw_w = 1.0 / np.sqrt(seq_lengths[fit_sample_idx])              # [n_fit]
         n_fit = len(fit_sample_idx)
-        ridge_sample_weight = raw_w * (n_fit / raw_w.sum())       # normalize to mean=1
-        print(f"[text_ridge] Using length importance weights "
+        ridge_sample_weight = raw_w * (n_fit / raw_w.sum())
+        print(f"[text_ridge] Length importance weights (basis=full_length) "
+              f"(min={ridge_sample_weight.min():.3f}, max={ridge_sample_weight.max():.3f})")
+    elif _iw_basis == "full_length_clip":
+        # 1/sqrt(max(L_full, floor)): same as full_length but clips the denominator
+        # so very short sequences aren't excessively upweighted.
+        floor = int(getattr(refinement_cfg, "length_importance_floor", 25))
+        seq_lengths = source_group_mask.sum(axis=1).astype(np.float32)  # [N_source]
+        clipped = np.maximum(seq_lengths[fit_sample_idx], floor)
+        raw_w = 1.0 / np.sqrt(clipped)                                  # [n_fit]
+        n_fit = len(fit_sample_idx)
+        ridge_sample_weight = raw_w * (n_fit / raw_w.sum())
+        print(f"[text_ridge] Length importance weights (basis=full_length_clip, floor={floor}) "
+              f"(min={ridge_sample_weight.min():.3f}, max={ridge_sample_weight.max():.3f})")
+    elif _iw_basis == "sampled_count":
+        # 1/sqrt(n_sampled): downweights tokens from sequences that contribute
+        # more rows to the actual fit batch.
+        N_source = source_group_mask.shape[0]
+        sampled_counts = np.bincount(fit_sample_idx, minlength=N_source).astype(np.float32)
+        raw_w = 1.0 / np.sqrt(sampled_counts[fit_sample_idx])           # [n_fit]
+        n_fit = len(fit_sample_idx)
+        ridge_sample_weight = raw_w * (n_fit / raw_w.sum())
+        print(f"[text_ridge] Length importance weights (basis=sampled_count) "
               f"(min={ridge_sample_weight.min():.3f}, max={ridge_sample_weight.max():.3f})")
 
     # --- Fit Ridge ---
@@ -580,6 +604,9 @@ def refine_text_features(
         )
     else:
         ridge_model = Ridge(alpha=refinement_cfg.ridge_alpha)
+        import torch as _torch
+        if isinstance(all_targets, _torch.Tensor):
+            all_targets = all_targets.cpu().numpy()
     ridge_model.fit(fit_features, all_targets, sample_weight=ridge_sample_weight)
     print(f"[text_ridge] Train R²: {ridge_model.score(fit_features, all_targets):.4f}")
 

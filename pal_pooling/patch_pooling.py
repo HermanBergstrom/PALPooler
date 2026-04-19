@@ -1133,6 +1133,9 @@ def refine_dataset_features(
         ridge_model: Union[Ridge, RidgeGPU] = RidgeGPU(alpha=refinement_cfg.ridge_alpha, device=gpu_ridge_device)
     else:
         ridge_model = Ridge(alpha=refinement_cfg.ridge_alpha)
+        import torch as _torch
+        if isinstance(all_targets, _torch.Tensor):
+            all_targets = all_targets.cpu().numpy()
     ridge_model.fit(all_features, all_targets)
     print(f"[ridge] Train R²: {ridge_model.score(all_features, all_targets):.4f}")
 

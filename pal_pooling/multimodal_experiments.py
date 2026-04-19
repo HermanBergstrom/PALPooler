@@ -351,7 +351,7 @@ def _run_single_seed(
             use_attn_masking=args.use_attn_masking,
             prior=args.prior,
             model_selection=args.model_selection,
-            use_length_importance_weights = True
+            length_importance_weight_basis=args.length_importance_weight_basis,
         )
 
         # ── Fit text PAL pooler (no tabular context) ──────────────────────────

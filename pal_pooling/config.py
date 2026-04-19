@@ -55,7 +55,6 @@ class DatasetConfig:
     n_train: Optional[int]
     n_test: Optional[int]
     n_val: Optional[int]
-    train_val_fraction: Optional[float]
     n_sample: int
     balance_train: bool
     balance_test: bool
@@ -87,6 +86,7 @@ class RefinementConfig:
     use_attn_masking: bool = False
     model_selection: str = "last_iteration"
     binary_dist: bool = False
+    train_val_fraction: Optional[float] = None
 
 @dataclass
 class TextRefinementConfig:
@@ -128,7 +128,9 @@ class TextRefinementConfig:
     model_selection: str = "last_iteration"
     binary_dist: bool = False
     prior: str = "label_frequency"    # "label_frequency", "token_marginal", or "current_pool_marginal"
-    use_length_importance_weights: bool = False  # upweight tokens from shorter sequences when subsampling
+    # "none" | "full_length" | "full_length_clip" | "sampled_count"
+    length_importance_weight_basis: str = "none"
+    length_importance_floor: int = 25  # floor for full_length_clip
     train_val_fraction: Optional[float] = None   # if set, split internally per stage instead of in the experiment script
 
 
@@ -226,10 +228,19 @@ def parse_args() -> ExperimentConfig:
                    help="Cap on the total number of patch-group rows forwarded through TabICL.")
     p.add_argument("--use-random-subsampling", action="store_true",
                    help="Enable random subsampling of patch-group rows for Ridge fitting.")
-    p.add_argument("--use-length-importance-weights", action="store_true",
-                   help="When subsampling text tokens for Ridge fitting, upweight tokens from shorter "
-                        "sequences (weight ∝ 1/seq_len, normalized to mean=1) so each sequence "
-                        "contributes equally regardless of length. Text datasets only.")
+    p.add_argument("--length-importance-weight-basis", type=str, default="none",
+                   choices=["none", "full_length", "full_length_clip", "sampled_count"],
+                   help="Importance-weight basis for Ridge fitting on text tokens. "
+                        "'none': no reweighting (default). "
+                        "'full_length': weight ∝ 1/sqrt(L_full). "
+                        "'full_length_clip': weight ∝ 1/sqrt(max(L_full, floor)) — same as full_length but "
+                        "clips the denominator to avoid overweighting very short sequences "
+                        "(see --length-importance-floor). "
+                        "'sampled_count': weight ∝ 1/sqrt(n_sampled) — downweights tokens from sequences "
+                        "that contribute more rows to the actual fit batch.")
+    p.add_argument("--length-importance-floor", type=int, default=25,
+                   help="Floor value for 'full_length_clip' basis: lengths below this are treated as "
+                        "this value when computing importance weights (default: 25).")
     p.add_argument("--balance-train", action="store_true",
                    help="Undersample majority classes in the training set.")
     p.add_argument("--balance-test", action="store_true",
@@ -283,8 +294,10 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--aoe-handling", type=str, default="filter",
                    choices=["filter", "entropy"],
                    help="How to handle the AoE class during Ridge fitting.")
-    p.add_argument("--gpu-ridge", action="store_true",
-                   help="Solve Ridge regression on the GPU (requires PyTorch + CUDA).")
+    p.add_argument("--no-gpu-ridge", dest="gpu_ridge", action="store_false",
+                   help="Solve Ridge regression on the CPU (sklearn) instead of the GPU. "
+                        "Useful when GPU memory is tight. Default: GPU Ridge when CUDA is available.")
+    p.set_defaults(gpu_ridge=True)
     p.add_argument("--post-refinement-viz", action="store_true",
                    help="Skip pre-refinement visualisations; only produce post-refinement figures.")
     p.add_argument("--viz-loo-train", action="store_true",
@@ -345,7 +358,6 @@ def parse_args() -> ExperimentConfig:
         n_train=args.n_train,
         n_test=args.n_test,
         n_val=args.n_val,
-        train_val_fraction=args.train_val_fraction,
         n_sample=args.n_sample,
         balance_train=args.balance_train,
         balance_test=args.balance_test
@@ -371,7 +383,8 @@ def parse_args() -> ExperimentConfig:
             model_selection=args.model_selection,
             binary_dist=args.binary_dist,
             prior=args.prior,
-            use_length_importance_weights=args.use_length_importance_weights,
+            length_importance_weight_basis=args.length_importance_weight_basis,
+            length_importance_floor=args.length_importance_floor,
             train_val_fraction=args.train_val_fraction,
         )
     else:
@@ -397,6 +410,7 @@ def parse_args() -> ExperimentConfig:
             use_attn_masking=args.use_attn_masking,
             model_selection=args.model_selection,
             binary_dist=args.binary_dist,
+            train_val_fraction=args.train_val_fraction,
         )
     
     attention_cfg = AttentionPoolConfig(
