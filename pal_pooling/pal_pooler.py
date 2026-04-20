@@ -67,11 +67,15 @@ from pal_pooling.patch_pooling import (
     _ridge_pool_weights,
     group_patches,
     refine_dataset_features,
+    collect_pseudo_labels_image,
+    fit_ridge_repool_image,
 )
 from pal_pooling.text_pooling import (
     _ridge_pool_weights_text,
     group_text_tokens,
     refine_text_features,
+    collect_pseudo_labels_text,
+    fit_ridge_repool_text,
 )
 
 
@@ -1356,7 +1360,7 @@ class IterativePALPooler:
     ) -> "IterativePALPooler":
         is_image = self.modality == "image"
         stage_items = self.patch_group_sizes if is_image else self.text_group_modes
-        
+
         if not stage_items:
             name = "patch_group_sizes" if is_image else "text_group_modes"
             raise ValueError(f"{name} must contain at least one entry.")
@@ -1365,10 +1369,26 @@ class IterativePALPooler:
         labels = np.asarray(labels)
         N, _, D = data.shape
 
-        # Compute splits first so we know whether to use per-stage tabular probs.
+        # Check if 4-fold CV should be used (N ≤ cross_validation_cap).
+        cv_cap = getattr(self.refinement_cfg, "cross_validation_cap", None)
+        use_cv = cv_cap is not None and N <= cv_cap
+        if use_cv:
+            tvf_override = getattr(self.refinement_cfg, "train_val_fraction", None)
+            if tvf_override is not None:
+                print(
+                    f"[IterativePALPooler] --train-val-fraction={tvf_override} overridden by "
+                    f"--cross-validation-cap={cv_cap} (N={N} ≤ cap): using 4-fold CV"
+                )
+            else:
+                print(
+                    f"[IterativePALPooler] --cross-validation-cap={cv_cap}: "
+                    f"N={N} ≤ cap — using 4-fold CV for pseudo-label collection"
+                )
+
+        # Compute standard train/val splits (ignored when use_cv is True).
         tvf = getattr(self.refinement_cfg, "train_val_fraction", None)
         splits: Optional[list] = None
-        if tvf is not None and tvf > 0.0:
+        if not use_cv and tvf is not None and tvf > 0.0:
             splits = []
             for _k in range(len(stage_items)):
                 _rng  = np.random.RandomState(self.seed + _k)
@@ -1378,11 +1398,11 @@ class IterativePALPooler:
             print(f"[IterativePALPooler] train_val_fraction={tvf}: "
                   f"{int(N*tvf)} val / {N - int(N*tvf)} train per stage (fresh split each stage)")
 
-        # When splits are present and tabular probs are not user-supplied, compute them
-        # per-stage inside fit_stage (train as support, val out-of-support).
+        # When splits or CV are active and tabular probs are not user-supplied, compute them
+        # per-stage / per-fold inside fit_stage so each fold uses only its 75% as support.
         # Otherwise, compute once on the full dataset now.
         _needs_per_stage_tab = (
-            splits is not None
+            (splits is not None or use_cv)
             and tabular_probs is None
             and context_features is not None
             and self.refinement_cfg.weight_method in ("kl_div", "wasserstein", "js_div", "tvd")
@@ -1432,47 +1452,55 @@ class IterativePALPooler:
                     seed=self.seed, gpu_ridge_device=self.gpu_ridge_device,
                 )
 
-        def fit_stage(stage, init_sup, init_pca, k):
-            train_idx, val_idx = splits[k] if splits is not None else (None, None)
-            stage_tab = (
-                self._compute_split_tabular_probs(context_features, labels, train_idx, val_idx, N)
-                if _needs_per_stage_tab else tabular_probs
-            )
-            stage._fit_from_indices(
-                data, labels, cls_tokens, init_sup, init_pca,
-                context_features, stage_tab, val_tabular_probs=None,
-                train_idx=train_idx, val_idx=val_idx,
-                token_ids=token_ids, attention_mask=attention_mask,
-            )
+        if use_cv:
+            def fit_stage(stage, init_sup, init_pca, k):
+                self._cv_fit_stage(
+                    stage, k, data, labels, cls_tokens, token_ids, attention_mask,
+                    init_sup, init_pca, tabular_probs, context_features, _stage_val_accs,
+                )
 
-        def post_fit(k, stage):
-            """After fitting on the train fold, pool val fold and rebuild full-N support."""
-            if splits is None:
-                return
-            train_idx, val_idx = splits[k]
-            val_pooled = stage._transform_subset(data, val_idx, cls_tokens,
-                                                 token_ids=token_ids, attention_mask=attention_mask)
-            val_proj = (
-                stage._pca_.transform(val_pooled).astype(np.float32)
-                if stage._pca_ is not None else val_pooled.astype(np.float32)
-            )
-            # Evaluate val accuracy now: support is still train-only, which is correct.
-            # Pass val_pooled (raw D-space) — score_tabicl applies PCA internally.
-            val_acc, val_auroc = PALPooler.score_tabicl(stage, val_pooled, labels[val_idx])
-            stage._val_accuracy_ = val_acc
-            stage._val_auroc_    = val_auroc
-            _stage_val_accs.append(val_acc)
-            print(
-                f"[IterativePALPooler] Stage {k} val accuracy: {val_acc:.4f}  "
-                f"auroc: {val_auroc:.4f}"
-            )
+            def post_fit(k, stage):
+                pass  # all work done inside _cv_fit_stage
+        else:
+            def fit_stage(stage, init_sup, init_pca, k):
+                train_idx, val_idx = splits[k] if splits is not None else (None, None)
+                stage_tab = (
+                    self._compute_split_tabular_probs(context_features, labels, train_idx, val_idx, N)
+                    if _needs_per_stage_tab else tabular_probs
+                )
+                stage._fit_from_indices(
+                    data, labels, cls_tokens, init_sup, init_pca,
+                    context_features, stage_tab, val_tabular_probs=None,
+                    train_idx=train_idx, val_idx=val_idx,
+                    token_ids=token_ids, attention_mask=attention_mask,
+                )
 
-            D_proj = stage._support_projected_.shape[1]
-            full_support = np.empty((N, D_proj), dtype=np.float32)
-            full_support[train_idx] = stage._support_projected_
-            full_support[val_idx]   = val_proj
-            stage._support_projected_ = full_support
-            stage.support_labels_     = labels
+            def post_fit(k, stage):
+                """After fitting on the train fold, pool val fold and rebuild full-N support."""
+                if splits is None:
+                    return
+                train_idx, val_idx = splits[k]
+                val_pooled = stage._transform_subset(data, val_idx, cls_tokens,
+                                                     token_ids=token_ids, attention_mask=attention_mask)
+                val_proj = (
+                    stage._pca_.transform(val_pooled).astype(np.float32)
+                    if stage._pca_ is not None else val_pooled.astype(np.float32)
+                )
+                val_acc, val_auroc = PALPooler.score_tabicl(stage, val_pooled, labels[val_idx])
+                stage._val_accuracy_ = val_acc
+                stage._val_auroc_    = val_auroc
+                _stage_val_accs.append(val_acc)
+                print(
+                    f"[IterativePALPooler] Stage {k} val accuracy: {val_acc:.4f}  "
+                    f"auroc: {val_auroc:.4f}"
+                )
+
+                D_proj = stage._support_projected_.shape[1]
+                full_support = np.empty((N, D_proj), dtype=np.float32)
+                full_support[train_idx] = stage._support_projected_
+                full_support[val_idx]   = val_proj
+                stage._support_projected_ = full_support
+                stage.support_labels_     = labels
 
         def eval_transform(stage):
             return stage._transform_all(data, cls_tokens, token_ids=token_ids, attention_mask=attention_mask)
@@ -1490,11 +1518,246 @@ class IterativePALPooler:
             stage_items, make_stage, fit_stage, eval_transform,
             labels, context_features, initial_support, initial_pca,
             stage_callback=_cb,
-            post_fit=post_fit if splits is not None else None,
+            post_fit=post_fit if (use_cv or splits is not None) else None,
             stage_key_label="patch_group_size" if is_image else "text_group_mode",
         )
         self.stage_val_accuracies_ = _stage_val_accs if _stage_val_accs else None
         return self
+
+    # ------------------------------------------------------------------
+    # Internal: 4-fold cross-validation stage fit
+    # ------------------------------------------------------------------
+
+    def _cv_fit_stage(
+        self,
+        stage,
+        stage_idx: int,
+        data: np.ndarray,
+        labels: np.ndarray,
+        cls_tokens,
+        token_ids,
+        attention_mask,
+        initial_support: Optional[np.ndarray],
+        initial_pca,
+        tabular_probs: Optional[np.ndarray],
+        context_features: Optional[np.ndarray],
+        stage_val_accs: list,
+    ) -> None:
+        """Fit one stage using 4-fold cross-validation for pseudo-label collection.
+
+        For each fold (75% support / 25% query):
+          - Fits TabICL on the 75% support.
+          - Forwards the 25% query patches/tokens to collect pseudo quality-logit targets.
+        After all 4 folds, fits Ridge once on the combined N pseudo-labels, repools
+        all N training samples, and evaluates accuracy on each fold's held-out 25%
+        (averaging the 4 accuracies).
+        """
+        from sklearn.metrics import roc_auc_score
+
+        is_image = self.modality == "image"
+        N = len(labels)
+        N_FOLDS = 4
+
+        # Pre-group all N training samples once — used for repooling after Ridge fit.
+        if is_image:
+            all_grouped = group_patches(data, stage.refinement_cfg.patch_group_sizes)
+            if cls_tokens is not None:
+                all_grouped = _append_cls(all_grouped, np.asarray(cls_tokens, dtype=np.float32))
+            stage.n_patches_grouped_ = all_grouped.shape[1]
+            stage.embed_dim_ = data.shape[-1]
+        else:
+            stage.text_group_mode_ = stage._stage_group_mode
+            all_grouped, all_group_mask = group_text_tokens(
+                data, token_ids,
+                mode=stage.text_group_mode_,
+                sep_token_id=stage.refinement_cfg.sep_token_id,
+                cls_token_id=stage.refinement_cfg.cls_token_id,
+            )
+            if stage.refinement_cfg.append_cls and cls_tokens is not None:
+                all_grouped, all_group_mask = _append_cls_masked(
+                    all_grouped, all_group_mask,
+                    np.asarray(cls_tokens, dtype=np.float32),
+                )
+            stage.n_groups_ = all_grouped.shape[1]
+            stage.group_mask_ = all_group_mask
+            stage.embed_dim_ = data.shape[-1]
+
+        _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd")
+        _needs_per_fold_tab = (
+            tabular_probs is None
+            and context_features is not None
+            and stage.refinement_cfg.weight_method in _divergence_methods
+            and not getattr(stage.refinement_cfg, "use_global_prior", False)
+        )
+
+        print(
+            f"[IterativePALPooler] Stage {stage_idx}: 4-fold CV "
+            f"(N={N}, ~{N // N_FOLDS} query per fold)"
+        )
+
+        X_all: List[np.ndarray] = []
+        y_all: List[np.ndarray] = []
+        sw_all: List[np.ndarray] = []
+        fold_splits: List[tuple] = []
+
+        for fold in range(N_FOLDS):
+            rng = np.random.RandomState(self.seed + stage_idx * 17 + fold)
+            n_val = N // N_FOLDS
+            perm = rng.permutation(N)
+            val_idx   = perm[:n_val]
+            train_idx = perm[n_val:]
+            fold_splits.append((train_idx, val_idx))
+
+            print(
+                f"[IterativePALPooler] Stage {stage_idx} fold {fold}: "
+                f"{len(train_idx)} support / {len(val_idx)} query"
+            )
+
+            # Fold-specific tabular probs for query set.
+            fold_tab_query: Optional[np.ndarray] = None
+            if _needs_per_fold_tab:
+                full_tab = self._compute_split_tabular_probs(
+                    context_features, labels, train_idx, val_idx, N
+                )
+                fold_tab_query = full_tab[val_idx]
+            elif tabular_probs is not None:
+                fold_tab_query = tabular_probs[val_idx]
+
+            # Fold support (slice initial_support when it spans all N samples).
+            if initial_support is not None and len(initial_support) == N:
+                fold_support = initial_support[train_idx]
+            else:
+                fold_support = initial_support
+
+            fold_train_ctx = (
+                context_features[train_idx].astype(np.float32)
+                if context_features is not None else None
+            )
+            fold_query_ctx = (
+                context_features[val_idx].astype(np.float32)
+                if context_features is not None else None
+            )
+
+            if is_image:
+                X, y = collect_pseudo_labels_image(
+                    all_grouped[val_idx],
+                    labels[val_idx],
+                    labels[train_idx],
+                    fold_support,
+                    initial_pca,
+                    self.tabicl,
+                    stage.refinement_cfg,
+                    tabular_probs=fold_tab_query,
+                    query_context_features=fold_query_ctx,
+                    train_context_features=fold_train_ctx,
+                    seed=self.seed + fold,
+                )
+                X_all.append(X)
+                y_all.append(y)
+            else:
+                X, y, sw = collect_pseudo_labels_text(
+                    all_grouped[val_idx],
+                    all_group_mask[val_idx],
+                    labels[val_idx],
+                    labels[train_idx],
+                    fold_support,
+                    initial_pca,
+                    self.tabicl,
+                    stage.refinement_cfg,
+                    tabular_probs=fold_tab_query,
+                    query_context_features=fold_query_ctx,
+                    train_context_features=fold_train_ctx,
+                    seed=self.seed + fold,
+                )
+                X_all.append(X)
+                y_all.append(y)
+                if sw is not None:
+                    sw_all.append(sw)
+
+        X_concat = np.concatenate(X_all, axis=0)
+        y_concat = np.concatenate(y_all, axis=0)
+        sw_concat = np.concatenate(sw_all, axis=0) if sw_all else None
+
+        # Fit Ridge once on all N accumulated pseudo-labels, repool all N.
+        if is_image:
+            refined, new_pca, weights_ridge, ridge_model, feature_scaler, fit_t, pool_t = \
+                fit_ridge_repool_image(
+                    X_concat, y_concat, all_grouped, initial_pca,
+                    stage.refinement_cfg, self.seed, self.gpu_ridge_device,
+                )
+            repooled_raw = (weights_ridge[:, :, None] * all_grouped).sum(axis=1).astype(np.float32)
+        else:
+            refined, new_pca, weights_ridge, ridge_model, feature_scaler, fit_t, pool_t = \
+                fit_ridge_repool_text(
+                    X_concat, y_concat, all_grouped, all_group_mask, initial_pca,
+                    stage.refinement_cfg, self.seed, self.gpu_ridge_device,
+                    sample_weight=sw_concat,
+                )
+            repooled_raw = (weights_ridge[:, :, None] * all_grouped).sum(axis=1).astype(np.float32)
+
+        # Empirical class prior from all N labels.
+        n_cls = int(labels.max()) + 1
+        counts = np.bincount(labels.astype(np.int64), minlength=n_cls)
+        class_prior = (counts / counts.sum()).astype(np.float32)
+
+        # Set all fitted attributes on the stage.
+        stage.ridge_model_        = ridge_model
+        stage.feature_scaler_     = feature_scaler
+        stage._pca_               = new_pca
+        stage._support_projected_ = refined
+        stage.support_            = repooled_raw
+        stage.support_labels_     = labels
+        stage.scoring_clf_        = self.tabicl
+        stage.class_prior_        = class_prior
+        stage.fit_time_s_         = fit_t
+        stage.pool_time_s_        = pool_t
+
+        # Evaluate val accuracy for each fold using the final Ridge model.
+        val_accs: List[float] = []
+        val_aurocs: List[float] = []
+        for fold, (train_idx, val_idx) in enumerate(fold_splits):
+            val_pooled = stage._transform_subset(
+                data, val_idx, cls_tokens,
+                token_ids=token_ids, attention_mask=attention_mask,
+            )
+            val_proj = (
+                stage._pca_.transform(val_pooled).astype(np.float32)
+                if stage._pca_ is not None else val_pooled.astype(np.float32)
+            )
+            train_proj = stage._support_projected_[train_idx]
+
+            clf_eval = TabICLClassifier(
+                n_estimators=getattr(self.tabicl, "n_estimators", 1),
+                random_state=self.seed,
+            )
+            clf_eval.fit(train_proj, labels[train_idx])
+            proba = clf_eval.predict_proba(val_proj)
+            acc = float((np.argmax(proba, axis=1) == labels[val_idx]).mean())
+            try:
+                if proba.shape[1] == 2:
+                    auroc = float(roc_auc_score(labels[val_idx], proba[:, 1]))
+                else:
+                    auroc = float(
+                        roc_auc_score(labels[val_idx], proba, multi_class="ovr", average="macro")
+                    )
+            except ValueError:
+                auroc = float("nan")
+            val_accs.append(acc)
+            val_aurocs.append(auroc)
+            print(
+                f"[IterativePALPooler] Stage {stage_idx} fold {fold} "
+                f"val acc: {acc:.4f}  auroc: {auroc:.4f}"
+            )
+
+        avg_acc   = float(np.mean(val_accs))
+        avg_auroc = float(np.mean(val_aurocs))
+        stage._val_accuracy_ = avg_acc
+        stage._val_auroc_    = avg_auroc
+        stage_val_accs.append(avg_acc)
+        print(
+            f"[IterativePALPooler] Stage {stage_idx} CV avg val acc: {avg_acc:.4f}  "
+            f"auroc: {avg_auroc:.4f}"
+        )
 
     # ------------------------------------------------------------------
     # Internal: shared finalisation + masked-accuracy helpers

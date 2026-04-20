@@ -179,6 +179,45 @@ Controls which stage is used at inference after iterative refinement:
 
 ---
 
+## 4-fold cross-validation for small training sets (`--cross-validation-cap`)
+
+When `--cross-validation-cap C` is set (e.g. `2000`), `IterativePALPooler` checks the training
+set size N at the start of each stage.  If **N ≤ C**, it switches from the standard single-split
+to **4-fold cross-validation** for pseudo-label collection.
+
+If `--train-val-fraction` is also provided and N ≤ cap, the fraction is silently overridden and a
+message is printed.
+
+### Per-stage CV flow
+
+1. **4 forward passes (Phase A — pseudo-label collection)**  
+   The N training samples are partitioned into 4 roughly equal folds.  For each fold:
+   - 75% of N = TabICL support (in-context examples).
+   - 25% of N = query set — forwarded through TabICL *out-of-support*.
+   - Quality logits are collected as Ridge regression targets.
+   - Tabular/contextual features (when provided with divergence weight methods) are computed
+     per fold: the TabICL tabular classifier is fit on the 75% only, so the 25% query
+     probs are truly out-of-support.
+   - All `(X, y [, sample_weight])` rows are accumulated across the 4 folds.
+
+2. **Single Ridge fit (Phase B)**  
+   After all 4 folds, Ridge is fit **once** on the concatenated pseudo-labels from all N samples.
+   For text, importance weights (length-based) are normalised to mean=1 before fitting.  
+   The Ridge model repools all N samples to produce `stage._support_projected_` (shape `[N, D]`).
+
+3. **Val accuracy averaging**  
+   For each of the 4 folds, the fitted pooler transforms the 25% query → fresh TabICL is fit on
+   the 75% projected support → accuracy evaluated on the 25%.  The four accuracies are averaged
+   and stored in `stage._val_accuracy_`.
+
+4. **Full-N support forwarded**  
+   `stage._support_projected_` always contains all N samples after the CV step.  The next stage
+   receives this as its `initial_support`, identical to the non-CV path.
+
+This is supported for **both image and text** modalities.
+
+---
+
 ## Train/validation split (`--train-val-fraction`)
 
 When `--train-val-fraction F` (e.g. `0.2`) is set, `IterativePALPooler` applies the following
@@ -231,6 +270,7 @@ python pal_pooling/pal_experiment.py [OPTIONS]
 | `--n-test` | `None` | Limit test set to this many images (DVM only) |
 | `--n-val` | `None` | Limit validation set to this many images (DVM only) |
 | `--train-val-fraction` | `None` | Fraction of training set to hold out as validation for Ridge fitting (e.g. `0.2`) |
+| `--cross-validation-cap` | `None` | When N ≤ this value, use 4-fold CV for pseudo-label collection instead of the standard split; overrides `--train-val-fraction` when active (e.g. `2000`) |
 | `--balance-train` | `False` | Undersample majority classes in the training set |
 | `--balance-test` | `False` | Undersample majority classes in the test set |
 

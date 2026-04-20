@@ -1159,21 +1159,29 @@ def run_pal_experiment(
 
         # Summary table
         col_w = max(len(r[0]) for r in all_results) + 2
-        print("\n" + "=" * (col_w + 60))
+        _sep_w = col_w + 74
+        print("\n" + "=" * _sep_w)
         print("ITERATIVE TEXT REFINEMENT SUMMARY")
-        print("=" * (col_w + 60))
+        print("=" * _sep_w)
         print(f"  {'Stage':<{col_w}}  {'Test Acc':>10}  {'AUROC':>8}  {'Δ Acc':>8}  "
-              f"{'Fit(s)':>8}  {'Pool(s)':>8}  {'Eval(s)':>8}")
-        print("-" * (col_w + 60))
+              f"{'Val Acc':>8}  {'Fit(s)':>8}  {'Pool(s)':>8}  {'Eval(s)':>8}")
+        print("-" * _sep_w)
+        _text_val_accs = [r[8] for r in all_results if r[8] is not None]
+        _best_text_val = max(_text_val_accs) if _text_val_accs else None
         for stage_name, acc, auroc, _, refine_s, eval_s, fit_s, pool_s, _val in all_results:
             delta_str = "" if stage_name == "baseline" else f"{acc - baseline_acc:+.4f}"
             fit_str   = "-" if stage_name == "baseline" else f"{fit_s:.1f}"
             pool_str  = "-" if stage_name == "baseline" else f"{pool_s:.1f}"
             eval_str  = "-" if stage_name == "baseline" else f"{eval_s:.1f}"
             auroc_str = f"{auroc:.4f}" if not np.isnan(auroc) else "  N/A"
-            print(f"  {stage_name:<{col_w}}  {acc:>10.4f}  {auroc_str:>8}  {delta_str:>8}"
-                  f"  {fit_str:>8}  {pool_str:>8}  {eval_str:>8}")
-        print("=" * (col_w + 60))
+            val_str   = f"{_val:.4f}" if _val is not None else "-"
+            row = (f"  {stage_name:<{col_w}}  {acc:>10.4f}  {auroc_str:>8}  {delta_str:>8}"
+                   f"  {val_str:>8}  {fit_str:>8}  {pool_str:>8}  {eval_str:>8}")
+            if _best_text_val is not None and _val == _best_text_val:
+                print(f"\033[1;32m{row}\033[0m")
+            else:
+                print(row)
+        print("=" * _sep_w)
         print(f"  Total wall time: {total_time_s:.1f}s")
 
         _save_results(
@@ -1464,25 +1472,31 @@ def run_pal_experiment(
 
     # --- Summary table ---
     col_w = max(len(r[0]) for r in all_results) + 2
-    print("\n" + "=" * (col_w + 78))
+    _sep_w = col_w + 74
+    print("\n" + "=" * _sep_w)
     print("ITERATIVE REFINEMENT SUMMARY")
-    print("=" * (col_w + 70))
+    print("=" * _sep_w)
     print(f"  {'Stage':<{col_w}}  {'Test Acc':>10}  {'AUROC':>8}  {'Δ Acc':>8}  "
-          f"{'P(true)/train':>14}  {'P(true)/test':>13}  {'Fit(s)':>8}  {'Pool(s)':>8}  {'Eval(s)':>8}")
-    print("-" * (col_w + 78))
+          f"{'Val Acc':>8}  {'Fit(s)':>8}  {'Pool(s)':>8}  {'Eval(s)':>8}")
+    print("-" * _sep_w)
+    _img_val_accs = [r[8] for r in all_results if r[8] is not None]
+    _best_img_val = max(_img_val_accs) if _img_val_accs else None
     for stage_name, acc, auroc, mean_probs, refine_s, eval_s, fit_s, pool_s, _val in all_results:
         delta_str = "" if stage_name == "baseline" else f"{acc - baseline_acc:+.4f}"
         fit_str   = "-" if stage_name == "baseline" else f"{fit_s:.1f}"
         pool_str  = "-" if stage_name == "baseline" else f"{pool_s:.1f}"
         eval_str  = "-" if stage_name == "baseline" else f"{eval_s:.1f}"
         auroc_str = f"{auroc:.4f}" if not np.isnan(auroc) else "  N/A"
-        print(
+        val_str   = f"{_val:.4f}" if _val is not None else "-"
+        row = (
             f"  {stage_name:<{col_w}}  {acc:>10.4f}  {auroc_str:>8}  {delta_str:>8}"
-            f"  {mean_probs.get('train', float('nan')):>14.3f}"
-            f"  {mean_probs.get('test', float('nan')):>13.3f}"
-            f"  {fit_str:>8}  {pool_str:>8}  {eval_str:>8}"
+            f"  {val_str:>8}  {fit_str:>8}  {pool_str:>8}  {eval_str:>8}"
         )
-    print("=" * (col_w + 78))
+        if _best_img_val is not None and _val == _best_img_val:
+            print(f"\033[1;32m{row}\033[0m")
+        else:
+            print(row)
+    print("=" * _sep_w)
     print(f"  Total wall time: {total_time_s:.1f}s")
 
     _save_results(

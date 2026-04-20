@@ -37,7 +37,9 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
+import pandas as pd
 import torch
+from skrub import TableVectorizer
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score
 from tabicl import TabICLClassifier
@@ -109,6 +111,25 @@ def _concat_tabular(img_features: np.ndarray, tabular: np.ndarray) -> np.ndarray
     return np.concatenate([img_features, tabular.astype(np.float32)], axis=1)
 
 
+def _vectorize_tabular(
+    tab_train: np.ndarray,
+    tab_test: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a TableVectorizer on tab_train, transform both splits.
+
+    Handles missing values (NaN) and mixed types via skrub's TableVectorizer.
+    Returns (tab_train_out, tab_test_out) as float32 arrays.
+    """
+    col_names = [str(i) for i in range(tab_train.shape[1])]
+    df_train = pd.DataFrame(tab_train, columns=col_names)
+    df_test  = pd.DataFrame(tab_test,  columns=col_names)
+    tv = TableVectorizer()
+    tab_train_out = np.nan_to_num(tv.fit_transform(df_train).astype(np.float32))
+    tab_test_out  = np.nan_to_num(tv.transform(df_test).astype(np.float32))
+    print(f"[TableVectorizer] {tab_train.shape[1]} → {tab_train_out.shape[1]} features")
+    return tab_train_out, tab_test_out
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -151,7 +172,6 @@ def _load_dataset(
         n_train=max_train,
         n_test=max_test,
         n_val=None,
-        train_val_fraction=None,
         n_sample=0,
         balance_train=False,
         balance_test=False,
@@ -165,6 +185,10 @@ def _load_dataset(
 
     tab_train = extra_data["tab_train"]
     tab_test  = extra_data["tab_test"]
+
+    tab_train, tab_test = _vectorize_tabular(tab_train, tab_test)
+    extra_data["tab_train"] = tab_train
+    extra_data["tab_test"]  = tab_test
 
     # Optional post-hoc n_train subsampling (separate from max_train loading limit).
     if n_train is not None and n_train < len(train_labels):
@@ -352,6 +376,7 @@ def _run_single_seed(
             prior=args.prior,
             model_selection=args.model_selection,
             length_importance_weight_basis=args.length_importance_weight_basis,
+            train_val_fraction=args.train_val_fraction,
         )
 
         # ── Fit text PAL pooler (no tabular context) ──────────────────────────
@@ -417,6 +442,7 @@ def _run_single_seed(
             use_attn_masking=args.use_attn_masking,
             prior=args.prior,
             model_selection=args.model_selection,
+            train_val_fraction=args.train_val_fraction,
         )
 
         pooler = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
@@ -531,8 +557,9 @@ def _run_single_seed(
             "ridge_alpha":        args.ridge_alpha,
             "weight_method":      args.weight_method,
             "text_weight_method": args.text_weight_method or args.weight_method,
-            "image_context_text": args.image_context_text,
-            "seed":               seed,
+            "image_context_text":   args.image_context_text,
+            "train_val_fraction":   args.train_val_fraction,
+            "seed":                 seed,
         },
         "dataset_info": {
             "n_train":   int(N_train),
@@ -676,6 +703,12 @@ def _parse_args() -> argparse.Namespace:
                         "'last_iteration' (default) always uses the final stage. "
                         "'masked_train_accuracy' evaluates every stage on the training set "
                         "with a diagonal attention mask and selects the best-performing one.")
+    p.add_argument("--length-importance-weight-basis", type=str, default="none",
+                   choices=["none", "full_length", "full_length_clip", "sampled_count"],
+                   help="Basis for weighting tokens by sequence length in text PAL pooler (default: none)")
+    p.add_argument("--train-val-fraction", type=float, default=None,
+                   help="Fraction of training data held out as validation inside each PAL pooler "
+                        "stage (e.g. 0.2). If None (default) no internal split is performed.")
     p.add_argument("--image-context-text", action="store_true",
                    help="When fitting image PAL pooler with context, include text+tabular features "
                         "(only for datasets with text support, e.g., petfinder)")

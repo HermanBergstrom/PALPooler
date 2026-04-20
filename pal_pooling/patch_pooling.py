@@ -5,6 +5,7 @@ Functions here are pure NumPy/sklearn — no I/O, no visualisation.
 
 from __future__ import annotations
 
+import copy
 import math
 import time
 from typing import Optional, Union
@@ -1162,3 +1163,218 @@ def refine_dataset_features(
           f"total={fit_time_s + pool_time_s:.1f}s")
 
     return refined, new_pca, weights_ridge, ridge_model, feature_scaler, clf, fit_time_s, pool_time_s, class_prior
+
+
+# ---------------------------------------------------------------------------
+# Cross-validation helpers (used by IterativePALPooler CV path)
+# ---------------------------------------------------------------------------
+
+def collect_pseudo_labels_image(
+    query_grouped: np.ndarray,                         # [N_q, P', D] already grouped
+    query_labels: np.ndarray,                          # [N_q]
+    train_labels: np.ndarray,                          # [N_tr] — for empirical prior
+    support_features: np.ndarray,                      # [N_tr, d] — PCA-projected support
+    pca: Optional[PCA],                                # to project query features for TabICL
+    tabicl: "TabICLClassifier",
+    refinement_cfg: RefinementConfig,
+    tabular_probs: Optional[np.ndarray] = None,        # [N_q, n_cls] for query set
+    query_context_features: Optional[np.ndarray] = None,   # [N_q, D_ctx]
+    train_context_features: Optional[np.ndarray] = None,   # [N_tr, D_ctx]
+    seed: int = 42,
+) -> tuple:
+    """Collect (patch_features, quality_logit) pairs for one CV fold (image path).
+
+    Fits TabICL on the fold's 75% support and forwards the 25% query patches
+    to produce quality-logit targets for downstream Ridge fitting.
+
+    Returns
+    -------
+    X_flat : np.ndarray [N_q * P', D]  — flat query patch features (Ridge inputs)
+    y_flat : np.ndarray [N_q * P']     — quality logit targets (Ridge outputs)
+    """
+    query_grouped = np.asarray(query_grouped, dtype=np.float32)
+    N_q, P, D = query_grouped.shape
+
+    n_cls = int(train_labels.max()) + 1
+    counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls)
+    empirical_prior = (counts / counts.sum()).astype(np.float32)
+
+    _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd")
+    class_prior: Optional[np.ndarray] = (
+        empirical_prior if refinement_cfg.weight_method in _divergence_methods else None
+    )
+
+    # Fit TabICL on this fold's support (optionally context-augmented).
+    support_for_clf = support_features
+    if train_context_features is not None:
+        support_for_clf = np.concatenate(
+            [support_features, train_context_features.astype(np.float32)], axis=1
+        )
+    clf = copy.deepcopy(tabicl)
+    clf.fit(support_for_clf, train_labels)
+
+    use_gpu = isinstance(clf, TabICLGPUAdapter)
+    _binary_dist = getattr(refinement_cfg, "binary_dist", False)
+
+    # Flatten: [N_q * P', D]
+    X_flat = query_grouped.reshape(N_q * P, D).astype(np.float32)
+
+    # Project via PCA + optional context for TabICL query features.
+    query_features = pca.transform(X_flat) if pca is not None else X_flat
+    if query_context_features is not None:
+        ctx_rep = np.repeat(query_context_features.astype(np.float32), P, axis=0)
+        query_features = np.concatenate([query_features, ctx_rep], axis=1)
+
+    # Repeat tabular probs to align with flat patch layout.
+    active_tab: Optional[np.ndarray] = (
+        np.repeat(tabular_probs.astype(np.float32), P, axis=0)
+        if tabular_probs is not None else None
+    )
+
+    n_cls_expected = n_cls
+
+    if use_gpu:
+        import torch as _torch
+        _dev = clf.device_
+        class_prior_t = (
+            _torch.from_numpy(class_prior).to(_dev) if class_prior is not None else None
+        )
+        probs_t = clf.predict_proba_tensor(query_features, blocked_indices=None)
+        if probs_t.shape[1] != n_cls_expected:
+            cls_t = _torch.tensor(clf.classes_, device=probs_t.device, dtype=_torch.long)
+            full_t = _torch.zeros(
+                (probs_t.shape[0], n_cls_expected), dtype=probs_t.dtype, device=probs_t.device
+            )
+            full_t[:, cls_t] = probs_t
+            probs_t = full_t
+
+        # current_pool_marginal: run support through clf with diagonal masking.
+        if refinement_cfg.prior == "current_pool_marginal" and class_prior_t is not None:
+            N_tr = len(support_features)
+            blocked_diag = _torch.arange(N_tr, device=_dev, dtype=_torch.long)
+            sup_proj = _torch.from_numpy(support_for_clf.astype(np.float32)).to(_dev)
+            marg_t = clf.predict_proba_tensor(sup_proj, blocked_indices=blocked_diag)
+            if marg_t.shape[1] != n_cls_expected:
+                cls_t2 = _torch.tensor(clf.classes_, device=_dev, dtype=_torch.long)
+                full_m = _torch.zeros((N_tr, n_cls_expected), dtype=marg_t.dtype, device=_dev)
+                full_m[:, cls_t2] = marg_t
+                marg_t = full_m
+            class_prior_t = marg_t.mean(dim=0)
+        elif refinement_cfg.prior == "token_marginal" and class_prior_t is not None:
+            class_prior_t = probs_t.mean(dim=0)
+
+        active_tab_t = (
+            _torch.from_numpy(active_tab).to(_dev) if active_tab is not None else None
+        )
+
+        y_flat_t = _torch.empty(N_q * P, dtype=_torch.float32, device=_dev)
+        for i in range(N_q):
+            s, e = i * P, (i + 1) * P
+            prior_i = active_tab_t[s] if active_tab_t is not None else class_prior_t
+            y_flat_t[s:e] = compute_patch_quality_logits_gpu(
+                probs_t[s:e], int(query_labels[i]),
+                refinement_cfg.temperature, refinement_cfg.weight_method,
+                prior_i, binary_dist=_binary_dist,
+            )
+        y_flat = y_flat_t.cpu().numpy()
+    else:
+        probs = clf.predict_proba(query_features, blocked_indices=None)
+        if probs.shape[1] != n_cls_expected:
+            full = np.zeros((probs.shape[0], n_cls_expected), dtype=probs.dtype)
+            full[:, clf.classes_] = probs
+            probs = full
+
+        if refinement_cfg.prior == "current_pool_marginal" and class_prior is not None:
+            N_tr = len(support_features)
+            blocked_diag = np.arange(N_tr)
+            marg = clf.predict_proba(support_for_clf, blocked_indices=blocked_diag)
+            if marg.shape[1] != n_cls_expected:
+                full_m = np.zeros((N_tr, n_cls_expected), dtype=marg.dtype)
+                full_m[:, clf.classes_] = marg
+                marg = full_m
+            class_prior = marg.mean(axis=0).astype(np.float32)
+        elif refinement_cfg.prior == "token_marginal" and class_prior is not None:
+            class_prior = probs.mean(axis=0).astype(np.float32)
+
+        y_flat = np.empty(N_q * P, dtype=np.float32)
+        for i in range(N_q):
+            s, e = i * P, (i + 1) * P
+            prior_i = active_tab[s] if active_tab is not None else class_prior
+            y_flat[s:e] = compute_patch_quality_logits(
+                probs[s:e], int(query_labels[i]),
+                refinement_cfg.temperature, refinement_cfg.weight_method,
+                prior_i, binary_dist=_binary_dist,
+            )
+
+    return X_flat, y_flat
+
+
+def fit_ridge_repool_image(
+    X_flat: np.ndarray,                # [M, D] accumulated flat patch features from all folds
+    y_flat: np.ndarray,                # [M] quality logit targets
+    all_patches_grouped: np.ndarray,   # [N, P', D] all N training grouped patches
+    pca: Optional[PCA],
+    refinement_cfg: RefinementConfig,
+    seed: int = 42,
+    gpu_ridge_device: str = "cuda",
+) -> tuple:
+    """Fit Ridge from CV pseudo-labels and repool all N training patches.
+
+    Called once after accumulating pseudo-labels from all 4 CV folds.
+
+    Returns
+    -------
+    (refined, new_pca, weights_ridge, ridge_model, feature_scaler, fit_time_s, pool_time_s)
+    """
+    import time as _time
+    t_start = _time.perf_counter()
+    N, P, D = all_patches_grouped.shape
+
+    fit_X = X_flat.astype(np.float32)
+    fit_y = y_flat
+    if not isinstance(fit_y, np.ndarray):
+        try:
+            fit_y = fit_y.cpu().numpy()
+        except Exception:
+            fit_y = np.asarray(fit_y, dtype=np.float32)
+    fit_y = fit_y.astype(np.float32)
+
+    feature_scaler: Optional[StandardScaler] = None
+    if refinement_cfg.normalize_features:
+        feature_scaler = StandardScaler()
+        fit_X = feature_scaler.fit_transform(fit_X)
+
+    backend = "GPU" if gpu_ridge_device else "CPU"
+    print(
+        f"[cv_ridge_image] Fitting Ridge(alpha={refinement_cfg.ridge_alpha}) on "
+        f"{len(fit_X):,} accumulated samples (D={D}, backend={backend}) ..."
+    )
+    if gpu_ridge_device:
+        ridge_model: Union[Ridge, "RidgeGPU"] = RidgeGPU(
+            alpha=refinement_cfg.ridge_alpha, device=gpu_ridge_device
+        )
+    else:
+        ridge_model = Ridge(alpha=refinement_cfg.ridge_alpha)
+    ridge_model.fit(fit_X, fit_y)
+    print(f"[cv_ridge_image] Train R²: {ridge_model.score(fit_X, fit_y):.4f}")
+
+    t_fit_done = _time.perf_counter()
+    fit_time_s = t_fit_done - t_start
+
+    print("[cv_ridge_image] Pooling all training samples with Ridge weights ...")
+    weights_ridge = _ridge_pool_weights(all_patches_grouped, ridge_model, feature_scaler)
+    repooled_raw = (weights_ridge[:, :, None] * all_patches_grouped).sum(axis=1).astype(np.float32)
+
+    if pca is not None:
+        new_pca = PCA(n_components=pca.n_components_, random_state=seed)
+        refined = new_pca.fit_transform(repooled_raw).astype(np.float32)
+    else:
+        refined = repooled_raw
+        new_pca = None
+
+    pool_time_s = _time.perf_counter() - t_fit_done
+    print(
+        f"[cv_ridge_image] fit={fit_time_s:.1f}s  pool={pool_time_s:.1f}s  "
+        f"total={fit_time_s + pool_time_s:.1f}s"
+    )
+    return refined, new_pca, weights_ridge, ridge_model, feature_scaler, fit_time_s, pool_time_s

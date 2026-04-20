@@ -87,6 +87,7 @@ class RefinementConfig:
     model_selection: str = "last_iteration"
     binary_dist: bool = False
     train_val_fraction: Optional[float] = None
+    cross_validation_cap: Optional[int] = None  # use 4-fold CV when N ≤ this value
 
 @dataclass
 class TextRefinementConfig:
@@ -132,6 +133,7 @@ class TextRefinementConfig:
     length_importance_weight_basis: str = "none"
     length_importance_floor: int = 25  # floor for full_length_clip
     train_val_fraction: Optional[float] = None   # if set, split internally per stage instead of in the experiment script
+    cross_validation_cap: Optional[int] = None   # use 4-fold CV when N ≤ this value
 
 
 @dataclass
@@ -194,6 +196,10 @@ def parse_args() -> ExperimentConfig:
                    help="Limit the val set to this many validation images (random subsample, only DVM)")
     p.add_argument("--train-val-fraction", type=float, default=None,
                    help="Fraction of the training set to hold out as a validation set for Ridge fitting (e.g. 0.2)")
+    p.add_argument("--cross-validation-cap", type=int, default=None,
+                   help="When the training set size N is at or below this cap, use 4-fold cross-validation "
+                        "for Ridge pseudo-label collection instead of the standard single split. "
+                        "Overrides --train-val-fraction when N ≤ cap (e.g. 2000).")
     p.add_argument("--n-estimators",  type=int,   default=1)
     p.add_argument("--pca-dim",       type=int,   default=128)
     p.add_argument("--no-pca",        action="store_true",
@@ -386,6 +392,7 @@ def parse_args() -> ExperimentConfig:
             length_importance_weight_basis=args.length_importance_weight_basis,
             length_importance_floor=args.length_importance_floor,
             train_val_fraction=args.train_val_fraction,
+            cross_validation_cap=args.cross_validation_cap,
         )
     else:
         refinement_cfg = RefinementConfig(
@@ -411,8 +418,9 @@ def parse_args() -> ExperimentConfig:
             model_selection=args.model_selection,
             binary_dist=args.binary_dist,
             train_val_fraction=args.train_val_fraction,
+            cross_validation_cap=args.cross_validation_cap,
         )
-    
+
     attention_cfg = AttentionPoolConfig(
         attn_pool=args.attn_pool or args.attn_pool_only,
         attn_pool_only=args.attn_pool_only,
