@@ -243,6 +243,7 @@ def refine_text_features(
     val_tokens:         Optional[np.ndarray] = None,  # [N_val, T_max, D]
     val_token_ids:      Optional[np.ndarray] = None,  # [N_val, T_max]
     val_labels:         Optional[np.ndarray] = None,  # [N_val]
+    val_tabular_probs:  Optional[np.ndarray] = None,  # [N_val, n_classes]
 ) -> tuple:
     """Refine mean-pooled text support features with Ridge-predicted quality-weighted pooling.
 
@@ -326,15 +327,17 @@ def refine_text_features(
             sep_token_id=refinement_cfg.sep_token_id,
             cls_token_id=refinement_cfg.cls_token_id,
         )
-        source_grouped    = val_grouped
-        source_group_mask = val_group_mask
-        source_labels     = val_labels
-        _apply_attn_mask  = False
+        source_grouped       = val_grouped
+        source_group_mask    = val_group_mask
+        source_labels        = val_labels
+        source_tabular_probs = val_tabular_probs
+        _apply_attn_mask     = False
     else:
-        source_grouped    = grouped
-        source_group_mask = group_mask
-        source_labels     = train_labels
-        _apply_attn_mask  = refinement_cfg.use_attn_masking
+        source_grouped       = grouped
+        source_group_mask    = group_mask
+        source_labels        = train_labels
+        source_tabular_probs = tabular_probs
+        _apply_attn_mask     = refinement_cfg.use_attn_masking
 
     # Precompute empirical class prior.
     n_cls = int(train_labels.max()) + 1
@@ -485,9 +488,9 @@ def refine_text_features(
         # Build targets
         all_targets_t = _torch.empty(len(fit_features), dtype=_torch.float32, device=_dev)
         # Per-valid-group tabular prior slicing
-        if tabular_probs is not None:
+        if source_tabular_probs is not None:
             active_tab_t = _torch.from_numpy(
-                tabular_probs[fit_sample_idx].astype(np.float32)
+                source_tabular_probs[fit_sample_idx].astype(np.float32)
             ).to(_dev)
         else:
             active_tab_t = None
@@ -530,8 +533,8 @@ def refine_text_features(
             class_prior = mean_probs
 
         all_targets = np.empty(len(fit_features), dtype=np.float32)
-        if tabular_probs is not None:
-            active_tab = tabular_probs[fit_sample_idx].astype(np.float32)
+        if source_tabular_probs is not None:
+            active_tab = source_tabular_probs[fit_sample_idx].astype(np.float32)
         else:
             active_tab = None
 

@@ -572,9 +572,10 @@ class TextPALPooler(PALPooler):
         initial_pca: Optional[PCA] = None,
         context_features: Optional[np.ndarray] = None,
         tabular_probs: Optional[np.ndarray] = None,
-        val_tokens: Optional[np.ndarray] = None,     # [N_val, T_max, D]
-        val_token_ids: Optional[np.ndarray] = None,  # [N_val, T_max]
-        val_labels: Optional[np.ndarray] = None,     # [N_val]
+        val_tokens: Optional[np.ndarray] = None,        # [N_val, T_max, D]
+        val_token_ids: Optional[np.ndarray] = None,     # [N_val, T_max]
+        val_labels: Optional[np.ndarray] = None,        # [N_val]
+        val_tabular_probs: Optional[np.ndarray] = None, # [N_val, n_classes]
     ) -> "TextPALPooler":
         """Fit the Ridge quality model on BERT token embeddings.
 
@@ -661,6 +662,7 @@ class TextPALPooler(PALPooler):
             val_tokens=val_tokens,
             val_token_ids=val_token_ids,
             val_labels=val_labels,
+            val_tabular_probs=val_tabular_probs,
         )
 
         # Re-pool in original D-space for raw support (same as image path).
@@ -692,6 +694,7 @@ class TextPALPooler(PALPooler):
         _val_tokens    = data[vl]       if (vl is not None) else None
         _val_token_ids = token_ids[vl]  if (token_ids is not None and vl is not None) else None
         _val_labels    = labels[vl]     if (vl is not None) else None
+        _val_tab = tabular_probs[vl] if (tabular_probs is not None and vl is not None) else None
         self.fit(
             data[tr] if tr is not None else data,
             token_ids[tr] if (token_ids is not None and tr is not None) else token_ids,
@@ -701,6 +704,7 @@ class TextPALPooler(PALPooler):
             initial_support=_sup, initial_pca=init_pca,
             context_features=_ctx, tabular_probs=_tab,
             val_tokens=_val_tokens, val_token_ids=_val_token_ids, val_labels=_val_labels,
+            val_tabular_probs=_val_tab,
         )
 
     def _transform_subset(self, data, idx, cls_tokens, token_ids=None, attention_mask=None):
@@ -1224,6 +1228,53 @@ class IterativePALPooler:
 
         return tabular_probs, val_tabular_probs
 
+    def _compute_split_tabular_probs(
+        self,
+        context_features: np.ndarray,
+        labels: np.ndarray,
+        train_idx: np.ndarray,
+        val_idx: np.ndarray,
+        N: int,
+    ) -> np.ndarray:
+        """Compute tabular probs per split: train as support, all N samples as queries.
+
+        The TabICL classifier is fit only on the train fold.  Train-fold probs
+        are computed with optional attention masking (self-query suppression);
+        val-fold probs are computed out-of-support (no masking needed).
+
+        Returns a full-N array so downstream _fit_from_indices can slice by
+        train_idx / val_idx without any interface changes.
+        """
+        print("[IterativePALPooler] Computing per-split P(Y|X_tab): train support, out-of-support val queries ...")
+        _clf = TabICLClassifier(
+            n_estimators=self.refinement_cfg.tabicl_n_estimators,
+            random_state=self.seed,
+        )
+        train_ctx = context_features[train_idx].astype(np.float32)
+        _clf.fit(train_ctx, labels[train_idx])
+
+        n_cls = int(labels.max()) + 1
+        stage_tab = np.zeros((N, n_cls), dtype=np.float32)
+
+        N_train = len(train_idx)
+        _mask = np.eye(N_train, dtype=bool) if self.refinement_cfg.use_attn_masking else None
+        raw_train = _clf.predict_proba(train_ctx, attn_mask=_mask).astype(np.float32)
+        if raw_train.shape[1] != n_cls:
+            tmp = np.zeros((N_train, n_cls), dtype=np.float32)
+            tmp[:, _clf.classes_] = raw_train
+            raw_train = tmp
+        stage_tab[train_idx] = raw_train
+
+        val_ctx = context_features[val_idx].astype(np.float32)
+        raw_val = _clf.predict_proba(val_ctx).astype(np.float32)
+        if raw_val.shape[1] != n_cls:
+            tmp = np.zeros((len(val_idx), n_cls), dtype=np.float32)
+            tmp[:, _clf.classes_] = raw_val
+            raw_val = tmp
+        stage_tab[val_idx] = raw_val
+
+        return stage_tab
+
     # ------------------------------------------------------------------
     # Internal: shared fit loop
     # ------------------------------------------------------------------
@@ -1314,33 +1365,7 @@ class IterativePALPooler:
         labels = np.asarray(labels)
         N, _, D = data.shape
 
-        val_tabular_probs = None
-        if is_image:
-            if cls_tokens is not None:
-                _cls = np.asarray(cls_tokens, dtype=np.float32)
-                support_raw = np.concatenate([data, _cls[:, None, :]], axis=1).mean(axis=1)
-            else:
-                support_raw = data.mean(axis=1)
-            tabular_probs, val_tabular_probs = self._maybe_compute_tabular_probs(
-                context_features, labels, provided_tabular_probs=tabular_probs
-            )
-        else:
-            token_ids = np.asarray(token_ids)
-            _valid = (token_ids != 0) & (token_ids != self.refinement_cfg.cls_token_id)
-            valid_counts = _valid.sum(axis=1, keepdims=True).clip(min=1)
-            support_raw = ((data * _valid[:, :, None]).sum(axis=1) / valid_counts).astype(np.float32)
-            if self.refinement_cfg.append_cls and cls_tokens is not None:
-                _cls = np.asarray(cls_tokens, dtype=np.float32)
-                support_raw = np.concatenate([support_raw[:, None, :], _cls[:, None, :]], axis=1).mean(axis=1)
-            
-            tabular_probs, _ = self._maybe_compute_tabular_probs(
-                context_features, labels, provided_tabular_probs=tabular_probs
-            )
-        
-        initial_support, initial_pca = self._init_pca(support_raw, N, D)
-
-        # Optionally split data per stage so each iteration uses a fresh independent
-        # validation fold for both image and text modalities.
+        # Compute splits first so we know whether to use per-stage tabular probs.
         tvf = getattr(self.refinement_cfg, "train_val_fraction", None)
         splits: Optional[list] = None
         if tvf is not None and tvf > 0.0:
@@ -1352,6 +1377,43 @@ class IterativePALPooler:
                 splits.append((_perm[_n_val:], _perm[:_n_val]))  # (train_idx, val_idx)
             print(f"[IterativePALPooler] train_val_fraction={tvf}: "
                   f"{int(N*tvf)} val / {N - int(N*tvf)} train per stage (fresh split each stage)")
+
+        # When splits are present and tabular probs are not user-supplied, compute them
+        # per-stage inside fit_stage (train as support, val out-of-support).
+        # Otherwise, compute once on the full dataset now.
+        _needs_per_stage_tab = (
+            splits is not None
+            and tabular_probs is None
+            and context_features is not None
+            and self.refinement_cfg.weight_method in ("kl_div", "wasserstein", "js_div", "tvd")
+            and not getattr(self.refinement_cfg, "use_global_prior", False)
+        )
+
+        val_tabular_probs = None
+        if is_image:
+            if cls_tokens is not None:
+                _cls = np.asarray(cls_tokens, dtype=np.float32)
+                support_raw = np.concatenate([data, _cls[:, None, :]], axis=1).mean(axis=1)
+            else:
+                support_raw = data.mean(axis=1)
+            if not _needs_per_stage_tab:
+                tabular_probs, val_tabular_probs = self._maybe_compute_tabular_probs(
+                    context_features, labels, provided_tabular_probs=tabular_probs
+                )
+        else:
+            token_ids = np.asarray(token_ids)
+            _valid = (token_ids != 0) & (token_ids != self.refinement_cfg.cls_token_id)
+            valid_counts = _valid.sum(axis=1, keepdims=True).clip(min=1)
+            support_raw = ((data * _valid[:, :, None]).sum(axis=1) / valid_counts).astype(np.float32)
+            if self.refinement_cfg.append_cls and cls_tokens is not None:
+                _cls = np.asarray(cls_tokens, dtype=np.float32)
+                support_raw = np.concatenate([support_raw[:, None, :], _cls[:, None, :]], axis=1).mean(axis=1)
+            if not _needs_per_stage_tab:
+                tabular_probs, _ = self._maybe_compute_tabular_probs(
+                    context_features, labels, provided_tabular_probs=tabular_probs
+                )
+
+        initial_support, initial_pca = self._init_pca(support_raw, N, D)
 
         _stage_val_accs: List[Optional[float]] = []
 
@@ -1372,9 +1434,13 @@ class IterativePALPooler:
 
         def fit_stage(stage, init_sup, init_pca, k):
             train_idx, val_idx = splits[k] if splits is not None else (None, None)
+            stage_tab = (
+                self._compute_split_tabular_probs(context_features, labels, train_idx, val_idx, N)
+                if _needs_per_stage_tab else tabular_probs
+            )
             stage._fit_from_indices(
                 data, labels, cls_tokens, init_sup, init_pca,
-                context_features, tabular_probs, val_tabular_probs=None,
+                context_features, stage_tab, val_tabular_probs=None,
                 train_idx=train_idx, val_idx=val_idx,
                 token_ids=token_ids, attention_mask=attention_mask,
             )

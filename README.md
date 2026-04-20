@@ -179,6 +179,40 @@ Controls which stage is used at inference after iterative refinement:
 
 ---
 
+## Train/validation split (`--train-val-fraction`)
+
+When `--train-val-fraction F` (e.g. `0.2`) is set, `IterativePALPooler` applies the following
+logic **at every stage independently**:
+
+1. **Split**: the training set is randomly partitioned into a train fold (`1-F`) and a val fold (`F`).  
+   A fresh permutation is drawn per stage (seed offset by stage index).
+
+2. **Support**: the TabICL scorer is fitted *only* on the train fold's (current) pooled features.
+
+3. **Ridge query source**: the val fold's patch groups (or token groups) are forwarded through TabICL
+   as queries.  Only these out-of-support pseudo-labels are used as Ridge regression targets.  
+   The train fold is never queried during Ridge fitting.
+
+4. **Post-fit evaluation**: after fitting Ridge, the val fold is pooled with the new pooler and
+   evaluated (train as support, val as query).  The per-stage val accuracy and AUROC are printed
+   and stored in `stage_val_accuracies_`.
+
+5. **Full-N support reconstruction**: val-fold projections are merged back with train-fold projections
+   so the next stage starts from a complete N-sample support.
+
+6. **Tabular/contextual features** (divergence weight methods only): when `--weight-method` is
+   `kl_div`, `wasserstein`, `js_div`, or `tvd` and contextual features are available,
+   `P(Y | X_tab)` is computed **per stage** after splitting.  The TabICL tabular classifier is fit
+   on the train fold only; train-fold probs use optional attention masking, while val-fold probs are
+   computed out-of-support (no masking).  If the user provides `--tabular-probs` externally those
+   are used as-is (no per-stage recomputation).
+
+This is identical for both the image and text pipelines.  The split is applied to all arrays
+(patches/tokens, token IDs, attention masks, CLS tokens, context features, tabular probs) before
+any fitting call.
+
+---
+
 ## CLI reference
 
 ```

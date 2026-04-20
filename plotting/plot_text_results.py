@@ -42,9 +42,9 @@ DATASET_LABELS: dict[str, str] = {
 
 # (variant_suffix, display_label, bar_color, hatch)
 VARIANTS: list[tuple[str, str, str, str]] = [
-    ("no_liw_no_tvf", "PAL",               "#55a868", ""),
-    ("liw_no_tvf",    "PAL\n+LIW",          "#55a868", "///"),
-    ("no_liw_tvf",    "PAL\n+TVF",          "#8172b2", ""),
+    ("noliw_notvf", "PAL",               "#55a868", ""),
+    ("liw_notvf",    "PAL\n+LIW",          "#55a868", "///"),
+    ("noliw_tvf",    "PAL\n+TVF",          "#8172b2", ""),
     ("liw_tvf",       "PAL\n+LIW\n+TVF",   "#8172b2", "///"),
 ]
 
