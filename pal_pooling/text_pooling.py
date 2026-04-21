@@ -39,6 +39,42 @@ from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
+# Safe TabICL wrapper for compatibility
+# ---------------------------------------------------------------------------
+
+def _safe_predict_proba(clf, X, blocked_indices=None):
+    """Call predict_proba with optional blocked_indices for leave-one-out masking.
+
+    Falls back to standard predict_proba if blocked_indices is not supported.
+    """
+    if blocked_indices is None:
+        return clf.predict_proba(X)
+
+    try:
+        return clf.predict_proba(X, blocked_indices=blocked_indices)
+    except TypeError as e:
+        if 'blocked_indices' in str(e):
+            return clf.predict_proba(X)
+        raise
+
+
+def _safe_predict_proba_tensor(clf, X_t, blocked_indices=None):
+    """Call predict_proba_tensor with optional blocked_indices for leave-one-out masking.
+
+    Falls back to standard predict_proba_tensor if blocked_indices is not supported.
+    """
+    if blocked_indices is None:
+        return clf.predict_proba_tensor(X_t)
+
+    try:
+        return clf.predict_proba_tensor(X_t, blocked_indices=blocked_indices)
+    except TypeError as e:
+        if 'blocked_indices' in str(e):
+            return clf.predict_proba_tensor(X_t)
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Text token grouping
 # ---------------------------------------------------------------------------
 
@@ -245,6 +281,7 @@ def refine_text_features(
     val_token_ids:      Optional[np.ndarray] = None,  # [N_val, T_max]
     val_labels:         Optional[np.ndarray] = None,  # [N_val]
     val_tabular_probs:  Optional[np.ndarray] = None,  # [N_val, n_classes]
+    verbose:            bool = True,
 ) -> tuple:
     """Refine mean-pooled text support features with Ridge-predicted quality-weighted pooling.
 
@@ -355,14 +392,14 @@ def refine_text_features(
     # attend to its own support row). This gives a sequence-level marginal that reflects
     # the actual discriminability of the pooled representation at this stage.
     if refinement_cfg.prior == "current_pool_marginal" and refinement_cfg.weight_method in _divergence_methods:
-        print("[calibration] Computing current_pool_marginal prior from current pooled features ...")
+        if verbose: print("[calibration] Computing current_pool_marginal prior from current pooled features ...")
         N_supp = len(support_for_clf)
         n_cls_prior = int(train_labels.max()) + 1
         blocked_diag_np = np.arange(N_supp)
         if hasattr(clf, "predict_proba_tensor"):
             import torch as _torch
             blocked_diag_t = _torch.from_numpy(blocked_diag_np).long()
-            probs_supp_t = clf.predict_proba_tensor(support_for_clf, blocked_indices=blocked_diag_t)
+            probs_supp_t = _safe_predict_proba_tensor(clf, support_for_clf, blocked_indices=blocked_diag_t)
             if probs_supp_t.shape[1] != n_cls_prior:
                 cls_t = _torch.tensor(clf.classes_, device=probs_supp_t.device, dtype=_torch.long)
                 full_t = _torch.zeros((N_supp, n_cls_prior), dtype=probs_supp_t.dtype, device=probs_supp_t.device)
@@ -370,13 +407,13 @@ def refine_text_features(
                 probs_supp_t = full_t
             class_prior = probs_supp_t.mean(dim=0).cpu().numpy().astype(np.float32)
         else:
-            probs_supp = clf.predict_proba(support_for_clf, blocked_indices=blocked_diag_np)
+            probs_supp = _safe_predict_proba(clf, support_for_clf, blocked_indices=blocked_diag_np)
             if probs_supp.shape[1] != n_cls_prior:
                 full = np.zeros((N_supp, n_cls_prior), dtype=probs_supp.dtype)
                 full[:, clf.classes_] = probs_supp
                 probs_supp = full
             class_prior = probs_supp.mean(axis=0).astype(np.float32)
-        print(f"[calibration] current_pool_marginal prior: {np.round(class_prior, 4)}")
+        if verbose: print(f"[calibration] current_pool_marginal prior: {np.round(class_prior, 4)}")
 
     # Fit the shared TabICL classifier on the (possibly context-augmented) support.
     if tabicl is not None:
@@ -433,7 +470,7 @@ def refine_text_features(
     )
     if exceeded and refinement_cfg.use_random_subsampling:
         n_fwd = refinement_cfg.max_query_rows
-        print(f"[text_sampling] Subsampling {n_fwd:,} / {n_valid:,} valid group rows "
+        if verbose: print(f"[text_sampling] Subsampling {n_fwd:,} / {n_valid:,} valid group rows "
               f"({100 * n_fwd / n_valid:.1f}%) for Ridge fitting")
         rng = np.random.RandomState(seed)
         sel  = np.sort(rng.choice(n_valid, size=n_fwd, replace=False))
@@ -468,7 +505,7 @@ def refine_text_features(
         _fit_blocked_t = (
             _torch.from_numpy(fit_blocked).long() if fit_blocked is not None else None
         )
-        probs_flat_t = clf.predict_proba_tensor(fit_qfeatures, blocked_indices=_fit_blocked_t)
+        probs_flat_t = _safe_predict_proba_tensor(clf, fit_qfeatures, blocked_indices=_fit_blocked_t)
         if probs_flat_t.shape[1] != n_cls_expected:
             cls_t  = _torch.tensor(clf.classes_, device=probs_flat_t.device, dtype=_torch.long)
             full_t = _torch.zeros(
@@ -480,9 +517,9 @@ def refine_text_features(
 
         # Compute token_marginal from GPU probs
         if _compute_token_marginal:
-            print("[calibration] Empirical label prior:    {0}".format(np.round(empirical_prior, 4)))
+            if verbose: print("[calibration] Empirical label prior:    {0}".format(np.round(empirical_prior, 4)))
             mean_probs = probs_flat_t.mean(dim=0).cpu().numpy().astype(np.float32)
-            print("[calibration] Marginal token predicted: {0}".format(np.round(mean_probs, 4)))
+            if verbose: print("[calibration] Marginal token predicted: {0}".format(np.round(mean_probs, 4)))
             class_prior = mean_probs
             class_prior_t = _torch.from_numpy(class_prior).to(_dev)
 
@@ -520,7 +557,7 @@ def refine_text_features(
         all_targets = all_targets_t
     else:
         _fit_blocked = fit_blocked
-        probs_flat = clf.predict_proba(fit_qfeatures, blocked_indices=_fit_blocked)
+        probs_flat = _safe_predict_proba(clf, fit_qfeatures, blocked_indices=_fit_blocked)
         if probs_flat.shape[1] != n_cls_expected:
             full = np.zeros((probs_flat.shape[0], n_cls_expected), dtype=probs_flat.dtype)
             full[:, clf.classes_] = probs_flat
@@ -528,9 +565,9 @@ def refine_text_features(
 
         # Compute token_marginal from CPU probs
         if _compute_token_marginal:
-            print("[calibration] Empirical label prior:    {0}".format(np.round(empirical_prior, 4)))
+            if verbose: print("[calibration] Empirical label prior:    {0}".format(np.round(empirical_prior, 4)))
             mean_probs = probs_flat.mean(axis=0).astype(np.float32)
-            print("[calibration] Marginal token predicted: {0}".format(np.round(mean_probs, 4)))
+            if verbose: print("[calibration] Marginal token predicted: {0}".format(np.round(mean_probs, 4)))
             class_prior = mean_probs
 
         all_targets = np.empty(len(fit_features), dtype=np.float32)
@@ -568,7 +605,7 @@ def refine_text_features(
         raw_w = 1.0 / np.sqrt(seq_lengths[fit_sample_idx])              # [n_fit]
         n_fit = len(fit_sample_idx)
         ridge_sample_weight = raw_w * (n_fit / raw_w.sum())
-        print(f"[text_ridge] Length importance weights (basis=full_length) "
+        if verbose: print(f"[text_ridge] Length importance weights (basis=full_length) "
               f"(min={ridge_sample_weight.min():.3f}, max={ridge_sample_weight.max():.3f})")
     elif _iw_basis == "full_length_clip":
         # 1/sqrt(max(L_full, floor)): same as full_length but clips the denominator
@@ -579,7 +616,7 @@ def refine_text_features(
         raw_w = 1.0 / np.sqrt(clipped)                                  # [n_fit]
         n_fit = len(fit_sample_idx)
         ridge_sample_weight = raw_w * (n_fit / raw_w.sum())
-        print(f"[text_ridge] Length importance weights (basis=full_length_clip, floor={floor}) "
+        if verbose: print(f"[text_ridge] Length importance weights (basis=full_length_clip, floor={floor}) "
               f"(min={ridge_sample_weight.min():.3f}, max={ridge_sample_weight.max():.3f})")
     elif _iw_basis == "sampled_count":
         # 1/sqrt(n_sampled): downweights tokens from sequences that contribute
@@ -589,7 +626,7 @@ def refine_text_features(
         raw_w = 1.0 / np.sqrt(sampled_counts[fit_sample_idx])           # [n_fit]
         n_fit = len(fit_sample_idx)
         ridge_sample_weight = raw_w * (n_fit / raw_w.sum())
-        print(f"[text_ridge] Length importance weights (basis=sampled_count) "
+        if verbose: print(f"[text_ridge] Length importance weights (basis=sampled_count) "
               f"(min={ridge_sample_weight.min():.3f}, max={ridge_sample_weight.max():.3f})")
 
     # --- Fit Ridge ---
@@ -599,7 +636,7 @@ def refine_text_features(
         fit_features = feature_scaler.fit_transform(fit_features)
 
     backend = "GPU" if gpu_ridge_device else "CPU"
-    print(f"[text_ridge] Fitting Ridge(alpha={refinement_cfg.ridge_alpha}) on "
+    if verbose: print(f"[text_ridge] Fitting Ridge(alpha={refinement_cfg.ridge_alpha}) on "
           f"{len(fit_features):,} group samples (D={D}, mode={text_group_mode}, "
           f"method={refinement_cfg.weight_method}, backend={backend}) ...")
     if gpu_ridge_device:
@@ -612,13 +649,13 @@ def refine_text_features(
         if isinstance(all_targets, _torch.Tensor):
             all_targets = all_targets.cpu().numpy()
     ridge_model.fit(fit_features, all_targets, sample_weight=ridge_sample_weight)
-    print(f"[text_ridge] Train R²: {ridge_model.score(fit_features, all_targets):.4f}")
+    if verbose: print(f"[text_ridge] Train R²: {ridge_model.score(fit_features, all_targets):.4f}")
 
     t_fit_done = time.perf_counter()
     fit_time_s = t_fit_done - t_start
 
     # --- Pool all sequences with Ridge weights ---
-    print("[text_ridge] Pooling support set with Ridge-predicted weights ...")
+    if verbose: print("[text_ridge] Pooling support set with Ridge-predicted weights ...")
     weights_ridge = _ridge_pool_weights_text(
         grouped, group_mask, ridge_model, feature_scaler
     )  # [N, G_max]
@@ -632,7 +669,7 @@ def refine_text_features(
         new_pca = None
 
     pool_time_s = time.perf_counter() - t_fit_done
-    print(f"[text_timing] fit={fit_time_s:.1f}s  pool={pool_time_s:.1f}s  "
+    if verbose: print(f"[text_timing] fit={fit_time_s:.1f}s  pool={pool_time_s:.1f}s  "
           f"total={fit_time_s + pool_time_s:.1f}s")
 
     return (
@@ -722,7 +759,7 @@ def collect_pseudo_labels_text(
         class_prior_t = (
             _torch.from_numpy(class_prior).to(_dev) if class_prior is not None else None
         )
-        probs_t = clf.predict_proba_tensor(query_features, blocked_indices=None)
+        probs_t = _safe_predict_proba_tensor(clf, query_features, blocked_indices=None)
         if probs_t.shape[1] != n_cls_expected:
             cls_t = _torch.tensor(clf.classes_, device=probs_t.device, dtype=_torch.long)
             full_t = _torch.zeros(
@@ -735,7 +772,7 @@ def collect_pseudo_labels_text(
             N_tr = len(support_features)
             blocked_diag = _torch.arange(N_tr, device=_dev, dtype=_torch.long)
             sup_t = _torch.from_numpy(support_for_clf.astype(np.float32)).to(_dev)
-            marg_t = clf.predict_proba_tensor(sup_t, blocked_indices=blocked_diag)
+            marg_t = _safe_predict_proba_tensor(clf, sup_t, blocked_indices=blocked_diag)
             if marg_t.shape[1] != n_cls_expected:
                 cls_t2 = _torch.tensor(clf.classes_, device=_dev, dtype=_torch.long)
                 full_m = _torch.zeros((N_tr, n_cls_expected), dtype=marg_t.dtype, device=_dev)
@@ -764,7 +801,7 @@ def collect_pseudo_labels_text(
             )
         y_flat = y_flat_t.cpu().numpy()
     else:
-        probs = clf.predict_proba(query_features, blocked_indices=None)
+        probs = _safe_predict_proba(clf, query_features, blocked_indices=None)
         if probs.shape[1] != n_cls_expected:
             full = np.zeros((probs.shape[0], n_cls_expected), dtype=probs.dtype)
             full[:, clf.classes_] = probs
@@ -773,7 +810,7 @@ def collect_pseudo_labels_text(
         if refinement_cfg.prior == "current_pool_marginal" and class_prior is not None:
             N_tr = len(support_features)
             blocked_diag = np.arange(N_tr)
-            marg = clf.predict_proba(support_for_clf, blocked_indices=blocked_diag)
+            marg = _safe_predict_proba(clf, support_for_clf, blocked_indices=blocked_diag)
             if marg.shape[1] != n_cls_expected:
                 full_m = np.zeros((N_tr, n_cls_expected), dtype=marg.dtype)
                 full_m[:, clf.classes_] = marg
@@ -827,6 +864,7 @@ def fit_ridge_repool_text(
     seed: int = 42,
     gpu_ridge_device: str = "cuda",
     sample_weight: Optional[np.ndarray] = None,   # combined from all folds (unnormalised)
+    verbose: bool = True,
 ) -> tuple:
     """Fit Ridge from CV pseudo-labels and repool all N text training samples.
 
@@ -861,7 +899,7 @@ def fit_ridge_repool_text(
         fit_X = feature_scaler.fit_transform(fit_X)
 
     backend = "GPU" if gpu_ridge_device else "CPU"
-    print(
+    if verbose: print(
         f"[cv_ridge_text] Fitting Ridge(alpha={refinement_cfg.ridge_alpha}) on "
         f"{len(fit_X):,} accumulated samples (D={D}, backend={backend}) ..."
     )
@@ -872,12 +910,12 @@ def fit_ridge_repool_text(
     else:
         ridge_model = Ridge(alpha=refinement_cfg.ridge_alpha)
     ridge_model.fit(fit_X, fit_y, sample_weight=sw)
-    print(f"[cv_ridge_text] Train R²: {ridge_model.score(fit_X, fit_y):.4f}")
+    if verbose: print(f"[cv_ridge_text] Train R²: {ridge_model.score(fit_X, fit_y):.4f}")
 
     t_fit_done = time.perf_counter()
     fit_time_s = t_fit_done - t_start
 
-    print("[cv_ridge_text] Pooling all training samples with Ridge weights ...")
+    if verbose: print("[cv_ridge_text] Pooling all training samples with Ridge weights ...")
     weights_ridge = _ridge_pool_weights_text(all_grouped, all_group_mask, ridge_model, feature_scaler)
     repooled_raw = (weights_ridge[:, :, None] * all_grouped).sum(axis=1).astype(np.float32)
 
@@ -889,7 +927,7 @@ def fit_ridge_repool_text(
         new_pca = None
 
     pool_time_s = time.perf_counter() - t_fit_done
-    print(
+    if verbose: print(
         f"[cv_ridge_text] fit={fit_time_s:.1f}s  pool={pool_time_s:.1f}s  "
         f"total={fit_time_s + pool_time_s:.1f}s"
     )

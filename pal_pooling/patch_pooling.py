@@ -21,6 +21,42 @@ from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
+# Safe TabICL wrapper for compatibility
+# ---------------------------------------------------------------------------
+
+def _safe_predict_proba(clf, X, blocked_indices=None):
+    """Call predict_proba with optional blocked_indices for leave-one-out masking.
+
+    Falls back to standard predict_proba if blocked_indices is not supported.
+    """
+    if blocked_indices is None:
+        return clf.predict_proba(X)
+
+    try:
+        return clf.predict_proba(X, blocked_indices=blocked_indices)
+    except TypeError as e:
+        if 'blocked_indices' in str(e):
+            return clf.predict_proba(X)
+        raise
+
+
+def _safe_predict_proba_tensor(clf, X_t, blocked_indices=None):
+    """Call predict_proba_tensor with optional blocked_indices for leave-one-out masking.
+
+    Falls back to standard predict_proba_tensor if blocked_indices is not supported.
+    """
+    if blocked_indices is None:
+        return clf.predict_proba_tensor(X_t)
+
+    try:
+        return clf.predict_proba_tensor(X_t, blocked_indices=blocked_indices)
+    except TypeError as e:
+        if 'blocked_indices' in str(e):
+            return clf.predict_proba_tensor(X_t)
+        raise
+
+
+# ---------------------------------------------------------------------------
 # GPU-accelerated Ridge (optional drop-in for sklearn Ridge)
 # ---------------------------------------------------------------------------
 
@@ -654,6 +690,7 @@ def refine_dataset_features(
     val_context_features: Optional[np.ndarray] = None, # [N_val, D_context]
     val_tabular_probs:  Optional[np.ndarray] = None,  # [N_val, n_classes]
     val_aoe_mask:       Optional[np.ndarray] = None,  # [N_val] bool
+    verbose:            bool                = True,
 ) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Union[Ridge, "RidgeGPU"], Optional[StandardScaler], TabICLClassifier, float, float, Optional[np.ndarray]]:
     """Refine mean-pooled support features with Ridge-predicted quality-weighted pooling.
 
@@ -745,7 +782,7 @@ def refine_dataset_features(
             and refinement_cfg.weight_method in _divergence_methods
             and tabular_probs is None
             and not getattr(refinement_cfg, "use_global_prior", False)):
-        print("[multimodal] Computing tabular-only P(Y|X_tab) for per-image prior ...")
+        if verbose: print("[multimodal] Computing tabular-only P(Y|X_tab) for per-image prior ...")
         _clf_tab = TabICLClassifier(n_estimators=refinement_cfg.tabicl_n_estimators, random_state=seed)
         _clf_tab.fit(context_features, train_labels)
         raw_tab_probs = _clf_tab.predict_proba(context_features).astype(np.float32)
@@ -823,14 +860,14 @@ def refine_dataset_features(
     # attend to its own support row).  This gives an image-level marginal that reflects
     # the actual discriminability of the pooled representation at this stage.
     if refinement_cfg.prior == "current_pool_marginal" and refinement_cfg.weight_method in _divergence_methods:
-        print("[calibration] Computing current_pool_marginal prior from current pooled features ...")
+        if verbose: print("[calibration] Computing current_pool_marginal prior from current pooled features ...")
         N_supp = len(support_for_clf)
         n_cls_prior = int(train_labels.max()) + 1
         blocked_diag_np = np.arange(N_supp)
         if isinstance(clf, TabICLGPUAdapter):
             import torch as _torch
             blocked_diag_t = _torch.from_numpy(blocked_diag_np).long()
-            probs_supp_t = clf.predict_proba_tensor(support_for_clf, blocked_indices=blocked_diag_t)
+            probs_supp_t = _safe_predict_proba_tensor(clf, support_for_clf, blocked_indices=blocked_diag_t)
             if probs_supp_t.shape[1] != n_cls_prior:
                 cls_t = _torch.tensor(clf.classes_, device=probs_supp_t.device, dtype=_torch.long)
                 full_t = _torch.zeros((N_supp, n_cls_prior), dtype=probs_supp_t.dtype, device=probs_supp_t.device)
@@ -838,13 +875,13 @@ def refine_dataset_features(
                 probs_supp_t = full_t
             class_prior = probs_supp_t.mean(dim=0).cpu().numpy().astype(np.float32)
         else:
-            probs_supp = clf.predict_proba(support_for_clf, blocked_indices=blocked_diag_np)
+            probs_supp = _safe_predict_proba(clf, support_for_clf, blocked_indices=blocked_diag_np)
             if probs_supp.shape[1] != n_cls_prior:
                 full = np.zeros((N_supp, n_cls_prior), dtype=probs_supp.dtype)
                 full[:, clf.classes_] = probs_supp
                 probs_supp = full
             class_prior = probs_supp.mean(axis=0).astype(np.float32)
-        print(f"[calibration] current_pool_marginal prior: {np.round(class_prior, 4)}")
+        if verbose: print(f"[calibration] current_pool_marginal prior: {np.round(class_prior, 4)}")
 
     # GPU path: skip D2H/H2D round-trip for probs and quality-logit targets.
     use_gpu = isinstance(clf, TabICLGPUAdapter)
@@ -876,7 +913,7 @@ def refine_dataset_features(
             # Subsampled: draw max_query_rows (image, patch) pairs from active images
             n_fwd    = refinement_cfg.max_query_rows
             aoe_note = f" (aoe_handling={refinement_cfg.aoe_handling})" if aoe_mask is not None else ""
-            print(f"[sampling] Subsampling {n_fwd:,} / {active_total_rows:,} patch-group rows "
+            if verbose: print(f"[sampling] Subsampling {n_fwd:,} / {active_total_rows:,} patch-group rows "
                   f"({100 * n_fwd / active_total_rows:.1f}%) for Ridge fitting{aoe_note}")
             rng           = np.random.RandomState(seed)
             sampled_flat  = rng.choice(active_total_rows, size=n_fwd, replace=False)
@@ -918,7 +955,7 @@ def refine_dataset_features(
             _blocked_indices_t = (
                 _torch.from_numpy(blocked_indices_np).long() if blocked_indices_np is not None else None
             )
-            probs_flat_t = clf.predict_proba_tensor(query_features, blocked_indices=_blocked_indices_t)  # [n_fwd, n_classes] GPU
+            probs_flat_t = _safe_predict_proba_tensor(clf, query_features, blocked_indices=_blocked_indices_t)  # [n_fwd, n_classes] GPU
             if n_cls_expected is not None and probs_flat_t.shape[1] != n_cls_expected:
                 cls_tensor = _torch.tensor(clf.classes_, device=probs_flat_t.device, dtype=_torch.long)
                 full_t = _torch.zeros((probs_flat_t.shape[0], n_cls_expected), dtype=probs_flat_t.dtype, device=probs_flat_t.device)
@@ -929,7 +966,7 @@ def refine_dataset_features(
 
             all_targets_t = _torch.empty(n_fwd, dtype=_torch.float32, device=_dev)
         else:
-            probs_flat  = clf.predict_proba(query_features, blocked_indices=blocked_indices_np)  # [n_fwd, n_classes] CPU
+            probs_flat  = _safe_predict_proba(clf, query_features, blocked_indices=blocked_indices_np)  # [n_fwd, n_classes] CPU
             if n_cls_expected is not None and probs_flat.shape[1] != n_cls_expected:
                 full = np.zeros((probs_flat.shape[0], n_cls_expected), dtype=probs_flat.dtype)
                 full[:, clf.classes_] = probs_flat
@@ -1003,7 +1040,7 @@ def refine_dataset_features(
                 _blocked_indices_t = (
                     _torch.from_numpy(_blocked_indices_np).long() if _blocked_indices_np is not None else None
                 )
-                probs_t = clf.predict_proba_tensor(query_features, blocked_indices=_blocked_indices_t)
+                probs_t = _safe_predict_proba_tensor(clf, query_features, blocked_indices=_blocked_indices_t)
                 if n_cls_expected is not None and probs_t.shape[1] != n_cls_expected:
                     cls_tensor = _torch.tensor(clf.classes_, device=probs_t.device, dtype=_torch.long)
                     full_t = _torch.zeros((probs_t.shape[0], n_cls_expected), dtype=probs_t.dtype, device=probs_t.device)
@@ -1023,7 +1060,7 @@ def refine_dataset_features(
                     s, e = base + j * P, base + (j + 1) * P
                     all_features[s:e] = batch_patches_arr[j]
             else:
-                probs = clf.predict_proba(query_features, blocked_indices=_blocked_indices_np)
+                probs = _safe_predict_proba(clf, query_features, blocked_indices=_blocked_indices_np)
                 if n_cls_expected is not None and probs.shape[1] != n_cls_expected:
                     full = np.zeros((probs.shape[0], n_cls_expected), dtype=probs.dtype)
                     full[:, clf.classes_] = probs
@@ -1046,8 +1083,8 @@ def refine_dataset_features(
         if count_probs > 0:
             mean_probs = sum_probs / count_probs
 
-    print(f"[calibration] Empirical label prior:    {np.round(empirical_prior, 4)}")
-    print(f"[calibration] Marginal patch predicted: {np.round(mean_probs, 4)}")
+    if verbose: print(f"[calibration] Empirical label prior:    {np.round(empirical_prior, 4)}")
+    if verbose: print(f"[calibration] Marginal patch predicted: {np.round(mean_probs, 4)}")
 
     if refinement_cfg.prior == "token_marginal":
         class_prior = mean_probs.astype(np.float32)
@@ -1123,12 +1160,12 @@ def refine_dataset_features(
     # --- Fit Ridge on collected (patch_feature, quality_logit) pairs ---
     feature_scaler: Optional[StandardScaler] = None
     if refinement_cfg.normalize_features:
-        print("[ridge] Fitting StandardScaler on training patches ...")
+        if verbose: print("[ridge] Fitting StandardScaler on training patches ...")
         feature_scaler = StandardScaler()
         all_features = feature_scaler.fit_transform(all_features)
 
     backend = "GPU" if gpu_ridge_device else "CPU"
-    print(f"[ridge] Fitting Ridge(alpha={refinement_cfg.ridge_alpha}) on {len(all_features):,} patch samples "
+    if verbose: print(f"[ridge] Fitting Ridge(alpha={refinement_cfg.ridge_alpha}) on {len(all_features):,} patch samples "
           f"(D={D}, method={refinement_cfg.weight_method}, backend={backend}) ...")
     if gpu_ridge_device:
         ridge_model: Union[Ridge, RidgeGPU] = RidgeGPU(alpha=refinement_cfg.ridge_alpha, device=gpu_ridge_device)
@@ -1138,7 +1175,7 @@ def refine_dataset_features(
         if isinstance(all_targets, _torch.Tensor):
             all_targets = all_targets.cpu().numpy()
     ridge_model.fit(all_features, all_targets)
-    print(f"[ridge] Train R²: {ridge_model.score(all_features, all_targets):.4f}")
+    if verbose: print(f"[ridge] Train R²: {ridge_model.score(all_features, all_targets):.4f}")
 
     # Split: everything up to here is the "learning" phase (TabICL forward + Ridge fit).
     # Everything below is the "pooling" phase (Ridge predict + repooling + PCA refit),
@@ -1147,7 +1184,7 @@ def refine_dataset_features(
     fit_time_s = t_fit_done - t_start
 
     # --- Pool all training images with Ridge weights (always full images) ---
-    print("[ridge] Pooling support set with Ridge-predicted weights ...")
+    if verbose: print("[ridge] Pooling support set with Ridge-predicted weights ...")
     weights_ridge = _ridge_pool_weights(train_patches, ridge_model, feature_scaler)   # [N, P]
     repooled_raw  = (weights_ridge[:, :, None] * train_patches).sum(axis=1)           # [N, D]
 
@@ -1159,7 +1196,7 @@ def refine_dataset_features(
         new_pca = None
 
     pool_time_s = time.perf_counter() - t_fit_done
-    print(f"[timing] fit={fit_time_s:.1f}s  pool={pool_time_s:.1f}s  "
+    if verbose: print(f"[timing] fit={fit_time_s:.1f}s  pool={pool_time_s:.1f}s  "
           f"total={fit_time_s + pool_time_s:.1f}s")
 
     return refined, new_pca, weights_ridge, ridge_model, feature_scaler, clf, fit_time_s, pool_time_s, class_prior
@@ -1239,7 +1276,7 @@ def collect_pseudo_labels_image(
         class_prior_t = (
             _torch.from_numpy(class_prior).to(_dev) if class_prior is not None else None
         )
-        probs_t = clf.predict_proba_tensor(query_features, blocked_indices=None)
+        probs_t = _safe_predict_proba_tensor(clf, query_features, blocked_indices=None)
         if probs_t.shape[1] != n_cls_expected:
             cls_t = _torch.tensor(clf.classes_, device=probs_t.device, dtype=_torch.long)
             full_t = _torch.zeros(
@@ -1253,7 +1290,7 @@ def collect_pseudo_labels_image(
             N_tr = len(support_features)
             blocked_diag = _torch.arange(N_tr, device=_dev, dtype=_torch.long)
             sup_proj = _torch.from_numpy(support_for_clf.astype(np.float32)).to(_dev)
-            marg_t = clf.predict_proba_tensor(sup_proj, blocked_indices=blocked_diag)
+            marg_t = _safe_predict_proba_tensor(clf, sup_proj, blocked_indices=blocked_diag)
             if marg_t.shape[1] != n_cls_expected:
                 cls_t2 = _torch.tensor(clf.classes_, device=_dev, dtype=_torch.long)
                 full_m = _torch.zeros((N_tr, n_cls_expected), dtype=marg_t.dtype, device=_dev)
@@ -1278,7 +1315,7 @@ def collect_pseudo_labels_image(
             )
         y_flat = y_flat_t.cpu().numpy()
     else:
-        probs = clf.predict_proba(query_features, blocked_indices=None)
+        probs = _safe_predict_proba(clf, query_features, blocked_indices=None)
         if probs.shape[1] != n_cls_expected:
             full = np.zeros((probs.shape[0], n_cls_expected), dtype=probs.dtype)
             full[:, clf.classes_] = probs
@@ -1287,7 +1324,7 @@ def collect_pseudo_labels_image(
         if refinement_cfg.prior == "current_pool_marginal" and class_prior is not None:
             N_tr = len(support_features)
             blocked_diag = np.arange(N_tr)
-            marg = clf.predict_proba(support_for_clf, blocked_indices=blocked_diag)
+            marg = _safe_predict_proba(clf, support_for_clf, blocked_indices=blocked_diag)
             if marg.shape[1] != n_cls_expected:
                 full_m = np.zeros((N_tr, n_cls_expected), dtype=marg.dtype)
                 full_m[:, clf.classes_] = marg
@@ -1317,6 +1354,7 @@ def fit_ridge_repool_image(
     refinement_cfg: ImagePALConfig,
     seed: int = 42,
     gpu_ridge_device: str = "cuda",
+    verbose: bool = True,
 ) -> tuple:
     """Fit Ridge from CV pseudo-labels and repool all N training patches.
 
@@ -1345,7 +1383,7 @@ def fit_ridge_repool_image(
         fit_X = feature_scaler.fit_transform(fit_X)
 
     backend = "GPU" if gpu_ridge_device else "CPU"
-    print(
+    if verbose: print(
         f"[cv_ridge_image] Fitting Ridge(alpha={refinement_cfg.ridge_alpha}) on "
         f"{len(fit_X):,} accumulated samples (D={D}, backend={backend}) ..."
     )
@@ -1356,12 +1394,12 @@ def fit_ridge_repool_image(
     else:
         ridge_model = Ridge(alpha=refinement_cfg.ridge_alpha)
     ridge_model.fit(fit_X, fit_y)
-    print(f"[cv_ridge_image] Train R²: {ridge_model.score(fit_X, fit_y):.4f}")
+    if verbose: print(f"[cv_ridge_image] Train R²: {ridge_model.score(fit_X, fit_y):.4f}")
 
     t_fit_done = _time.perf_counter()
     fit_time_s = t_fit_done - t_start
 
-    print("[cv_ridge_image] Pooling all training samples with Ridge weights ...")
+    if verbose: print("[cv_ridge_image] Pooling all training samples with Ridge weights ...")
     weights_ridge = _ridge_pool_weights(all_patches_grouped, ridge_model, feature_scaler)
     repooled_raw = (weights_ridge[:, :, None] * all_patches_grouped).sum(axis=1).astype(np.float32)
 
@@ -1373,7 +1411,7 @@ def fit_ridge_repool_image(
         new_pca = None
 
     pool_time_s = _time.perf_counter() - t_fit_done
-    print(
+    if verbose: print(
         f"[cv_ridge_image] fit={fit_time_s:.1f}s  pool={pool_time_s:.1f}s  "
         f"total={fit_time_s + pool_time_s:.1f}s"
     )

@@ -157,7 +157,8 @@ class PALPooler:
         import joblib
         self._check_fitted()
         joblib.dump(self, Path(path))
-        print(f"[{type(self).__name__}] Saved → {path}")
+        if getattr(self, "verbose", True):
+            print(f"[{type(self).__name__}] Saved → {path}")
 
     @classmethod
     def load(cls, path: Union[str, Path]) -> "PALPooler":
@@ -260,12 +261,14 @@ class ImagePALPooler(PALPooler):
         refinement_cfg: ImagePALConfig,
         seed: int = 42,
         gpu_ridge_device: str = "cuda",
+        verbose: bool = True,
     ) -> None:
         self.tabicl = tabicl
         self.refinement_cfg = refinement_cfg
         self.pca_dim = refinement_cfg.tabicl_pca_dim
         self.seed = seed
         self.gpu_ridge_device = gpu_ridge_device
+        self.verbose = verbose
 
     # ------------------------------------------------------------------
     # Core sklearn-style API
@@ -347,6 +350,7 @@ class ImagePALPooler(PALPooler):
             val_labels=val_labels,
             val_context_features=val_context_features,
             val_tabular_probs=val_tabular_probs,
+            verbose=self.verbose,
         )
 
         repooled_raw = (
@@ -545,12 +549,14 @@ class TextPALPooler(PALPooler):
         text_group_mode: Optional[str] = None,
         seed: int = 42,
         gpu_ridge_device: str = "cuda",
+        verbose: bool = True,
     ) -> None:
         self.tabicl = tabicl
         self.refinement_cfg = refinement_cfg
         self.pca_dim = refinement_cfg.tabicl_pca_dim
         self.seed = seed
         self.gpu_ridge_device = gpu_ridge_device
+        self.verbose = verbose
         # Allow per-stage override from IterativePALPooler.
         if text_group_mode is not None:
             self._stage_group_mode = text_group_mode
@@ -666,6 +672,7 @@ class TextPALPooler(PALPooler):
             val_token_ids=val_token_ids,
             val_labels=val_labels,
             val_tabular_probs=val_tabular_probs,
+            verbose=self.verbose,
         )
 
         # Re-pool in original D-space for raw support (same as image path).
@@ -922,6 +929,7 @@ class IterativePALPooler:
         modality: str = "image",
         gpu_ridge_device: str = "cuda",
         seed: int = 42,
+        verbose: bool = True,
     ) -> None:
         if modality not in ("image", "text"):
             raise ValueError(f"modality must be 'image' or 'text', got {modality!r}")
@@ -937,6 +945,7 @@ class IterativePALPooler:
         self.modality         = modality
         self.seed             = seed
         self.gpu_ridge_device = gpu_ridge_device
+        self.verbose          = verbose
 
         if modality == "image":
             self.patch_group_sizes = list(refinement_cfg.patch_group_sizes)
@@ -1164,6 +1173,26 @@ class IterativePALPooler:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _safe_predict_proba(clf, X, attn_mask=None, blocked_indices=None):
+        """Call predict_proba with optional TabICL extensions (attn_mask, blocked_indices).
+
+        Falls back to standard predict_proba if these arguments are not supported.
+        """
+        kwargs = {}
+        if attn_mask is not None:
+            kwargs['attn_mask'] = attn_mask
+        if blocked_indices is not None:
+            kwargs['blocked_indices'] = blocked_indices
+
+        try:
+            return clf.predict_proba(X, **kwargs)
+        except TypeError as e:
+            # If we get an unexpected keyword argument error, retry without the custom args
+            if 'unexpected keyword argument' in str(e) and kwargs:
+                return clf.predict_proba(X)
+            raise
+
     def _init_pca(
         self,
         support_raw: np.ndarray,
@@ -1219,8 +1248,8 @@ class IterativePALPooler:
                 np.eye(N_tab, dtype=bool)
                 if self.refinement_cfg.use_attn_masking else None
             )
-            raw_tab = _clf_tab.predict_proba(
-                context_features, attn_mask=_tab_mask
+            raw_tab = self._safe_predict_proba(
+                _clf_tab, context_features, attn_mask=_tab_mask
             ).astype(np.float32)
             n_cls_local = int(labels.max()) + 1
             if raw_tab.shape[1] != n_cls_local:
@@ -1263,7 +1292,9 @@ class IterativePALPooler:
 
         N_train = len(train_idx)
         _mask = np.eye(N_train, dtype=bool) if self.refinement_cfg.use_attn_masking else None
-        raw_train = _clf.predict_proba(train_ctx, attn_mask=_mask).astype(np.float32)
+        raw_train = self._safe_predict_proba(
+            _clf, train_ctx, attn_mask=_mask
+        ).astype(np.float32)
         if raw_train.shape[1] != n_cls:
             tmp = np.zeros((N_train, n_cls), dtype=np.float32)
             tmp[:, _clf.classes_] = raw_train
@@ -1444,6 +1475,7 @@ class IterativePALPooler:
                 return ImagePALPooler(
                     tabicl=self.tabicl, refinement_cfg=iter_cfg,
                     seed=self.seed, gpu_ridge_device=self.gpu_ridge_device,
+                    verbose=self.verbose,
                 )
             else:
                 iter_cfg.text_group_modes = item
@@ -1451,6 +1483,7 @@ class IterativePALPooler:
                     tabicl=self.tabicl, refinement_cfg=iter_cfg,
                     text_group_mode=item,
                     seed=self.seed, gpu_ridge_device=self.gpu_ridge_device,
+                    verbose=self.verbose,
                 )
 
         if use_cv:
@@ -1720,6 +1753,7 @@ class IterativePALPooler:
                 fit_ridge_repool_image(
                     X_concat, y_concat, all_grouped, initial_pca,
                     stage.refinement_cfg, self.seed, self.gpu_ridge_device,
+                    verbose=self.verbose,
                 )
             repooled_raw = (weights_ridge[:, :, None] * all_grouped).sum(axis=1).astype(np.float32)
         else:
@@ -1728,6 +1762,7 @@ class IterativePALPooler:
                     X_concat, y_concat, all_grouped, all_group_mask, initial_pca,
                     stage.refinement_cfg, self.seed, self.gpu_ridge_device,
                     sample_weight=sw_concat,
+                    verbose=self.verbose,
                 )
             repooled_raw = (weights_ridge[:, :, None] * all_grouped).sum(axis=1).astype(np.float32)
 
@@ -1850,7 +1885,9 @@ class IterativePALPooler:
         n_est = getattr(self.tabicl, "n_estimators", 1)
         clf   = TabICLClassifier(n_estimators=n_est, random_state=self.seed)
         clf.fit(support_for_clf, stage.support_labels_)
-        proba = clf.predict_proba(query_for_clf, blocked_indices=np.arange(N))
+        proba = self._safe_predict_proba(
+            clf, query_for_clf, blocked_indices=np.arange(N)
+        )
         return float((np.argmax(proba, axis=1) == labels).mean())
 
     @staticmethod
@@ -1908,6 +1945,7 @@ def pooler_factory(
     refinement_cfg: Union[ImagePALConfig, TextPALConfig],
     seed: int,
     modality: str = "image",
+    verbose: bool = True,
 ) -> IterativePALPooler:
     """Convenience factory to build an IterativePALPooler from config dataclasses."""
     tabicl = TabICLClassifier(
@@ -1918,4 +1956,5 @@ def pooler_factory(
         refinement_cfg=refinement_cfg,
         modality=modality,
         seed=seed,
+        verbose=verbose,
     )

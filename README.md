@@ -176,6 +176,7 @@ Controls which stage is used at inference after iterative refinement:
 |-------|-------------|
 | `last_iteration` (default) | Always use the final stage |
 | `masked_train_accuracy` | Evaluate every stage on the training set with a diagonal attention mask; select the best-performing stage |
+| `validation_accuracy` | Select the stage with the highest val accuracy (requires `--train-val-fraction` or `--cross-validation-cap`; falls back to last stage if no val accuracies were collected) |
 
 ---
 
@@ -385,8 +386,20 @@ python pal_pooling/pal_experiment.py \
 
 | Class/Function | Purpose |
 |----------------|---------|
-| `PALPooler` | Single-stage sklearn-style pooler: `fit(patches, labels)` → `transform(patches)` |
-| `IterativePALPooler` | Chains multiple `PALPooler` stages; `fit` + `score_tabicl(query_patches, query_labels)` |
+| `PALPooler` | Abstract base class: shared `save`/`load`, `score_tabicl`, `_check_fitted` |
+| `ImagePALPooler` | Single-stage Ridge pooler for image patch (DINO/ViT) embeddings; `fit(patches, labels)` → `transform(patches)` |
+| `TextPALPooler` | Single-stage Ridge pooler for BERT token embeddings; handles variable-length sequences with padding masks and two grouping modes (`"none"` / `"sentence"`) |
+| `IterativePALPooler` | Chains multiple `ImagePALPooler` or `TextPALPooler` stages; modality selected via `modality="image"` (default) or `"text"`; `fit` + `transform` + `score_tabicl` |
+| `pooler_factory(refinement_cfg, seed, modality)` | Convenience factory: builds a `TabICLClassifier` from `refinement_cfg` and returns an `IterativePALPooler` |
+
+**`text_pooling.py`**
+
+| Function | Purpose |
+|----------|---------|
+| `group_text_tokens(tokens, token_ids, mode, ...)` | `[N, T_max, D]` → `[N, G_max, D]` + validity mask; modes: `"none"` (individual tokens) or `"sentence"` (mean-pooled sentence spans delimited by `[SEP]`) |
+| `collect_pseudo_labels_text(query_grouped, ...)` | Phase A (CV): fits TabICL on fold support, collects `(X_flat, y_flat, sample_weight)` pseudo-labels for the query fold |
+| `fit_ridge_repool_text(X_flat, y_flat, all_grouped, ..., sample_weight)` | Phase B (CV): normalises weights, fits Ridge once on all-N pseudo-labels, repools |
+| `refine_text_features(train_tokens, ...)` | Full single-stage refinement for text; returns `(refined_support, new_pca, weights_ridge, ridge_model, ...)` |
 
 **`data_loading.py`**
 

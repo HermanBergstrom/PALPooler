@@ -84,7 +84,7 @@ SEED = 42
 #   test_patches,  test_labels  = ...
 
 tabicl = TabICLClassifier(n_estimators=image_cfg.tabicl_n_estimators, random_state=SEED)
-image_pooler = IterativePALPooler(tabicl=tabicl, refinement_cfg=image_cfg, seed=SEED)
+image_pooler = IterativePALPooler(tabicl=tabicl, refinement_cfg=image_cfg, seed=SEED, verbose=False)
 
 image_pooler.fit(train_patches, train_labels)
 
@@ -107,7 +107,7 @@ print(f"[image] acc={acc:.4f}  auroc={auroc:.4f}")
 
 tabicl = TabICLClassifier(n_estimators=text_cfg.tabicl_n_estimators, random_state=SEED)
 text_pooler = IterativePALPooler(tabicl=tabicl, refinement_cfg=text_cfg, seed=SEED,
-                                  modality="text")
+                                  modality="text", verbose=False)
 
 text_pooler.fit(
     train_patches, train_labels,
@@ -124,6 +124,6 @@ test_embeddings = text_pooler.transform(
 
 acc, auroc = text_pooler.score_tabicl(
     test_patches, test_labels,
-    token_ids=test_token_ids, attention_mask=test_attention_mask,
+    query_token_ids=test_token_ids, query_attention_mask=test_attention_mask,
 )
 print(f"[text]  acc={acc:.4f}  auroc={auroc:.4f}")
