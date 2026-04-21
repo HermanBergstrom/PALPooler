@@ -698,7 +698,7 @@ def _parse_args() -> argparse.Namespace:
                    choices=["label_frequency", "patch_marginal", "current_pool_marginal"],
                    help="Prior to use as the divergence reference (default: label_frequency)")
     p.add_argument("--model-selection", type=str, default="last_iteration",
-                   choices=["last_iteration", "masked_train_accuracy"],
+                   choices=["last_iteration", "masked_train_accuracy", "validation_accuracy"],
                    help="Which stage to use at inference after iterative refinement. "
                         "'last_iteration' (default) always uses the final stage. "
                         "'masked_train_accuracy' evaluates every stage on the training set "

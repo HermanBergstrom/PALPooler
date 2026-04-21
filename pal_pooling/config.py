@@ -284,11 +284,13 @@ def parse_args() -> ExperimentConfig:
                    help="During refinement, prevent each image's patches from attending to that image's "
                         "own support row in the TabICL ICL transformer.")
     p.add_argument("--model-selection", type=str, default="last_iteration",
-                   choices=["last_iteration", "masked_train_accuracy"],
+                   choices=["last_iteration", "masked_train_accuracy", "validation_accuracy"],
                    help="Which stage to use at inference after iterative refinement. "
                         "'last_iteration' (default) always uses the final stage. "
                         "'masked_train_accuracy' evaluates every stage on the training set with a "
-                        "diagonal attention mask and selects the best-performing one.")
+                        "diagonal attention mask and selects the best-performing one. "
+                        "'validation_accuracy' selects the stage with the highest held-out val "
+                        "accuracy (requires --train-val-fraction or --cross-validation-cap).")
     p.add_argument("--binary-dist", action="store_true",
                    help="For divergence-based and entropy weight methods, collapse all non-correct "
                         "classes into one before measuring the distributional distance. The comparison "

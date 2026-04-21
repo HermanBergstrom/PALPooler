@@ -926,10 +926,12 @@ class IterativePALPooler:
     ) -> None:
         if modality not in ("image", "text"):
             raise ValueError(f"modality must be 'image' or 'text', got {modality!r}")
-        if refinement_cfg.model_selection not in ("last_iteration", "masked_train_accuracy"):
+        if refinement_cfg.model_selection not in (
+            "last_iteration", "masked_train_accuracy", "validation_accuracy"
+        ):
             raise ValueError(
-                f"model_selection must be 'last_iteration' or 'masked_train_accuracy', "
-                f"got {refinement_cfg.model_selection!r}"
+                f"model_selection must be 'last_iteration', 'masked_train_accuracy', or "
+                f"'validation_accuracy', got {refinement_cfg.model_selection!r}"
             )
         self.tabicl           = tabicl
         self.refinement_cfg   = refinement_cfg
@@ -1486,7 +1488,25 @@ class IterativePALPooler:
                     stage._pca_.transform(val_pooled).astype(np.float32)
                     if stage._pca_ is not None else val_pooled.astype(np.float32)
                 )
-                val_acc, val_auroc = PALPooler.score_tabicl(stage, val_pooled, labels[val_idx])
+                from sklearn.metrics import roc_auc_score as _roc_auc
+                n_est = getattr(self.tabicl, "n_estimators", 1)
+                sup_for_clf = stage._support_projected_
+                qry_for_clf = val_proj
+                if context_features is not None:
+                    ctx = context_features.astype(np.float32)
+                    sup_for_clf = np.concatenate([sup_for_clf, ctx[train_idx]], axis=1)
+                    qry_for_clf = np.concatenate([qry_for_clf, ctx[val_idx]],   axis=1)
+                _clf = TabICLClassifier(n_estimators=n_est, random_state=self.seed)
+                _clf.fit(sup_for_clf, labels[train_idx])
+                proba = _clf.predict_proba(qry_for_clf)
+                val_acc = float((np.argmax(proba, axis=1) == labels[val_idx]).mean())
+                try:
+                    val_auroc = float(
+                        _roc_auc(labels[val_idx], proba[:, 1]) if proba.shape[1] == 2
+                        else _roc_auc(labels[val_idx], proba, multi_class="ovr", average="macro")
+                    )
+                except ValueError:
+                    val_auroc = float("nan")
                 stage._val_accuracy_ = val_acc
                 stage._val_auroc_    = val_auroc
                 _stage_val_accs.append(val_acc)
@@ -1522,6 +1542,23 @@ class IterativePALPooler:
             stage_key_label="patch_group_size" if is_image else "text_group_mode",
         )
         self.stage_val_accuracies_ = _stage_val_accs if _stage_val_accs else None
+
+        if self.refinement_cfg.model_selection == "validation_accuracy":
+            if _stage_val_accs:
+                self.best_stage_idx_ = int(np.argmax(_stage_val_accs))
+                print(
+                    f"[IterativePALPooler] Best stage (validation_accuracy): "
+                    f"{self.best_stage_idx_} "
+                    f"(val acc={_stage_val_accs[self.best_stage_idx_]:.4f})"
+                )
+            else:
+                print(
+                    "[IterativePALPooler] Warning: model_selection='validation_accuracy' but no "
+                    "val accuracies were collected (set --train-val-fraction or "
+                    "--cross-validation-cap). Falling back to last stage."
+                )
+                self.best_stage_idx_ = len(self.stages_) - 1
+
         return self
 
     # ------------------------------------------------------------------
@@ -1725,13 +1762,19 @@ class IterativePALPooler:
                 if stage._pca_ is not None else val_pooled.astype(np.float32)
             )
             train_proj = stage._support_projected_[train_idx]
+            sup_for_clf = train_proj
+            qry_for_clf = val_proj
+            if context_features is not None:
+                ctx = context_features.astype(np.float32)
+                sup_for_clf = np.concatenate([sup_for_clf, ctx[train_idx]], axis=1)
+                qry_for_clf = np.concatenate([qry_for_clf, ctx[val_idx]],   axis=1)
 
             clf_eval = TabICLClassifier(
                 n_estimators=getattr(self.tabicl, "n_estimators", 1),
                 random_state=self.seed,
             )
-            clf_eval.fit(train_proj, labels[train_idx])
-            proba = clf_eval.predict_proba(val_proj)
+            clf_eval.fit(sup_for_clf, labels[train_idx])
+            proba = clf_eval.predict_proba(qry_for_clf)
             acc = float((np.argmax(proba, axis=1) == labels[val_idx]).mean())
             try:
                 if proba.shape[1] == 2:
