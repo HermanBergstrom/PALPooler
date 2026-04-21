@@ -28,7 +28,7 @@ from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
-from pal_pooling.config import TextRefinementConfig
+from pal_pooling.config import TextPALConfig
 from pal_pooling.patch_pooling import (
     RidgeGPU,
     compute_patch_quality_logits,
@@ -233,7 +233,7 @@ def refine_text_features(
     train_token_ids:    np.ndarray,      # [N, T_max]  token IDs
     train_labels:       np.ndarray,      # [N]
     support_features:   np.ndarray,      # [N, d]  initial pooled (post-PCA) features
-    refinement_cfg:     TextRefinementConfig,
+    refinement_cfg:     TextPALConfig,
     pca:                Optional[PCA],
     text_group_mode:    str,             # "none" | "sentence" — single stage value
     seed:               int = 42,
@@ -273,7 +273,7 @@ def refine_text_features(
     train_labels : np.ndarray, shape [N]
     support_features : np.ndarray, shape [N, d]
         Initial (mean-pooled, optionally PCA-projected) support features.
-    refinement_cfg : TextRefinementConfig
+    refinement_cfg : TextPALConfig
     pca : PCA or None
         PCA fitted on the baseline support features.
     text_group_mode : str
@@ -654,7 +654,7 @@ def collect_pseudo_labels_text(
     support_features: np.ndarray,                      # [N_tr, d] — PCA-projected support
     pca: Optional[PCA],
     tabicl,
-    refinement_cfg: "TextRefinementConfig",
+    refinement_cfg: "TextPALConfig",
     tabular_probs: Optional[np.ndarray] = None,        # [N_q, n_cls]
     query_context_features: Optional[np.ndarray] = None,   # [N_q, D_ctx]
     train_context_features: Optional[np.ndarray] = None,   # [N_tr, D_ctx]
@@ -823,7 +823,7 @@ def fit_ridge_repool_text(
     all_grouped: np.ndarray,           # [N, G_max, D] all N training samples grouped
     all_group_mask: np.ndarray,        # [N, G_max] bool
     pca: Optional[PCA],
-    refinement_cfg: "TextRefinementConfig",
+    refinement_cfg: "TextPALConfig",
     seed: int = 42,
     gpu_ridge_device: str = "cuda",
     sample_weight: Optional[np.ndarray] = None,   # combined from all folds (unnormalised)

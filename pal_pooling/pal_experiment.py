@@ -43,7 +43,7 @@ from pal_pooling.patch_pooling import (
 )
 from pal_pooling.patch_visualisation import summary_figure, visualise_image
 from pal_pooling.text_visualisation import visualise_text_batch, visualise_text
-from pal_pooling.config import DatasetConfig, RefinementConfig, AttentionPoolConfig, RunConfig, ExperimentConfig, parse_args
+from pal_pooling.config import DatasetConfig, ImagePALConfig, TextPALConfig, AttentionPoolConfig, RunConfig, ExperimentConfig, parse_args
 from pal_pooling.data_loading import (
     _get_image_paths,
     _dicom_to_pil,
@@ -890,14 +890,14 @@ def run_pal_experiment(
     # TEXT MODALITY BRANCH — runs the full experiment and returns early.
     # -----------------------------------------------------------------------
     if cfg.dataset.modality == "text":
-        text_cfg = cfg.refinement  # already a TextRefinementConfig from parse_args()
+        text_cfg = cfg.refinement  # already a TextPALConfig from parse_args()
 
         train_token_ids      = extra_data["train_token_ids"]       # [N_train, T_max]
         train_attention_mask = extra_data["train_attention_mask"]  # [N_train, T_max]
         test_token_ids       = extra_data["test_token_ids"]
         test_attention_mask  = extra_data["test_attention_mask"]
         # val_token_ids / val_attention_mask are never set for text: splitting is
-        # handled internally by IterativePALPooler (see TextRefinementConfig.train_val_fraction).
+        # handled internally by IterativePALPooler (see TextPALConfig.train_val_fraction).
 
         # --- Masked mean-pool baseline (exclude [CLS] and padding) ---
         _cls_id  = text_cfg.cls_token_id   # 101
@@ -1027,18 +1027,6 @@ def run_pal_experiment(
                 binary_dist=text_cfg.binary_dist,
             )
 
-
-        if not text_cfg.refine:
-            _save_results(
-                output_dir=output_dir, run_ts=run_ts,
-                total_time_s=time.perf_counter() - experiment_start,
-                train_patches=train_patches, test_labels=test_labels, D=D,
-                n_classes=n_classes, pca=pca,
-                cls_acc=cls_acc, cls_auroc=cls_auroc,
-                baseline_acc=baseline_acc, baseline_auroc=baseline_auroc,
-                all_results=all_results, cfg=cfg, attn_result=attn_result,
-            )
-            return
 
         # --- Iterative text PAL refinement ---
         _refine_dev = cfg.device if cfg.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -1378,20 +1366,6 @@ def run_pal_experiment(
     else:
         baseline_mean_probs = {}
 
-    if not cfg.refinement.refine:
-        _save_results(
-            output_dir=output_dir, run_ts=run_ts,
-            total_time_s=time.perf_counter() - experiment_start,
-            train_patches=train_patches, test_labels=test_labels, D=D,
-            n_classes=n_classes, pca=pca,
-            cls_acc=cls_acc, cls_auroc=cls_auroc,
-            baseline_acc=baseline_acc, baseline_auroc=baseline_auroc,
-            all_results=[("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0, 0.0, 0.0, None)],
-            cfg=cfg,
-            attn_result=attn_result,
-        )
-        return
-
     # ---------------------------------------------------------------------------
     # Iterative multi-scale refinement
     # ---------------------------------------------------------------------------
@@ -1445,7 +1419,7 @@ def run_pal_experiment(
     # Produces Ridge-weight figures for the last refinement stage, giving you the quality
     # heatmaps even when per-stage post-refinement viz was skipped.
 
-    if cfg.dataset.n_sample > 0 and not cfg.run.post_refinement_viz and cfg.refinement.refine and _last_stage_data:
+    if cfg.dataset.n_sample > 0 and not cfg.run.post_refinement_viz and _last_stage_data:
         split_configs_final = [
             ("train", _last_stage_data["train_grouped"], train_labels, train_image_paths, train_sample_idx),
             ("test",  _last_stage_data["test_grouped"],  test_labels,  test_image_paths,  test_sample_idx),

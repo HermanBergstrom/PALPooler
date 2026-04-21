@@ -14,7 +14,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
-from pal_pooling.config import RefinementConfig
+from pal_pooling.config import ImagePALConfig
 from pal_pooling.tabicl_gpu_adapter import TabICLGPUAdapter
 from tabicl import TabICLClassifier
 from tqdm import tqdm
@@ -640,7 +640,7 @@ def refine_dataset_features(
     train_patches:      np.ndarray,      # [N, P, D]  raw DINO patch features
     train_labels:       np.ndarray,      # [N]
     support_features:   np.ndarray,      # [N_train, d]  initial mean-pooled (post-PCA) features
-    refinement_cfg: RefinementConfig,
+    refinement_cfg: ImagePALConfig,
     pca:                Optional[PCA],   # PCA fitted on the baseline support set
     seed:               int   = 42,
     aoe_mask:              Optional[np.ndarray] = None,  # [N] bool; True = absence-of-evidence class
@@ -1176,7 +1176,7 @@ def collect_pseudo_labels_image(
     support_features: np.ndarray,                      # [N_tr, d] — PCA-projected support
     pca: Optional[PCA],                                # to project query features for TabICL
     tabicl: "TabICLClassifier",
-    refinement_cfg: RefinementConfig,
+    refinement_cfg: ImagePALConfig,
     tabular_probs: Optional[np.ndarray] = None,        # [N_q, n_cls] for query set
     query_context_features: Optional[np.ndarray] = None,   # [N_q, D_ctx]
     train_context_features: Optional[np.ndarray] = None,   # [N_tr, D_ctx]
@@ -1314,7 +1314,7 @@ def fit_ridge_repool_image(
     y_flat: np.ndarray,                # [M] quality logit targets
     all_patches_grouped: np.ndarray,   # [N, P', D] all N training grouped patches
     pca: Optional[PCA],
-    refinement_cfg: RefinementConfig,
+    refinement_cfg: ImagePALConfig,
     seed: int = 42,
     gpu_ridge_device: str = "cuda",
 ) -> tuple:

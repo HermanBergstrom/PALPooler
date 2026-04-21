@@ -46,8 +46,8 @@ from tabicl import TabICLClassifier
 
 from pal_pooling.config import (
     CBIS_DDSM_DATASET_PATH, CLOTHING_DATASET_PATH, DatasetConfig, DVM_DATASET_PATH,
-    FEATURES_DIR, PAD_UFES_DATASET_PATH, PETFINDER_DATASET_PATH, RefinementConfig,
-    SALARY_INDIA_DATASET_PATH, TextRefinementConfig, get_modality,
+    FEATURES_DIR, PAD_UFES_DATASET_PATH, PETFINDER_DATASET_PATH, ImagePALConfig,
+    SALARY_INDIA_DATASET_PATH, TextPALConfig, get_modality,
 )
 from pal_pooling.data_loading import _load_features
 from pal_pooling.pal_pooler import IterativePALPooler, pooler_factory
@@ -356,9 +356,8 @@ def _run_single_seed(
         _eval("mean_pool_text+tab", _concat_tabular(mean_text_tr, tab_train), _concat_tabular(mean_text_te, tab_test))
         _eval("cls_text+tab",       _concat_tabular(cls_text_tr, tab_train),  _concat_tabular(cls_text_te, tab_test))
 
-        # ── Build TextRefinementConfig ────────────────────────────────────────
-        text_refinement_cfg = TextRefinementConfig(
-            refine=True,
+        # ── Build TextPALConfig ───────────────────────────────────────────────
+        text_refinement_cfg = TextPALConfig(
             text_group_modes=args.text_group_modes,
             temperature=args.temperature,
             weight_method=args.text_weight_method or args.weight_method,
@@ -421,8 +420,7 @@ def _run_single_seed(
     if not is_text_primary:
         # ── PALPool: fit on image patches only ───────────────────────────────
         print("\n--- Fitting IterativePALPooler (image-only) ---")
-        refinement_cfg = RefinementConfig(
-            refine=True,
+        refinement_cfg = ImagePALConfig(
             patch_size=16,
             patch_group_sizes=args.patch_group_sizes,
             temperature=args.temperature,

@@ -63,11 +63,9 @@ class DatasetConfig:
     def modality(self) -> str:
         """Return ``'image'`` or ``'text'`` based on the dataset name."""
         return get_modality(self.dataset)
-@dataclass
-class RefinementConfig:
-    refine: bool
-    patch_size: int
-    patch_group_sizes: List[int]
+@dataclass(kw_only=True)
+class PALConfig:
+    """Shared hyperparameters for both image and text PAL pooling."""
     temperature: List[float]
     weight_method: str
     ridge_alpha: List[float]
@@ -75,27 +73,31 @@ class RefinementConfig:
     batch_size: int
     max_query_rows: Optional[int]
     use_random_subsampling: bool
-    aoe_class: Optional[str]
-    aoe_handling: str
     gpu_ridge: bool
     tabicl_n_estimators: int
     tabicl_pca_dim: Optional[int]
     append_cls: bool = False
     use_global_prior: bool = False
-    prior: str = "label_frequency"
     use_attn_masking: bool = False
     model_selection: str = "last_iteration"
     binary_dist: bool = False
+    prior: str = "label_frequency"
     train_val_fraction: Optional[float] = None
-    cross_validation_cap: Optional[int] = None  # use 4-fold CV when N ≤ this value
+    cross_validation_cap: Optional[int] = None
 
-@dataclass
-class TextRefinementConfig:
+
+@dataclass(kw_only=True)
+class ImagePALConfig(PALConfig):
+    """Hyperparameters for image patch PAL pooling."""
+    patch_size: int
+    patch_group_sizes: List[int]
+    aoe_class: Optional[str] = None
+    aoe_handling: str = "filter"
+
+
+@dataclass(kw_only=True)
+class TextPALConfig(PALConfig):
     """Hyperparameters for text token PAL pooling.
-
-    Mirrors :class:`RefinementConfig` for the text modality.  The key
-    difference is ``text_group_modes`` (a per-stage list of grouping strategies)
-    replacing ``patch_group_sizes``.
 
     Grouping modes
     --------------
@@ -106,34 +108,18 @@ class TextRefinementConfig:
         are defined by the ``[SEP]`` token (``sep_token_id``).
 
     The ``[CLS]`` token is always excluded from pooling by default.  Set
-    ``append_cls=True`` to append its embedding as an extra group (matching
-    the image CLS-token behaviour).
+    ``append_cls=True`` to append its embedding as an extra group.
     """
-    refine: bool
     text_group_modes: List[str]       # e.g. ["sentence", "none"]; one entry per stage
-    temperature: List[float]
-    ridge_alpha: List[float]
-    weight_method: str
-    normalize_features: bool
-    batch_size: int
-    max_query_rows: Optional[int]
-    use_random_subsampling: bool
-    gpu_ridge: bool
-    tabicl_n_estimators: int
-    tabicl_pca_dim: Optional[int]
     sep_token_id: int = 102           # BERT [SEP]
     cls_token_id: int = 101           # BERT [CLS] — excluded from pooling by default
-    append_cls: bool = False          # if True, [CLS] embedding appended as extra group
-    use_global_prior: bool = False
-    use_attn_masking: bool = False
-    model_selection: str = "last_iteration"
-    binary_dist: bool = False
-    prior: str = "label_frequency"    # "label_frequency", "token_marginal", or "current_pool_marginal"
-    # "none" | "full_length" | "full_length_clip" | "sampled_count"
     length_importance_weight_basis: str = "none"
-    length_importance_floor: int = 25  # floor for full_length_clip
-    train_val_fraction: Optional[float] = None   # if set, split internally per stage instead of in the experiment script
-    cross_validation_cap: Optional[int] = None   # use 4-fold CV when N ≤ this value
+    length_importance_floor: int = 25
+
+
+# Backwards-compatible aliases
+RefinementConfig = ImagePALConfig
+TextRefinementConfig = TextPALConfig
 
 
 @dataclass
@@ -163,7 +149,7 @@ class RunConfig:
 @dataclass
 class ExperimentConfig:
     dataset: DatasetConfig
-    refinement: Union[RefinementConfig, TextRefinementConfig]
+    refinement: Union[ImagePALConfig, TextPALConfig]
     attention: AttentionPoolConfig
     run: RunConfig
     seed: int
@@ -217,8 +203,6 @@ def parse_args() -> ExperimentConfig:
                         "'none' = individual non-padding tokens; "
                         "'sentence' = mean-pool within sentence spans delimited by [SEP]. "
                         "Text datasets only.")
-    p.add_argument("--refine",        action="store_true",
-                   help="Refine support features with patch-quality weighting before eval")
     p.add_argument("--temperature",    type=float, nargs="+",  default=[1.0],
                    help="Softmax temperature for patch pooling weights.")
     p.add_argument("--batch-size",     type=int,   default=1000,
@@ -372,8 +356,7 @@ def parse_args() -> ExperimentConfig:
     )
     
     if modality == "text":
-        refinement_cfg: Union[RefinementConfig, TextRefinementConfig] = TextRefinementConfig(
-            refine=args.refine,
+        refinement_cfg: Union[ImagePALConfig, TextPALConfig] = TextPALConfig(
             text_group_modes=args.text_group_modes,
             temperature=args.temperature,
             ridge_alpha=args.ridge_alpha,
@@ -397,8 +380,7 @@ def parse_args() -> ExperimentConfig:
             cross_validation_cap=args.cross_validation_cap,
         )
     else:
-        refinement_cfg = RefinementConfig(
-            refine=args.refine,
+        refinement_cfg = ImagePALConfig(
             patch_size=args.patch_size,
             patch_group_sizes=args.patch_group_sizes,
             temperature=args.temperature,

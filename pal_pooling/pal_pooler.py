@@ -33,10 +33,9 @@ Typical image usage (backward-compatible)
 Typical text usage
 -------------------
 >>> from pal_pooling import TextPALPooler, IterativePALPooler
->>> from pal_pooling.config import TextRefinementConfig
+>>> from pal_pooling.config import TextPALConfig
 >>>
->>> text_cfg = TextRefinementConfig(
-...     refine=True,
+>>> text_cfg = TextPALConfig(
 ...     text_group_modes=["sentence", "none"],
 ...     temperature=[2.0, 1.0],
 ...     ridge_alpha=[10.0, 1.0],
@@ -60,7 +59,7 @@ from typing import Callable, List, Optional, Union
 
 import numpy as np
 from sklearn.decomposition import PCA
-from pal_pooling.config import RefinementConfig, TextRefinementConfig
+from pal_pooling.config import ImagePALConfig, TextPALConfig
 from tabicl import TabICLClassifier
 
 from pal_pooling.patch_pooling import (
@@ -145,7 +144,7 @@ class PALPooler:
 
     # Subclasses must set these in __init__
     tabicl: TabICLClassifier
-    refinement_cfg: Union[RefinementConfig, TextRefinementConfig]
+    refinement_cfg: Union[ImagePALConfig, TextPALConfig]
     seed: int
     gpu_ridge_device: str
 
@@ -245,7 +244,7 @@ class ImagePALPooler(PALPooler):
     Parameters
     ----------
     tabicl : TabICLClassifier
-    refinement_cfg : RefinementConfig
+    refinement_cfg : ImagePALConfig
     seed : int
     gpu_ridge_device : str
 
@@ -258,7 +257,7 @@ class ImagePALPooler(PALPooler):
     def __init__(
         self,
         tabicl: TabICLClassifier,
-        refinement_cfg: RefinementConfig,
+        refinement_cfg: ImagePALConfig,
         seed: int = 42,
         gpu_ridge_device: str = "cuda",
     ) -> None:
@@ -516,12 +515,12 @@ class TextPALPooler(PALPooler):
     """Single-stage Ridge-based adaptive token pooling for text (BERT) embeddings.
 
     Handles variable-length sequences with padding masks and two grouping
-    modes controlled by ``TextRefinementConfig.text_group_modes``.
+    modes controlled by ``TextPALConfig.text_group_modes``.
 
     Parameters
     ----------
     tabicl : TabICLClassifier
-    refinement_cfg : TextRefinementConfig
+    refinement_cfg : TextPALConfig
         Must have ``text_group_modes`` as a single string (one stage) or the
         caller sets ``text_group_mode`` directly via the ``fit`` internals.
     text_group_mode : str
@@ -542,7 +541,7 @@ class TextPALPooler(PALPooler):
     def __init__(
         self,
         tabicl: TabICLClassifier,
-        refinement_cfg: TextRefinementConfig,
+        refinement_cfg: TextPALConfig,
         text_group_mode: Optional[str] = None,
         seed: int = 42,
         gpu_ridge_device: str = "cuda",
@@ -897,10 +896,10 @@ class IterativePALPooler:
     Parameters
     ----------
     tabicl : TabICLClassifier
-    refinement_cfg : RefinementConfig or TextRefinementConfig
-        For images: ``RefinementConfig`` with ``patch_group_sizes`` as a
+    refinement_cfg : ImagePALConfig or TextPALConfig
+        For images: ``ImagePALConfig`` with ``patch_group_sizes`` as a
         list (one entry per stage).
-        For text: ``TextRefinementConfig`` with ``text_group_modes`` as a
+        For text: ``TextPALConfig`` with ``text_group_modes`` as a
         list of strings (one entry per stage).
     modality : str
         ``"image"`` (default) or ``"text"``.
@@ -919,7 +918,7 @@ class IterativePALPooler:
     def __init__(
         self,
         tabicl: TabICLClassifier,
-        refinement_cfg: Union[RefinementConfig, TextRefinementConfig],
+        refinement_cfg: Union[ImagePALConfig, TextPALConfig],
         modality: str = "image",
         gpu_ridge_device: str = "cuda",
         seed: int = 42,
@@ -1906,7 +1905,7 @@ class IterativePALPooler:
 # ---------------------------------------------------------------------------
 
 def pooler_factory(
-    refinement_cfg: Union[RefinementConfig, TextRefinementConfig],
+    refinement_cfg: Union[ImagePALConfig, TextPALConfig],
     seed: int,
     modality: str = "image",
 ) -> IterativePALPooler:

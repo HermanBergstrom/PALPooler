@@ -20,7 +20,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 from tabicl import TabICLClassifier
 
-from pal_pooling.config import FEATURES_DIR, RefinementConfig
+from pal_pooling.config import FEATURES_DIR, ImagePALConfig
 from pal_pooling.data_loading import ButterflyPatchDataset
 from pal_pooling.pal_pooler import IterativePALPooler
 
@@ -60,8 +60,7 @@ print(f"\n[baseline]  mean-pool → PCA({PCA_DIM}) → TabICL  acc={baseline_acc
 #    The refined support is passed to the next finer-grained stage.
 #    ridge_alpha=1e3 applies strong regularisation to the quality predictor.
 # ---------------------------------------------------------------------------
-refinement_cfg = RefinementConfig(
-    refine=True,
+refinement_cfg = ImagePALConfig(
     patch_size=16,
     patch_group_sizes=[16, 4, 1],  # coarse → medium → individual patches
     temperature=[0.5],             # softmax temperature; broadcast to all stages
