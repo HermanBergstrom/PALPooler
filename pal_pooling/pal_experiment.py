@@ -38,12 +38,13 @@ from tqdm import tqdm
 from pal_pooling.tabicl_gpu_adapter import TabICLGPUAdapter
 from pal_pooling.patch_pooling import (
     _ridge_pool_weights,
+    compute_patch_pooling_weights,
     group_patches,
     refine_dataset_features,
 )
 from pal_pooling.patch_visualisation import summary_figure, visualise_image
 from pal_pooling.text_visualisation import visualise_text_batch, visualise_text
-from pal_pooling.config import DatasetConfig, ImagePALConfig, TextPALConfig, AttentionPoolConfig, RunConfig, ExperimentConfig, parse_args
+from pal_pooling.config import DatasetConfig, ImagePALConfig, TextPALConfig, AttentionPoolConfig, RunConfig, ExperimentConfig, parse_args, IMAGENET_SUBSETS
 from pal_pooling.data_loading import (
     _get_image_paths,
     _dicom_to_pil,
@@ -52,6 +53,7 @@ from pal_pooling.data_loading import (
     _get_pad_ufes_image_paths,
     _get_cbis_ddsm_image_paths,
     _get_rsna_image_paths,
+    _get_imagenet_image_paths,
     _load_features,
     _balance_classes,
 )
@@ -92,16 +94,18 @@ def _compute_accuracy_from_features(
     query_labels:     np.ndarray,   # [N_test]
     n_estimators:     int = 1,
     seed:             int = 42,
-) -> tuple[float, float]:
+) -> tuple[float, float, dict[int, float]]:
     """Classify pre-projected query features against a support set.
 
     Returns:
-        (accuracy, auroc)  — auroc is NaN if it cannot be computed (e.g. single class in test set).
+        (accuracy, auroc, per_class_acc)  — auroc is NaN if it cannot be computed (e.g. single class in test set).
+        per_class_acc is a dict mapping class index → per-class accuracy.
     """
     clf = TabICLClassifier(n_estimators=n_estimators, random_state=seed)
     clf.fit(support_features, support_labels)
     proba = clf.predict_proba(query_features)   # [N_test, n_classes]
-    acc   = float((np.argmax(proba, axis=1) == query_labels).mean())
+    preds = np.argmax(proba, axis=1)
+    acc   = float((preds == query_labels).mean())
     try:
         if proba.shape[1] == 2:
             auroc = float(roc_auc_score(query_labels, proba[:, 1]))
@@ -109,7 +113,14 @@ def _compute_accuracy_from_features(
             auroc = float(roc_auc_score(query_labels, proba, multi_class="ovr", average="macro"))
     except ValueError:
         auroc = float("nan")
-    return acc, auroc
+
+    # Compute per-class accuracy
+    per_class_acc = {}
+    for c in sorted(set(int(l) for l in query_labels)):
+        mask = query_labels == c
+        per_class_acc[c] = float((preds[mask] == c).mean()) if mask.sum() > 0 else float("nan")
+
+    return acc, auroc, per_class_acc
 
 
 def _compute_accuracy(
@@ -120,7 +131,7 @@ def _compute_accuracy(
     pca:              Optional[PCA],
     n_estimators:     int = 1,
     seed:             int = 42,
-) -> tuple[float, float]:
+) -> tuple[float, float, dict[int, float]]:
     """Accuracy and AUROC of TabICL on the held-out test set using mean-pooled test queries."""
     test_query = test_patches.mean(axis=1)   # [N_test, D]
     if pca is not None:
@@ -128,6 +139,20 @@ def _compute_accuracy(
     return _compute_accuracy_from_features(
         support_features, support_labels, test_query, test_labels, n_estimators, seed
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-class accuracy helpers
+# ---------------------------------------------------------------------------
+
+def _print_per_class_accuracy(tag: str, per_class_acc: dict[int, float], idx_to_class: dict) -> None:
+    """Print per-class accuracy for debugging and analysis."""
+    print(f"[{tag}] per-class accuracy:")
+    for c in sorted(per_class_acc.keys()):
+        acc = per_class_acc[c]
+        class_name = idx_to_class.get(c, f"class_{c}")
+        acc_str = f"{acc:.4f}" if not np.isnan(acc) else "  N/A"
+        print(f"    {class_name:<20}: {acc_str}")
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +181,7 @@ def _run_visual_eval(
     show_per_class_probs: bool = False,
     use_attn_masking:  bool = False,
     binary_dist:       bool = False,
+    unified_weight_limits: bool = False,
 ) -> dict[str, float]:
     """Run the patch-quality visual evaluation for one support set variant.
 
@@ -210,6 +236,38 @@ def _run_visual_eval(
             )
         # ---------------------------------------------
 
+        # --- Pre-compute unified colour limits across all sampled images ---
+        weight_limits: Optional[dict[str, tuple[float, float]]] = None
+        if unified_weight_limits:
+            weight_limits = {}
+            _methods = ["correct_class_prob", "entropy"]
+            if class_prior is not None:
+                _methods += ["kl_div", "wasserstein", "js_div", "tvd"]
+            for _method in _methods:
+                _all = np.concatenate([
+                    compute_patch_pooling_weights(
+                        probs_all[_i], int(labels_all[sample_idx[_i]]),
+                        temperature, _method,
+                        class_prior if _method not in ("correct_class_prob", "entropy") else None,
+                        binary_dist=binary_dist,
+                    )
+                    for _i in range(N_s)
+                ])
+                weight_limits[_method] = (float(_all.min()), float(_all.max()))
+            if ridge_pred_logits_all is not None:
+                weight_limits["ridge"] = (
+                    float(ridge_pred_logits_all.min()),
+                    float(ridge_pred_logits_all.max()),
+                )
+            if show_minority_prob and class_prior is not None:
+                minority_idx = int(np.argmin(class_prior))
+                _all_minority = probs_all[:, :, minority_idx].ravel()
+                weight_limits["minority_prob"] = (
+                    float(_all_minority.min()),
+                    float(_all_minority.max()),
+                )
+        # ------------------------------------------------------------------
+
         results: list[dict] = []
         bar = tqdm(enumerate(sample_idx), total=len(sample_idx),
                    desc=f"[{tag}] {split_name}", unit="img")
@@ -252,6 +310,7 @@ def _run_visual_eval(
                 show_minority_prob=show_minority_prob,
                 show_per_class_probs=show_per_class_probs,
                 binary_dist=binary_dist,
+                weight_limits=weight_limits,
             )
             out_path = (
                 split_out_dir
@@ -536,7 +595,7 @@ def _run_attn_only_text(
         attn_pca    = PCA(n_components=n_comp_attn, random_state=seed)
         train_pooled = attn_pca.fit_transform(train_pooled).astype(np.float32)
         test_pooled  = attn_pca.transform(test_pooled).astype(np.float32)
-    test_acc, test_auroc = _compute_accuracy_from_features(
+    test_acc, test_auroc, _ = _compute_accuracy_from_features(
         train_pooled, train_labels, test_pooled, test_labels,
         n_estimators=attn_cfg.tabicl_n_estimators, seed=seed,
     )
@@ -639,7 +698,7 @@ def _run_attn_only(
         attn_pca    = PCA(n_components=n_comp_attn, random_state=seed)
         train_pooled = attn_pca.fit_transform(train_pooled).astype(np.float32)
         test_pooled  = attn_pca.transform(test_pooled).astype(np.float32)
-    test_acc, test_auroc = _compute_accuracy_from_features(
+    test_acc, test_auroc, _ = _compute_accuracy_from_features(
         train_pooled, train_labels, test_pooled, test_labels,
         n_estimators=attn_cfg.tabicl_n_estimators, seed=seed,
     )
@@ -760,6 +819,7 @@ def _make_stage_callback(
                 show_per_class_probs=cfg.run.show_per_class_probs,
                 use_attn_masking=cfg.refinement.use_attn_masking,
                 binary_dist=cfg.refinement.binary_dist,
+                unified_weight_limits=cfg.run.unified_weight_limits,
             )
         else:
             iter_mean_probs = {}
@@ -793,6 +853,7 @@ def _make_stage_callback(
                 show_per_class_probs=cfg.run.show_per_class_probs,
                 use_attn_masking=cfg.refinement.use_attn_masking,
                 binary_dist=cfg.refinement.binary_dist,
+                unified_weight_limits=cfg.run.unified_weight_limits,
             )
 
         # Pool test queries with Ridge and evaluate accuracy.
@@ -809,7 +870,7 @@ def _make_stage_callback(
             if new_pca is not None else test_repooled
         )
         t_eval_start = time.perf_counter()
-        iter_acc, iter_auroc = _compute_accuracy_from_features(
+        iter_acc, iter_auroc, iter_per_class_stage = _compute_accuracy_from_features(
             new_support, train_labels, test_query, test_labels,
             n_estimators=cfg.refinement.tabicl_n_estimators, seed=cfg.seed,
         )
@@ -817,6 +878,8 @@ def _make_stage_callback(
         refine_time_s = fit_time_s + pool_time_s
         print(f"[{tag}] test accuracy (quality-pooled queries): {iter_acc:.4f}  auroc: {iter_auroc:.4f}  "
               f"(fit {fit_time_s:.1f}s, pool {pool_time_s:.1f}s, eval {eval_time_s:.1f}s)")
+        if cfg.run.per_class_accuracy:
+            _print_per_class_accuracy(tag, iter_per_class_stage, idx_to_class)
 
         all_results.append((tag, iter_acc, iter_auroc, iter_mean_probs, refine_time_s, eval_time_s, fit_time_s, pool_time_s, getattr(stage, '_val_accuracy_', None)))
 
@@ -926,27 +989,32 @@ def run_pal_experiment(
         # CLS token baseline
         cls_acc:   Optional[float] = None
         cls_auroc: Optional[float] = None
+        cls_per_class: Optional[dict] = None
         if cls_train_feats is not None and cls_test_feats is not None:
             cls_pca: Optional[PCA] = None
             if text_cfg.tabicl_pca_dim is not None:
                 n_cls = min(text_cfg.tabicl_pca_dim, len(cls_train_feats), cls_train_feats.shape[1])
-                cls_pca     = PCA(n_components=n_cls, random_state=cfg.seed)
+                cls_pca = PCA(n_components=n_cls, random_state=cfg.seed)
                 cls_support = cls_pca.fit_transform(cls_train_feats).astype(np.float32)
                 cls_test_q  = cls_pca.transform(cls_test_feats).astype(np.float32)
             else:
                 cls_support = cls_train_feats
                 cls_test_q  = cls_test_feats
-            cls_acc, cls_auroc = _compute_accuracy_from_features(
+            cls_acc, cls_auroc, cls_per_class = _compute_accuracy_from_features(
                 cls_support, train_labels, cls_test_q, test_labels,
                 n_estimators=text_cfg.tabicl_n_estimators, seed=cfg.seed,
             )
+            if cfg.run.per_class_accuracy:
+                _print_per_class_accuracy("[cls-token]", cls_per_class, idx_to_class)
 
         # The baseline uses the full train set as support (train_patches is never split
         # for text; val splitting is handled internally by IterativePALPooler).
-        baseline_acc, baseline_auroc = _compute_accuracy_from_features(
+        baseline_acc, baseline_auroc, baseline_per_class = _compute_accuracy_from_features(
             baseline_support, train_labels, test_mean_proj, test_labels,
             n_estimators=text_cfg.tabicl_n_estimators, seed=cfg.seed,
         )
+        if cfg.run.per_class_accuracy:
+            _print_per_class_accuracy("[mean-pool]", baseline_per_class, idx_to_class)
         if cls_acc is not None:
             print(f"\n[cls-token]  test accuracy: {cls_acc:.4f}  auroc: {cls_auroc:.4f}")
         else:
@@ -1068,7 +1136,7 @@ def run_pal_experiment(
                 stage._pca_.transform(test_pooled).astype(np.float32)
                 if stage._pca_ is not None else test_pooled
             )
-            iter_acc, iter_auroc = _compute_accuracy_from_features(
+            iter_acc, iter_auroc, iter_per_class = _compute_accuracy_from_features(
                 stage._support_projected_, stage.support_labels_, test_query, test_labels,
                 n_estimators=text_cfg.tabicl_n_estimators, seed=cfg.seed,
             )
@@ -1076,6 +1144,8 @@ def run_pal_experiment(
             print(f"[{tag}] test accuracy: {iter_acc:.4f}  auroc: {iter_auroc:.4f}  "
                   f"(fit {stage.fit_time_s_:.1f}s, pool {stage.pool_time_s_:.1f}s, "
                   f"eval {eval_time_s:.1f}s)")
+            if cfg.run.per_class_accuracy:
+                _print_per_class_accuracy(tag, iter_per_class, idx_to_class)
             all_results.append((
                 tag, iter_acc, iter_auroc, {},
                 stage.fit_time_s_ + stage.pool_time_s_, eval_time_s,
@@ -1268,6 +1338,7 @@ def run_pal_experiment(
     # --- CLS token baseline ---
     cls_acc:   Optional[float] = None
     cls_auroc: Optional[float] = None
+    cls_per_class_img: Optional[dict] = None
     if cls_train_feats is not None and cls_test_feats is not None:
         cls_pca: Optional[PCA] = None
         if cfg.refinement.tabicl_pca_dim is not None:
@@ -1278,10 +1349,12 @@ def run_pal_experiment(
         else:
             cls_support = cls_train_feats
             cls_test_q  = cls_test_feats
-        cls_acc, cls_auroc = _compute_accuracy_from_features(
+        cls_acc, cls_auroc, cls_per_class_img = _compute_accuracy_from_features(
             cls_support, train_labels, cls_test_q, test_labels,
             n_estimators=cfg.refinement.tabicl_n_estimators, seed=cfg.seed,
         )
+        if cfg.run.per_class_accuracy and cls_per_class_img is not None:
+            _print_per_class_accuracy("[cls-token]", cls_per_class_img, idx_to_class)
 
     # --- Image paths + opener for visualisation (only loaded when needed) ---
     train_image_paths: list = []
@@ -1305,6 +1378,8 @@ def run_pal_experiment(
         elif cfg.dataset.dataset in ("cbis-ddsm-mass", "cbis-ddsm-calc"):
             kind = "mass" if cfg.dataset.dataset == "cbis-ddsm-mass" else "calc"
             train_image_paths, test_image_paths = _get_cbis_ddsm_image_paths(cfg.dataset.dataset_path, kind=kind)
+        elif cfg.dataset.dataset in IMAGENET_SUBSETS:
+            train_image_paths, test_image_paths = _get_imagenet_image_paths(cfg.dataset.dataset)
 
         # Keep train_image_paths aligned with train_patches by applying the same
         # index selections that _load_features and _balance_classes applied.
@@ -1323,10 +1398,12 @@ def run_pal_experiment(
     test_sample_idx  = rng.choice(len(test_labels),  size=min(cfg.dataset.n_sample, len(test_labels)),  replace=False)
 
     # --- Baseline: accuracy + visual eval at original patch resolution ---
-    baseline_acc, baseline_auroc = _compute_accuracy(
+    baseline_acc, baseline_auroc, baseline_per_class = _compute_accuracy(
         baseline_support, train_labels, test_patches, test_labels,
         pca=pca, n_estimators=cfg.refinement.tabicl_n_estimators, seed=cfg.seed,
     )
+    if cfg.run.per_class_accuracy:
+        _print_per_class_accuracy("[mean-pool]", baseline_per_class, idx_to_class)
     if cls_acc is not None:
         print(f"\n[cls-token]  test accuracy: {cls_acc:.4f}  auroc: {cls_auroc:.4f}")
     else:
@@ -1362,6 +1439,7 @@ def run_pal_experiment(
             show_per_class_probs=cfg.run.show_per_class_probs,
             use_attn_masking=cfg.refinement.use_attn_masking,
             binary_dist=cfg.refinement.binary_dist,
+            unified_weight_limits=cfg.run.unified_weight_limits,
         )
     else:
         baseline_mean_probs = {}
@@ -1440,6 +1518,7 @@ def run_pal_experiment(
             show_per_class_probs=cfg.run.show_per_class_probs,
             use_attn_masking=cfg.refinement.use_attn_masking,
             binary_dist=cfg.refinement.binary_dist,
+            unified_weight_limits=cfg.run.unified_weight_limits,
         )
 
     total_time_s = time.perf_counter() - experiment_start

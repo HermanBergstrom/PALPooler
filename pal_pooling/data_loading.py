@@ -22,14 +22,22 @@ from torch.utils.data import Dataset
 
 from pal_pooling.config import (
     AG_NEWS_DATASET_PATH,
+    AIRBNB_DATASET_PATH,
     BUTTERFLY_DATASET_PATH,
     CBIS_DDSM_DATASET_PATH,
     CLOTHING_DATASET_PATH,
+    FAKE_JOBS_DATASET_PATH,
     FEATURES_DIR,
+    IMAGENET_EMBEDDINGS_PATH,
+    IMAGENET_IMAGES_PATH,
+    IMAGENET_SUBSETS,
+    JIGSAW_DATASET_PATH,
     PAD_UFES_DATASET_PATH,
     PETFINDER_DATASET_PATH,
+    PRODUCT_SENTIMENT_DATASET_PATH,
     RSNA_DATASET_PATH,
     SALARY_INDIA_DATASET_PATH,
+    WINE_REVIEWS_DATASET_PATH,
     YELP_DATASET_PATH,
     DatasetConfig,
 )
@@ -280,6 +288,31 @@ def _get_pad_ufes_image_paths(
 
     train_paths = [_stem_to_path(Path(r["img_id"]).stem) for _, r in df_train.iterrows()]
     test_paths  = [_stem_to_path(Path(r["img_id"]).stem) for _, r in df_test.iterrows()]
+    return train_paths, test_paths
+
+
+def _get_imagenet_image_paths(
+    dataset_name: str,
+    embeddings_root: Path = IMAGENET_EMBEDDINGS_PATH,
+    images_root: Path = IMAGENET_IMAGES_PATH,
+) -> tuple[list[Path], list[Path]]:
+    """Return (train_paths, test_paths) for an ImageNet subset.
+
+    Iteration order mirrors _load_features exactly: synsets in IMAGENET_SUBSETS
+    order, files sorted lexicographically within each synset/split, matching the
+    feature array row order.
+    """
+    synsets = IMAGENET_SUBSETS[dataset_name]
+    train_paths: list[Path] = []
+    test_paths:  list[Path] = []
+
+    for synset in synsets:
+        for split, paths_list in [("train", train_paths), ("val", test_paths)]:
+            emb_dir = embeddings_root / synset / split
+            img_dir = images_root / split / synset
+            for npy_path in sorted(emb_dir.glob("*.npy")):
+                paths_list.append(img_dir / (npy_path.stem + ".JPEG"))
+
     return train_paths, test_paths
 
 
@@ -1138,6 +1171,146 @@ def _load_features(
 
         n_train = None
 
+    elif dataset_cfg.dataset == "airbnb":
+        airbnb_dir = str(Path(dataset_cfg.dataset_path))
+        if airbnb_dir not in sys.path:
+            sys.path.insert(0, airbnb_dir)
+        from airbnb_melbourne_dataset import AirbnbMelbourneDataset  # type: ignore
+        ds = AirbnbMelbourneDataset(Path(dataset_cfg.dataset_path))
+        idx_to_class = {i: str(c) for i, c in enumerate(ds.classes)}
+        train_idx, test_idx = ds.default_split()
+
+        (train_patches, train_labels, cls_train,
+         tab_tr, train_token_ids, train_attention_mask) = _collect_electra_tabular(ds, train_idx)
+        (test_patches, test_labels, cls_test,
+         tab_te, test_token_ids, test_attention_mask) = _collect_electra_tabular(ds, test_idx)
+
+        extra_data = {
+            "train_token_ids":      train_token_ids,
+            "train_attention_mask": train_attention_mask,
+            "test_token_ids":       test_token_ids,
+            "test_attention_mask":  test_attention_mask,
+        }
+        if load_tabular:
+            extra_data["tab_train"] = tab_tr
+            extra_data["tab_test"]  = tab_te
+
+        print(f"[info] airbnb (train): N={len(train_labels)}  "
+              f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] airbnb (test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "product-sentiment":
+        prod_dir = str(Path(dataset_cfg.dataset_path))
+        if prod_dir not in sys.path:
+            sys.path.insert(0, prod_dir)
+        from product_sentiment_dataset import ProductSentimentDataset  # type: ignore
+        ds = ProductSentimentDataset(Path(dataset_cfg.dataset_path))
+        idx_to_class = {i: str(c) for i, c in enumerate(ds.classes)}
+        train_idx, test_idx = ds.default_split(random_state=seed)
+
+        (train_patches, train_labels, cls_train,
+         tab_tr, train_token_ids, train_attention_mask) = _collect_electra_tabular(ds, train_idx)
+        (test_patches, test_labels, cls_test,
+         tab_te, test_token_ids, test_attention_mask) = _collect_electra_tabular(ds, test_idx)
+
+        extra_data = {
+            "train_token_ids":      train_token_ids,
+            "train_attention_mask": train_attention_mask,
+            "test_token_ids":       test_token_ids,
+            "test_attention_mask":  test_attention_mask,
+        }
+        if load_tabular:
+            extra_data["tab_train"] = tab_tr
+            extra_data["tab_test"]  = tab_te
+
+        print(f"[info] product-sentiment (train): N={len(train_labels)}  "
+              f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] product-sentiment (test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "wine-reviews":
+        wine_dir = str(Path(dataset_cfg.dataset_path))
+        if wine_dir not in sys.path:
+            sys.path.insert(0, wine_dir)
+        from wine_reviews_dataset import WineReviewsDataset  # type: ignore
+        ds = WineReviewsDataset(Path(dataset_cfg.dataset_path))
+        idx_to_class = {i: str(c) for i, c in enumerate(ds.classes)}
+        train_idx, test_idx = ds.default_split(random_state=seed)
+
+        (train_patches, train_labels, cls_train,
+         tab_tr, train_token_ids, train_attention_mask) = _collect_electra_tabular(ds, train_idx)
+        (test_patches, test_labels, cls_test,
+         tab_te, test_token_ids, test_attention_mask) = _collect_electra_tabular(ds, test_idx)
+
+        extra_data = {
+            "train_token_ids":      train_token_ids,
+            "train_attention_mask": train_attention_mask,
+            "test_token_ids":       test_token_ids,
+            "test_attention_mask":  test_attention_mask,
+        }
+        if load_tabular:
+            extra_data["tab_train"] = tab_tr
+            extra_data["tab_test"]  = tab_te
+
+        print(f"[info] wine-reviews (train): N={len(train_labels)}  "
+              f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] wine-reviews (test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "fake-jobs":
+        fakejobs_dir = str(Path(dataset_cfg.dataset_path))
+        if fakejobs_dir not in sys.path:
+            sys.path.insert(0, fakejobs_dir)
+        from fake_jobs_dataset import FakeJobsDataset  # type: ignore
+        ds = FakeJobsDataset(Path(dataset_cfg.dataset_path))
+        idx_to_class = {i: str(c) for i, c in enumerate(ds.classes)}
+        train_idx, test_idx = ds.default_split(random_state=seed)
+
+        (train_patches, train_labels, cls_train,
+         tab_tr, train_token_ids, train_attention_mask) = _collect_electra_tabular(ds, train_idx)
+        (test_patches, test_labels, cls_test,
+         tab_te, test_token_ids, test_attention_mask) = _collect_electra_tabular(ds, test_idx)
+
+        extra_data = {
+            "train_token_ids":      train_token_ids,
+            "train_attention_mask": train_attention_mask,
+            "test_token_ids":       test_token_ids,
+            "test_attention_mask":  test_attention_mask,
+        }
+        if load_tabular:
+            extra_data["tab_train"] = tab_tr
+            extra_data["tab_test"]  = tab_te
+
+        print(f"[info] fake-jobs (train): N={len(train_labels)}  "
+              f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] fake-jobs (test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "jigsaw":
+        jigsaw_dir = str(Path(dataset_cfg.dataset_path))
+        if jigsaw_dir not in sys.path:
+            sys.path.insert(0, jigsaw_dir)
+        from jigsaw_dataset import JigsawDataset  # type: ignore
+        ds = JigsawDataset(Path(dataset_cfg.dataset_path))
+        idx_to_class = {i: str(c) for i, c in enumerate(ds.classes)}
+        train_idx, test_idx = ds.default_split()
+
+        (train_patches, train_labels, cls_train,
+         tab_tr, train_token_ids, train_attention_mask) = _collect_electra_tabular(ds, train_idx)
+        (test_patches, test_labels, cls_test,
+         tab_te, test_token_ids, test_attention_mask) = _collect_electra_tabular(ds, test_idx)
+
+        extra_data = {
+            "train_token_ids":      train_token_ids,
+            "train_attention_mask": train_attention_mask,
+            "test_token_ids":       test_token_ids,
+            "test_attention_mask":  test_attention_mask,
+        }
+        if load_tabular:
+            extra_data["tab_train"] = tab_tr
+            extra_data["tab_test"]  = tab_te
+
+        print(f"[info] jigsaw (train): N={len(train_labels)}  "
+              f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] jigsaw (test):  N={len(test_labels)}")
+
     elif dataset_cfg.dataset in ("clothing", "salary"):
         from sklearn.model_selection import train_test_split as _tts
 
@@ -1180,11 +1353,46 @@ def _load_features(
               f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] {dataset_cfg.dataset} (test):  N={len(test_labels)}")
 
+    elif dataset_cfg.dataset in IMAGENET_SUBSETS:
+        synsets = IMAGENET_SUBSETS[dataset_cfg.dataset]
+        embeddings_root = Path(dataset_cfg.dataset_path)
+
+        train_patches_list, train_labels_list = [], []
+        test_patches_list,  test_labels_list  = [], []
+        cls_train_list, cls_test_list = [], []
+
+        for label_idx, synset in enumerate(synsets):
+            synset_dir = embeddings_root / synset
+            for split_dir, patches_list, labels_list, cls_list in [
+                (synset_dir / "train", train_patches_list, train_labels_list, cls_train_list),
+                (synset_dir / "val",   test_patches_list,  test_labels_list,  cls_test_list),
+            ]:
+                for npy_path in sorted(split_dir.glob("*.npy")):
+                    emb = np.load(npy_path)          # (201, 768): row 0 = CLS, rows 1-4 = register tokens, rows 5: = 196 spatial patches
+                    cls_list.append(emb[0])
+                    patches_list.append(emb[5:])
+                    labels_list.append(label_idx)
+
+        train_patches = np.stack(train_patches_list, axis=0).astype(np.float32)
+        train_labels  = np.array(train_labels_list, dtype=np.int64)
+        cls_train     = np.stack(cls_train_list, axis=0).astype(np.float32)
+        test_patches  = np.stack(test_patches_list, axis=0).astype(np.float32)
+        test_labels   = np.array(test_labels_list, dtype=np.int64)
+        cls_test      = np.stack(cls_test_list, axis=0).astype(np.float32)
+
+        idx_to_class = {i: s for i, s in enumerate(synsets)}
+
+        print(f"[info] {dataset_cfg.dataset} (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] {dataset_cfg.dataset} (test):  N={len(test_labels)}")
+
     else:
         raise ValueError(f"Unknown dataset '{dataset_cfg.dataset}'. "
                          f"Choices: butterfly, rsna, petfinder, dvm, pad-ufes, "
                          f"cbis-ddsm-mass, cbis-ddsm-calc, imdb, 20news, ag_news, yelp, "
-                         f"clothing, salary")
+                         f"clothing, salary, airbnb, fake-jobs, jigsaw, "
+                         f"product-sentiment, wine-reviews, " +
+                         f", ".join(sorted(IMAGENET_SUBSETS)))
 
     # --- Optional n_train subsampling for non-RSNA/DVM datasets ---
     if dataset_cfg.n_train is not None and dataset_cfg.n_train < len(train_labels):

@@ -45,9 +45,11 @@ from sklearn.metrics import roc_auc_score
 from tabicl import TabICLClassifier
 
 from pal_pooling.config import (
-    CBIS_DDSM_DATASET_PATH, CLOTHING_DATASET_PATH, DatasetConfig, DVM_DATASET_PATH,
-    FEATURES_DIR, PAD_UFES_DATASET_PATH, PETFINDER_DATASET_PATH, ImagePALConfig,
-    SALARY_INDIA_DATASET_PATH, TextPALConfig, get_modality,
+    AIRBNB_DATASET_PATH, CBIS_DDSM_DATASET_PATH, CLOTHING_DATASET_PATH, DatasetConfig,
+    DVM_DATASET_PATH, FAKE_JOBS_DATASET_PATH, FEATURES_DIR, JIGSAW_DATASET_PATH,
+    PAD_UFES_DATASET_PATH, PETFINDER_DATASET_PATH,
+    ImagePALConfig, PRODUCT_SENTIMENT_DATASET_PATH, SALARY_INDIA_DATASET_PATH,
+    TextPALConfig, WINE_REVIEWS_DATASET_PATH, get_modality,
 )
 from pal_pooling.data_loading import _load_features
 from pal_pooling.pal_pooler import IterativePALPooler, pooler_factory
@@ -160,8 +162,13 @@ def _load_dataset(
         "pad-ufes":       "dinov3_local",
         "cbis-ddsm-mass": "dinov3_local",
         "cbis-ddsm-calc": "dinov3_local",
-        "clothing":       "electra",
-        "salary":         "electra",
+        "clothing":          "electra",
+        "salary":            "electra",
+        "airbnb":            "electra",
+        "fake-jobs":         "electra",
+        "jigsaw":            "electra",
+        "product-sentiment": "electra",
+        "wine-reviews":      "electra",
     }
     _SUPPORTS_TEXT = {"petfinder"}
     dataset_cfg = DatasetConfig(
@@ -199,7 +206,8 @@ def _load_dataset(
         train_labels  = train_labels[idx]
         cls_train     = cls_train[idx]
         tab_train     = tab_train[idx]
-        for k in ["text_train", "text_train_token_ids", "text_train_attn_mask", "text_cls_train"]:
+        for k in ["text_train", "text_train_token_ids", "text_train_attn_mask", "text_cls_train",
+                  "train_attention_mask", "train_token_ids"]:
             if extra_data.get(k) is not None:
                 extra_data[k] = extra_data[k][idx]
 
@@ -338,12 +346,12 @@ def _run_single_seed(
     if has_text:
         # ── Baseline: text mean-pool (exclude CLS at pos 0) -────────────────
         print("\n--- mean_pool_text ---")
-        valid_mask_tr = text_train_attn.copy(); valid_mask_tr[:, 0] = False
-        valid_mask_te = text_test_attn.copy();  valid_mask_te[:, 0] = False
-        counts_tr = valid_mask_tr.sum(axis=1, keepdims=True).clip(min=1)
-        counts_te = valid_mask_te.sum(axis=1, keepdims=True).clip(min=1)
-        mean_text_raw_tr = (text_train * valid_mask_tr[:, :, None]).sum(axis=1) / counts_tr
-        mean_text_raw_te = (text_test  * valid_mask_te[:, :, None]).sum(axis=1) / counts_te
+        counts_tr = (text_train_attn.sum(axis=1, keepdims=True) - text_train_attn[:, 0:1]).clip(min=1)
+        counts_te = (text_test_attn.sum(axis=1, keepdims=True)  - text_test_attn[:, 0:1]).clip(min=1)
+        full_sum_tr = np.matmul(text_train_attn[:, None, :].astype(text_train.dtype), text_train).squeeze(1)
+        mean_text_raw_tr = (full_sum_tr - text_train[:, 0, :] * text_train_attn[:, 0:1]) / counts_tr
+        full_sum_te = np.matmul(text_test_attn[:, None, :].astype(text_test.dtype), text_test).squeeze(1)
+        mean_text_raw_te = (full_sum_te - text_test[:, 0, :]  * text_test_attn[:, 0:1])  / counts_te
         mean_text_tr, mean_text_te, _ = _pca_project(mean_text_raw_tr, mean_text_raw_te, pca_dim, seed)
         _eval("mean_pool_text", mean_text_tr, mean_text_te)
 
@@ -587,8 +595,13 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
             "pad-ufes":       PAD_UFES_DATASET_PATH,
             "cbis-ddsm-mass": CBIS_DDSM_DATASET_PATH,
             "cbis-ddsm-calc": CBIS_DDSM_DATASET_PATH,
-            "clothing":       CLOTHING_DATASET_PATH,
-            "salary":         SALARY_INDIA_DATASET_PATH,
+            "clothing":          CLOTHING_DATASET_PATH,
+            "salary":            SALARY_INDIA_DATASET_PATH,
+            "airbnb":            AIRBNB_DATASET_PATH,
+            "fake-jobs":         FAKE_JOBS_DATASET_PATH,
+            "jigsaw":            JIGSAW_DATASET_PATH,
+            "product-sentiment": PRODUCT_SENTIMENT_DATASET_PATH,
+            "wine-reviews":      WINE_REVIEWS_DATASET_PATH,
         }[args.dataset]
 
     output_dir = Path(args.output_dir) if args.output_dir is not None else Path("results/multimodal") / args.dataset
@@ -646,7 +659,8 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dataset",        type=str,   default="petfinder",
                    choices=["petfinder", "dvm", "pad-ufes", "cbis-ddsm-mass", "cbis-ddsm-calc",
-                            "clothing", "salary"],
+                            "clothing", "salary", "airbnb", "fake-jobs", "jigsaw",
+                            "product-sentiment", "wine-reviews"],
                    help="Dataset to run multimodal experiment on")
     p.add_argument("--dataset-path",   type=Path,  default=None,
                    help="Root directory of the dataset (defaults to config value)")

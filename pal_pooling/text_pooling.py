@@ -31,6 +31,7 @@ from sklearn.preprocessing import StandardScaler
 from pal_pooling.config import TextPALConfig
 from pal_pooling.patch_pooling import (
     RidgeGPU,
+    _class_normalize_scores,
     compute_patch_quality_logits,
     compute_patch_quality_logits_gpu,
 )
@@ -639,6 +640,16 @@ def refine_text_features(
     if verbose: print(f"[text_ridge] Fitting Ridge(alpha={refinement_cfg.ridge_alpha}) on "
           f"{len(fit_features):,} group samples (D={D}, mode={text_group_mode}, "
           f"method={refinement_cfg.weight_method}, backend={backend}) ...")
+    if getattr(refinement_cfg, "class_normalized_scores", False):
+        import torch as _torch_cn
+        _tgt_np = (
+            all_targets.cpu().numpy() if isinstance(all_targets, _torch_cn.Tensor)
+            else np.asarray(all_targets, dtype=np.float32)
+        )
+        all_targets = _class_normalize_scores(
+            _tgt_np, source_labels[fit_sample_idx].astype(np.int64), verbose=verbose
+        )
+
     if gpu_ridge_device:
         ridge_model: Union[Ridge, RidgeGPU] = RidgeGPU(
             alpha=refinement_cfg.ridge_alpha, device=gpu_ridge_device
@@ -659,7 +670,7 @@ def refine_text_features(
     weights_ridge = _ridge_pool_weights_text(
         grouped, group_mask, ridge_model, feature_scaler
     )  # [N, G_max]
-    repooled_raw = (weights_ridge[:, :, None] * grouped).sum(axis=1).astype(np.float32)  # [N, D]
+    repooled_raw = np.matmul(weights_ridge[:, None, :], grouped).squeeze(1).astype(np.float32)  # [N, D]
 
     if pca is not None:
         new_pca = PCA(n_components=pca.n_components_, random_state=seed)
@@ -917,7 +928,7 @@ def fit_ridge_repool_text(
 
     if verbose: print("[cv_ridge_text] Pooling all training samples with Ridge weights ...")
     weights_ridge = _ridge_pool_weights_text(all_grouped, all_group_mask, ridge_model, feature_scaler)
-    repooled_raw = (weights_ridge[:, :, None] * all_grouped).sum(axis=1).astype(np.float32)
+    repooled_raw = np.matmul(weights_ridge[:, None, :], all_grouped).squeeze(1).astype(np.float32)
 
     if pca is not None:
         new_pca = PCA(n_components=pca.n_components_, random_state=seed)

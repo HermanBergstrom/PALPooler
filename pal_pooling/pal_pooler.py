@@ -63,6 +63,7 @@ from pal_pooling.config import ImagePALConfig, TextPALConfig
 from tabicl import TabICLClassifier
 
 from pal_pooling.patch_pooling import (
+    _class_normalize_scores,
     _ridge_pool_weights,
     group_patches,
     refine_dataset_features,
@@ -353,9 +354,7 @@ class ImagePALPooler(PALPooler):
             verbose=self.verbose,
         )
 
-        repooled_raw = (
-            weights_ridge[:, :, None] * grouped
-        ).sum(axis=1).astype(np.float32)
+        repooled_raw = np.matmul(weights_ridge[:, None, :], grouped).squeeze(1).astype(np.float32)
 
         self.ridge_model_          = ridge_model
         self.feature_scaler_       = feature_scaler
@@ -411,7 +410,7 @@ class ImagePALPooler(PALPooler):
         grouped = group_patches(patches, self.refinement_cfg.patch_group_sizes)
         grouped = _append_cls(grouped, cls_tokens)
         weights = _ridge_pool_weights(grouped, self.ridge_model_, self.feature_scaler_)
-        return (weights[:, :, None] * grouped).sum(axis=1)
+        return np.matmul(weights[:, None, :], grouped).squeeze(1)
 
     def fit_transform(
         self,
@@ -635,7 +634,7 @@ class TextPALPooler(PALPooler):
             # Mean pool over valid groups per sequence.
             valid_counts = group_mask.sum(axis=1, keepdims=True).clip(min=1)  # [N, 1]
             support_raw  = (
-                (grouped * group_mask[:, :, None]).sum(axis=1) / valid_counts
+                np.matmul(group_mask[:, None, :].astype(grouped.dtype), grouped).squeeze(1) / valid_counts
             ).astype(np.float32)  # [N, D]
             if self.pca_dim is not None:
                 n_comp      = min(self.pca_dim, N, D)
@@ -676,9 +675,7 @@ class TextPALPooler(PALPooler):
         )
 
         # Re-pool in original D-space for raw support (same as image path).
-        repooled_raw = (
-            weights_ridge[:, :, None] * grouped
-        ).sum(axis=1).astype(np.float32)  # [N, D]
+        repooled_raw = np.matmul(weights_ridge[:, None, :], grouped).squeeze(1).astype(np.float32)  # [N, D]
 
         self.ridge_model_        = ridge_model
         self.feature_scaler_     = feature_scaler
@@ -749,7 +746,7 @@ class TextPALPooler(PALPooler):
         weights = _ridge_pool_weights_text(
             grouped, group_mask, self.ridge_model_, self.feature_scaler_
         )
-        return (weights[:, :, None] * grouped).sum(axis=1)
+        return np.matmul(weights[:, None, :], grouped).squeeze(1)
 
     def fit_transform(
         self,
@@ -1456,7 +1453,7 @@ class IterativePALPooler:
             token_ids = np.asarray(token_ids)
             _valid = (token_ids != 0) & (token_ids != self.refinement_cfg.cls_token_id)
             valid_counts = _valid.sum(axis=1, keepdims=True).clip(min=1)
-            support_raw = ((data * _valid[:, :, None]).sum(axis=1) / valid_counts).astype(np.float32)
+            support_raw = (np.matmul(_valid[:, None, :].astype(data.dtype), data).squeeze(1) / valid_counts).astype(np.float32)
             if self.refinement_cfg.append_cls and cls_tokens is not None:
                 _cls = np.asarray(cls_tokens, dtype=np.float32)
                 support_raw = np.concatenate([support_raw[:, None, :], _cls[:, None, :]], axis=1).mean(axis=1)
@@ -1667,6 +1664,7 @@ class IterativePALPooler:
         X_all: List[np.ndarray] = []
         y_all: List[np.ndarray] = []
         sw_all: List[np.ndarray] = []
+        labels_all: List[np.ndarray] = []
         fold_splits: List[tuple] = []
 
         for fold in range(N_FOLDS):
@@ -1723,6 +1721,7 @@ class IterativePALPooler:
                 )
                 X_all.append(X)
                 y_all.append(y)
+                labels_all.append(np.repeat(labels[val_idx], all_grouped.shape[1]))
             else:
                 X, y, sw = collect_pseudo_labels_text(
                     all_grouped[val_idx],
@@ -1742,10 +1741,17 @@ class IterativePALPooler:
                 y_all.append(y)
                 if sw is not None:
                     sw_all.append(sw)
+                labels_all.append(
+                    np.repeat(labels[val_idx], all_group_mask[val_idx].sum(axis=1))
+                )
 
         X_concat = np.concatenate(X_all, axis=0)
         y_concat = np.concatenate(y_all, axis=0)
         sw_concat = np.concatenate(sw_all, axis=0) if sw_all else None
+
+        if getattr(stage.refinement_cfg, "class_normalized_scores", False) and labels_all:
+            labels_concat = np.concatenate(labels_all, axis=0)
+            y_concat = _class_normalize_scores(y_concat, labels_concat, verbose=self.verbose)
 
         # Fit Ridge once on all N accumulated pseudo-labels, repool all N.
         if is_image:
@@ -1755,7 +1761,7 @@ class IterativePALPooler:
                     stage.refinement_cfg, self.seed, self.gpu_ridge_device,
                     verbose=self.verbose,
                 )
-            repooled_raw = (weights_ridge[:, :, None] * all_grouped).sum(axis=1).astype(np.float32)
+            repooled_raw = np.matmul(weights_ridge[:, None, :], all_grouped).squeeze(1).astype(np.float32)
         else:
             refined, new_pca, weights_ridge, ridge_model, feature_scaler, fit_t, pool_t = \
                 fit_ridge_repool_text(
@@ -1764,7 +1770,7 @@ class IterativePALPooler:
                     sample_weight=sw_concat,
                     verbose=self.verbose,
                 )
-            repooled_raw = (weights_ridge[:, :, None] * all_grouped).sum(axis=1).astype(np.float32)
+            repooled_raw = np.matmul(weights_ridge[:, None, :], all_grouped).squeeze(1).astype(np.float32)
 
         # Empirical class prior from all N labels.
         n_cls = int(labels.max()) + 1

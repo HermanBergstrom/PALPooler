@@ -15,7 +15,30 @@ AG_NEWS_DATASET_PATH     = Path("/project/aip-rahulgk/image_icl_project/ag_news"
 YELP_DATASET_PATH        = Path("/project/aip-rahulgk/image_icl_project/yelp")
 CLOTHING_DATASET_PATH    = Path("/project/aip-rahulgk/image_icl_project/womens-ecommerce-clothing-reviews")
 SALARY_INDIA_DATASET_PATH = Path("/project/aip-rahulgk/image_icl_project/predict-the-data-scientists-salary-in-india")
+AIRBNB_DATASET_PATH           = Path("/project/aip-rahulgk/image_icl_project/airbnb-melbourne")
+FAKE_JOBS_DATASET_PATH         = Path("/project/6101781/image_icl_project/fake-jobs")
+JIGSAW_DATASET_PATH            = Path("/project/6101781/image_icl_project/jigsaw")
+PRODUCT_SENTIMENT_DATASET_PATH = Path("/project/6101781/image_icl_project/product-sentiment")
+WINE_REVIEWS_DATASET_PATH      = Path("/project/6101781/image_icl_project/wine-reviews")
 FEATURES_DIR            = Path("/scratch/hermanb/temp_datasets/extracted_features")
+IMAGENET_EMBEDDINGS_PATH = Path("/project/aip-rahulgk/image_icl_project/imagenet_embeddings_dinov3")
+IMAGENET_IMAGES_PATH     = Path("/datasets/imagenet")
+
+# Mapping from imagenet subset name → list of ImageNet synset IDs.
+IMAGENET_SUBSETS: Dict[str, List[str]] = {
+    "imagenet-beetle":       ["n02165105", "n02165456", "n02167151", "n02168699", "n02169497", "n02172182", "n02174001", "n02177972"],
+    "imagenet-birds":        ["n01518878", "n01614925", "n01806143", "n01818515", "n01819313", "n01843383", "n01860187", "n02007558", "n02051845", "n02056570"],
+    "imagenet-cats":         ["n02123045", "n02123159", "n02123394", "n02123597", "n02124075", "n02127052", "n02128757", "n02128925", "n02129165", "n02129604"],
+    "imagenet-feline":       ["n02123045", "n02123159", "n02123394", "n02123597", "n02124075", "n02125311", "n02127052", "n02128385", "n02128757", "n02128925"],
+    "imagenet-fruits":       ["n07718472", "n07720875", "n07742313", "n07745940", "n07747607", "n07749582", "n07753113", "n07753275", "n07753592", "n07768694"],
+    "imagenet-monkey":       ["n02484975", "n02486261", "n02486410", "n02487347", "n02488291", "n02488702", "n02489166", "n02490219", "n02492035", "n02492660"],
+    "imagenet-motor-vehicle":["n02701002", "n02704792", "n02814533", "n02930766", "n03100240", "n03345487", "n03417042", "n03444034", "n03445924", "n03594945"],
+    "imagenet-snake":        ["n01728572", "n01728920", "n01729322", "n01729977", "n01734418", "n01735189", "n01737021", "n01739381", "n01740131", "n01742172"],
+    "imagenet-sporting-dog": ["n02099267", "n02099429", "n02099601", "n02099712", "n02099849", "n02100236", "n02100583", "n02100735", "n02100877", "n02101006"],
+    "imagenet-terrier":      ["n02093256", "n02093428", "n02093647", "n02093754", "n02093859", "n02093991", "n02094114", "n02094258", "n02094433", "n02095314"],
+    "imagenet-vessel":       ["n02687172", "n02951358", "n02981792", "n03095699", "n03344393", "n03447447", "n03662601", "n03673027", "n03947888", "n04147183"],
+    "imagenet-working-dog":  ["n02104029", "n02104365", "n02105056", "n02105162", "n02105251", "n02105412", "n02105505", "n02105641", "n02105855", "n02106030"],
+}
 
 # Maps each dataset name to its modality.  Image datasets default to DINOv3;
 # text datasets default to ELECTRA.
@@ -31,8 +54,14 @@ MODALITY_MAP: Dict[str, str] = {
     "20news":         "text",
     "ag_news":        "text",
     "yelp":           "text",
-    "clothing":       "text",
-    "salary":         "text",
+    "clothing":         "text",
+    "salary":           "text",
+    "airbnb":           "text",
+    "fake-jobs":        "text",
+    "jigsaw":           "text",
+    "product-sentiment":"text",
+    "wine-reviews":     "text",
+    **{name: "image" for name in IMAGENET_SUBSETS},
 }
 
 # Default backbone per modality (used when --backbone is not set by the user).
@@ -84,6 +113,7 @@ class PALConfig:
     prior: str = "label_frequency"
     train_val_fraction: Optional[float] = None
     cross_validation_cap: Optional[int] = None
+    class_normalized_scores: bool = False
 
 
 @dataclass(kw_only=True)
@@ -143,6 +173,8 @@ class RunConfig:
     show_pred_label: bool
     show_minority_prob: bool
     show_per_class_probs: bool
+    unified_weight_limits: bool
+    per_class_accuracy: bool
     n_train_sweep: Optional[List[int]]
     seeds: Optional[List[int]] = None
 
@@ -158,10 +190,13 @@ class ExperimentConfig:
 
 def parse_args() -> ExperimentConfig:
     p = argparse.ArgumentParser(description="Patch quality evaluation with TabICL")
+    _imagenet_choices = sorted(IMAGENET_SUBSETS.keys())
     p.add_argument("--dataset",       type=str,   default="butterfly",
                    choices=["butterfly", "rsna", "petfinder", "dvm", "pad-ufes",
                             "cbis-ddsm-mass", "cbis-ddsm-calc", "imdb", "20news",
-                            "ag_news", "yelp", "clothing", "salary"],
+                            "ag_news", "yelp", "clothing", "salary", "airbnb",
+                            "fake-jobs", "jigsaw", "product-sentiment", "wine-reviews"]
+                           + _imagenet_choices,
                    help="Which dataset to run on")
     p.add_argument("--backbone",      type=str,   default=None,
                    choices=["rad-dino", "dinov3", "mae", "ijepa", "electra"],
@@ -300,12 +335,22 @@ def parse_args() -> ExperimentConfig:
                    help="Add a P(minority class) panel with image-local colour scale to visualisation figures.")
     p.add_argument("--per-class-probs-viz", action="store_true",
                    help="Add one P(class k) heatmap panel per class (only when n_classes <= 10).")
+    p.add_argument("--unified-weight-limits", action="store_true",
+                   help="Use shared vmin/vmax across all sampled images for each weight panel, "
+                        "instead of per-image auto-scaling.")
+    p.add_argument("--per-class-accuracy", action="store_true",
+                   help="Print per-class accuracy for all evaluation points (baseline, CLS, each stage).")
     p.add_argument("--n-train-sweep", type=int, nargs="+", default=None,
                    metavar="N",
                    help="Run one experiment per value and collect results into a single sweep_results.json. Mutually exclusive with --n-train.")
     p.add_argument("--seeds", type=int, nargs="+", default=None,
                    metavar="S",
                    help="Run the experiment once per seed and save results continuously. Mutually exclusive with --seed.")
+    p.add_argument("--class-normalized-scores", action="store_true",
+                   help="Before fitting Ridge, standardize quality logits within each class: "
+                        "s~_i = (s_i - mu_c) / sigma_c where c is the class of sample i. "
+                        "Preserves relative within-class variation even when classes have "
+                        "systematically different score levels.")
 
     args = p.parse_args()
 
@@ -326,8 +371,14 @@ def parse_args() -> ExperimentConfig:
         "20news":         TWENTY_NEWS_DATASET_PATH,
         "ag_news":        AG_NEWS_DATASET_PATH,
         "yelp":           YELP_DATASET_PATH,
-        "clothing":       CLOTHING_DATASET_PATH,
-        "salary":         SALARY_INDIA_DATASET_PATH,
+        "clothing":          CLOTHING_DATASET_PATH,
+        "salary":            SALARY_INDIA_DATASET_PATH,
+        "airbnb":            AIRBNB_DATASET_PATH,
+        "fake-jobs":         FAKE_JOBS_DATASET_PATH,
+        "jigsaw":            JIGSAW_DATASET_PATH,
+        "product-sentiment": PRODUCT_SENTIMENT_DATASET_PATH,
+        "wine-reviews":      WINE_REVIEWS_DATASET_PATH,
+        **{name: IMAGENET_EMBEDDINGS_PATH for name in IMAGENET_SUBSETS},
     }
     dataset_path = args.dataset_path or _dataset_defaults[args.dataset]
 
@@ -378,6 +429,7 @@ def parse_args() -> ExperimentConfig:
             length_importance_floor=args.length_importance_floor,
             train_val_fraction=args.train_val_fraction,
             cross_validation_cap=args.cross_validation_cap,
+            class_normalized_scores=args.class_normalized_scores,
         )
     else:
         refinement_cfg = ImagePALConfig(
@@ -403,6 +455,7 @@ def parse_args() -> ExperimentConfig:
             binary_dist=args.binary_dist,
             train_val_fraction=args.train_val_fraction,
             cross_validation_cap=args.cross_validation_cap,
+            class_normalized_scores=args.class_normalized_scores,
         )
 
     attention_cfg = AttentionPoolConfig(
@@ -425,6 +478,8 @@ def parse_args() -> ExperimentConfig:
         show_pred_label=args.pred_label_viz,
         show_minority_prob=args.minority_prob_viz,
         show_per_class_probs=args.per_class_probs_viz,
+        unified_weight_limits=args.unified_weight_limits,
+        per_class_accuracy=args.per_class_accuracy,
         n_train_sweep=args.n_train_sweep,
         seeds=args.seeds,
     )

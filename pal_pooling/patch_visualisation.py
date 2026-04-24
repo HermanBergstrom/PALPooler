@@ -66,6 +66,7 @@ def visualise_image(
     show_minority_prob: bool = False,                 # add a P(minority class) panel with image-local scale
     show_per_class_probs: bool = False,               # add one P(class k) panel per class (only when n_classes <= 10)
     binary_dist:       bool  = False,                 # collapse non-correct classes before computing weights
+    weight_limits: Optional[dict[str, tuple[float, float]]] = None,  # shared vmin/vmax per method across images
 ) -> plt.Figure:
     """Figure with overlay panels showing per-patch softmax quality scores.
 
@@ -103,38 +104,49 @@ def visualise_image(
         kl_div, wasserstein, js_div, and tvd panels are shown when class_prior is provided.
         """
         p_true    = dist[:, true_label]
+        def _lim(method: str, arr: np.ndarray) -> tuple[float, float]:
+            if weight_limits and method in weight_limits:
+                return weight_limits[method]
+            return float(arr.min()), float(arr.max())
+
         w_ccp     = compute_patch_pooling_weights(dist, true_label, temperature, "correct_class_prob", binary_dist=binary_dist)
         w_entropy = compute_patch_pooling_weights(dist, true_label, temperature, "entropy", binary_dist=binary_dist)
+        ccp_lo, ccp_hi   = _lim("correct_class_prob", w_ccp)
+        ent_lo,  ent_hi  = _lim("entropy", w_entropy)
         panels = [
             (f"Original image\n[{label}]", None, {}),
             (f"P(true class)  (mean={p_true.mean():.3f})",
              p_true, {"vmin": 0.0, "vmax": 1.0}),
             (_mark("Correct-class-prob weights", "correct_class_prob"),
-             w_ccp, {"vmin": w_ccp.min(), "vmax": w_ccp.max()}),
+             w_ccp, {"vmin": ccp_lo, "vmax": ccp_hi}),
             (_mark("Entropy weights", "entropy"),
-             w_entropy, {"vmin": w_entropy.min(), "vmax": w_entropy.max()}),
+             w_entropy, {"vmin": ent_lo, "vmax": ent_hi}),
         ]
         if class_prior is not None:
             w_kl = compute_patch_pooling_weights(
                 dist, true_label, temperature, "kl_div", class_prior, binary_dist=binary_dist
             )
+            kl_lo, kl_hi = _lim("kl_div", w_kl)
             panels.append((_mark("KL-div weights", "kl_div"),
-                           w_kl, {"vmin": w_kl.min(), "vmax": w_kl.max()}))
+                           w_kl, {"vmin": kl_lo, "vmax": kl_hi}))
             w_wass = compute_patch_pooling_weights(
                 dist, true_label, temperature, "wasserstein", class_prior, binary_dist=binary_dist
             )
+            wass_lo, wass_hi = _lim("wasserstein", w_wass)
             panels.append((_mark("Wasserstein weights", "wasserstein"),
-                           w_wass, {"vmin": w_wass.min(), "vmax": w_wass.max()}))
+                           w_wass, {"vmin": wass_lo, "vmax": wass_hi}))
             w_js = compute_patch_pooling_weights(
                 dist, true_label, temperature, "js_div", class_prior, binary_dist=binary_dist
             )
+            js_lo, js_hi = _lim("js_div", w_js)
             panels.append((_mark("JS-div weights", "js_div"),
-                           w_js, {"vmin": w_js.min(), "vmax": w_js.max()}))
+                           w_js, {"vmin": js_lo, "vmax": js_hi}))
             w_tvd = compute_patch_pooling_weights(
                 dist, true_label, temperature, "tvd", class_prior, binary_dist=binary_dist
             )
+            tvd_lo, tvd_hi = _lim("tvd", w_tvd)
             panels.append((_mark("TVD weights", "tvd"),
-                           w_tvd, {"vmin": w_tvd.min(), "vmax": w_tvd.max()}))
+                           w_tvd, {"vmin": tvd_lo, "vmax": tvd_hi}))
         if show_pred_label:
             pred_vals = dist.argmax(axis=1).astype(float)
             class_names = [idx_to_class[i] for i in range(n_classes)]
@@ -148,22 +160,25 @@ def visualise_image(
             minority_idx  = int(np.argmin(class_prior))
             minority_name = idx_to_class[minority_idx]
             p_minority    = dist[:, minority_idx]
+            min_lo, min_hi = _lim("minority_prob", p_minority)
             panels.append((
                 f"P(minority: {minority_name!r})",
                 p_minority,
-                {"vmin": float(p_minority.min()), "vmax": float(p_minority.max())},
+                {"vmin": min_lo, "vmax": min_hi},
             ))
         return panels
 
     all_rows = [_dist_panels(patch_probs, "Softmax")]
 
     if ridge_pred_logits is not None:
+        if weight_limits and "ridge" in weight_limits:
+            ridge_lo, ridge_hi = weight_limits["ridge"]
+        else:
+            ridge_lo, ridge_hi = float(ridge_pred_logits.min()), float(ridge_pred_logits.max())
         ridge_panel = (
             f"Ridge pooling weights  (max={ridge_pred_logits.max():.4f})",
             ridge_pred_logits,
-            {"cmap": "RdYlGn",
-             "vmin": ridge_pred_logits.min(),
-             "vmax": ridge_pred_logits.max()},
+            {"cmap": "RdYlGn", "vmin": ridge_lo, "vmax": ridge_hi},
         )
         all_rows = [row + [ridge_panel] for row in all_rows]
 

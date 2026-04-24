@@ -384,6 +384,32 @@ def compute_patch_pooling_weights(
     return weights                                                      # [P]
 
 
+def _class_normalize_scores(
+    y: np.ndarray,
+    labels_per_element: np.ndarray,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Standardize quality logits within each class.
+
+    For class c: y~[i] = (y[i] - mu_c) / sigma_c, where mu_c and sigma_c are
+    computed over all elements with label c.  Falls back to zero-centering when
+    std < 1e-8 (degenerate class with constant scores).
+    """
+    y_out = y.copy().astype(np.float32)
+    for c in np.unique(labels_per_element):
+        mask = labels_per_element == c
+        mu = float(y[mask].mean())
+        sigma = float(y[mask].std())
+        if sigma > 1e-8:
+            y_out[mask] = (y[mask] - mu) / sigma
+        else:
+            y_out[mask] = y[mask] - mu
+    if verbose:
+        n_cls = len(np.unique(labels_per_element))
+        print(f"[class_norm] Within-class score normalization applied ({n_cls} classes)")
+    return y_out
+
+
 def compute_patch_quality_logits(
     patch_probs:   np.ndarray,             # [P, n_classes]
     true_label:    int,
@@ -1167,6 +1193,28 @@ def refine_dataset_features(
     backend = "GPU" if gpu_ridge_device else "CPU"
     if verbose: print(f"[ridge] Fitting Ridge(alpha={refinement_cfg.ridge_alpha}) on {len(all_features):,} patch samples "
           f"(D={D}, method={refinement_cfg.weight_method}, backend={backend}) ...")
+    if getattr(refinement_cfg, "class_normalized_scores", False):
+        import torch as _torch_cn
+        _tgt_np = (
+            all_targets.cpu().numpy() if isinstance(all_targets, _torch_cn.Tensor)
+            else np.asarray(all_targets, dtype=np.float32)
+        )
+        _cn_labels = np.empty(len(_tgt_np), dtype=np.int64)
+        if one_pass:
+            for _idx in range(N_active):
+                _s, _e = int(img_boundaries[_idx]), int(img_boundaries[_idx + 1])
+                if _s < _e:
+                    _cn_labels[_s:_e] = int(active_labels[_idx])
+        else:
+            _rptr = 0
+            for _pb, _bl, _ia, _Ba in saved_probs:
+                for _j in range(_Ba):
+                    _s = (_rptr + _j) * P_dim
+                    _e = (_rptr + _j + 1) * P_dim
+                    _cn_labels[_s:_e] = int(_bl[_j])
+                _rptr += _Ba
+        all_targets = _class_normalize_scores(_tgt_np, _cn_labels, verbose=verbose)
+
     if gpu_ridge_device:
         ridge_model: Union[Ridge, RidgeGPU] = RidgeGPU(alpha=refinement_cfg.ridge_alpha, device=gpu_ridge_device)
     else:
