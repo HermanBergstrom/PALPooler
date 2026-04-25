@@ -1528,7 +1528,7 @@ class IterativePALPooler:
                 _clf = TabICLClassifier(n_estimators=n_est, random_state=self.seed)
                 _clf.fit(sup_for_clf, labels[train_idx])
                 proba = _clf.predict_proba(qry_for_clf)
-                val_acc = float((np.argmax(proba, axis=1) == labels[val_idx]).mean())
+                val_acc = float((np.array(_clf.classes_)[np.argmax(proba, axis=1)] == labels[val_idx]).mean())
                 try:
                     val_auroc = float(
                         _roc_auc(labels[val_idx], proba[:, 1]) if proba.shape[1] == 2
@@ -1815,7 +1815,7 @@ class IterativePALPooler:
             )
             clf_eval.fit(sup_for_clf, labels[train_idx])
             proba = clf_eval.predict_proba(qry_for_clf)
-            acc = float((np.argmax(proba, axis=1) == labels[val_idx]).mean())
+            acc = float((np.array(clf_eval.classes_)[np.argmax(proba, axis=1)] == labels[val_idx]).mean())
             try:
                 if proba.shape[1] == 2:
                     auroc = float(roc_auc_score(labels[val_idx], proba[:, 1]))

@@ -1,13 +1,12 @@
-"""Dataset classes and feature-loading utilities for patch-quality experiments.
+"""Feature-loading utilities for patch-quality experiments.
 
-Covers both the Butterfly image-classification dataset and the RSNA Pneumonia
-X-ray dataset.  All public symbols are re-exported through this module so that
-other scripts only need a single import site.
+Dispatches to the appropriate dataset class (HDF5-backed or custom) for each
+supported dataset and provides shared helpers for collecting embeddings,
+balancing classes, and ELECTRA token features.
 """
 
 from __future__ import annotations
 
-import csv as _csv
 import sys
 from pathlib import Path
 from typing import Optional
@@ -17,140 +16,31 @@ if __package__ in (None, ""):
 
 import numpy as np
 import torch
-from PIL import Image
-from torch.utils.data import Dataset
 
 from pal_pooling.config import (
     AG_NEWS_DATASET_PATH,
     AIRBNB_DATASET_PATH,
-    BUTTERFLY_DATASET_PATH,
+    AIRCRAFTS_DATASET_PATH,
+    COCO_DATASET_PATH,
+    OPEN_IMAGES_DATASET_PATH,
+    DTD_DATASET_PATH,
     CBIS_DDSM_DATASET_PATH,
     CLOTHING_DATASET_PATH,
     FAKE_JOBS_DATASET_PATH,
-    FEATURES_DIR,
+    HAM10000_DATASET_PATH,
     IMAGENET_EMBEDDINGS_PATH,
     IMAGENET_IMAGES_PATH,
     IMAGENET_SUBSETS,
     JIGSAW_DATASET_PATH,
+    OXFORD_FLOWERS_DATASET_PATH,
     PAD_UFES_DATASET_PATH,
     PETFINDER_DATASET_PATH,
     PRODUCT_SENTIMENT_DATASET_PATH,
-    RSNA_DATASET_PATH,
     SALARY_INDIA_DATASET_PATH,
     WINE_REVIEWS_DATASET_PATH,
     YELP_DATASET_PATH,
     DatasetConfig,
 )
-
-DATASET_PATH = BUTTERFLY_DATASET_PATH   # kept for backward compat
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-class ButterflyPatchDataset(Dataset):
-    """Loads pre-extracted DINOv3 patch features for the butterfly dataset.
-
-    Each sample is ``(patches, label)`` where:
-        patches : float tensor of shape [num_patches, embed_dim]  (e.g. [196, 768])
-        label   : int class index
-
-    Args:
-        features_dir: Directory containing the .pt files produced by the
-            feature extraction script.
-        split: ``"train"`` or ``"test"``.
-        dtype: Cast features to this dtype on load (default: float32 for model compat).
-    """
-
-    def __init__(
-        self,
-        features_dir: Path = FEATURES_DIR,
-        split: str = "train",
-        dtype: torch.dtype = torch.float32,
-    ) -> None:
-        features_dir = Path(features_dir)
-        pt_path = features_dir / f"butterfly_{split}_dinov3_patch_features.pt"
-        if not pt_path.exists():
-            raise FileNotFoundError(
-                f"Patch features not found at {pt_path}. "
-                "Run the feature extraction script first."
-            )
-
-        ckpt = torch.load(pt_path, map_location="cpu", weights_only=True)
-        self.features: torch.Tensor = ckpt["features"].to(dtype)   # [N, P, D]
-        self.labels:   torch.Tensor = ckpt["labels"].long()        # [N]
-
-        N, P, D = self.features.shape
-        print(
-            f"[info] ButterflyPatchDataset ({split}): "
-            f"N={N}  num_patches={P}  embed_dim={D}"
-        )
-
-    def __len__(self) -> int:
-        return len(self.labels)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.features[idx], self.labels[idx]
-
-
-# ---------------------------------------------------------------------------
-# Reconstruct training-split file paths (must match extraction order)
-# ---------------------------------------------------------------------------
-
-def _get_image_paths(
-    dataset_path: Path = DATASET_PATH,
-    split: str = "train",
-    seed: int = 42,
-    test_fraction: float = 0.2,
-) -> tuple[list[Path], list[int], dict[int, str]]:
-    """Return (paths, labels, idx_to_class) for the requested split.
-
-    Uses the exact same shuffle/split logic as ButterflyPatchDataset so that
-    index i here corresponds to row i in the .pt feature file.
-    """
-    csv_path = Path(dataset_path) / "Training_set.csv"
-    img_dir  = Path(dataset_path) / "train"
-
-    rows: list[tuple[str, str]] = []
-    all_labels: list[str] = []
-    with csv_path.open(newline="") as f:
-        for row in _csv.DictReader(f):
-            rows.append((row["filename"], row["label"]))
-            all_labels.append(row["label"])
-
-    class_to_idx: dict[str, int] = {
-        lbl: i for i, lbl in enumerate(sorted(set(all_labels)))
-    }
-    idx_to_class: dict[int, str] = {v: k for k, v in class_to_idx.items()}
-
-    n_total = len(rows)
-    rng     = np.random.RandomState(seed)
-    idx     = rng.permutation(n_total)
-    n_test  = int(n_total * test_fraction)
-    selected = [rows[i] for i in (idx[:n_test] if split == "test" else idx[n_test:])]
-
-    paths  = [img_dir / fname   for fname, _   in selected]
-    labels = [class_to_idx[lbl] for _,    lbl  in selected]
-    return paths, labels, idx_to_class
-
-
-# ---------------------------------------------------------------------------
-# RSNA helpers
-# ---------------------------------------------------------------------------
-
-def _dicom_to_pil(path: Path) -> Image.Image:
-    """Load a DICOM file and return an 8-bit grayscale-as-RGB PIL Image."""
-    import pydicom
-    dcm    = pydicom.dcmread(str(path))
-    pixels = dcm.pixel_array.astype(np.float32)
-    pi     = getattr(dcm, "PhotometricInterpretation", "MONOCHROME2")
-    if pi.strip() == "MONOCHROME1":
-        pixels = pixels.max() - pixels
-    pmin, pmax = pixels.min(), pixels.max()
-    if pmax > pmin:
-        pixels = (pixels - pmin) / (pmax - pmin) * 255.0
-    return Image.fromarray(pixels.astype(np.uint8)).convert("RGB")
 
 
 # Cache: images_dir → {pet_id: Path}.  Populated once per directory per process.
@@ -316,32 +206,6 @@ def _get_imagenet_image_paths(
     return train_paths, test_paths
 
 
-def _get_rsna_image_paths(
-    dataset_path: Path,
-    features_dir: Path,
-    split:        str,
-    backbone:     str = "rad-dino",
-) -> tuple[list[Path], list[int], dict[int, str]]:
-    """Return (paths, labels, idx_to_class) for the RSNA split.
-
-    Paths and labels are read directly from the saved .pt metadata so that
-    index i here corresponds exactly to row i in the patch-features tensor.
-    """
-    backbone_tag = backbone.replace("-", "_")
-    pt_path = Path(features_dir) / f"rsna_{split}_{backbone_tag}_features.pt"
-    ckpt    = torch.load(pt_path, map_location="cpu", weights_only=False)
-
-    patient_ids  = ckpt["patient_ids"]          # list of strings
-    labels_t     = ckpt["labels"]               # [N] int tensor
-    class_to_idx = ckpt["class_to_idx"]         # {"Normal": 0, "Pneumonia": 1}
-    idx_to_class = {v: k for k, v in class_to_idx.items()}
-
-    image_dir = Path(dataset_path) / "stage_2_train_images"
-    paths  = [image_dir / f"{pid}.dcm" for pid in patient_ids]
-    labels = labels_t.tolist()
-    return paths, labels, idx_to_class
-
-
 # ---------------------------------------------------------------------------
 # Generic helper for tabular + ELECTRA text datasets
 # ---------------------------------------------------------------------------
@@ -394,6 +258,45 @@ def _collect_electra_tabular(ds, indices: np.ndarray):
 
 
 # ---------------------------------------------------------------------------
+# Generic helper for HDF5-backed image datasets (aircrafts / ham10000 / oxford-flowers)
+# ---------------------------------------------------------------------------
+
+def _collect_h5_dataset(
+    ds,
+    indices: np.ndarray,
+    with_tabular: bool = False,
+    desc: str = "",
+) -> tuple:
+    """Collect patch/CLS embeddings for *indices* from an HDF5-backed dataset.
+
+    The dataset's ``__getitem__`` must return a dict with keys:
+      ``"image"``   : (P, D) float32 — patch embeddings
+      ``"cls"``     : (D,)   float32 — CLS embedding
+      ``"target"``  : scalar int
+      ``"tabular"`` : (F,)   float32  (optional, only read when *with_tabular*)
+
+    Returns (patches, cls_embs, labels, tab_arr) where tab_arr is None unless
+    *with_tabular* is True and the dataset provides a ``"tabular"`` key.
+    """
+    from tqdm import tqdm
+    patches_list, cls_list, labels_list, tab_list = [], [], [], []
+    for i in tqdm(indices, desc=desc):
+        sample = ds[int(i)]
+        patches_list.append(sample["image"].numpy())
+        cls_list.append(sample["cls"].numpy())
+        labels_list.append(sample["target"].item())
+        if with_tabular and "tabular" in sample:
+            tab_list.append(sample["tabular"].float().numpy())
+    tab_arr = np.stack(tab_list, axis=0) if tab_list else None
+    return (
+        np.stack(patches_list, axis=0),
+        np.stack(cls_list,     axis=0),
+        np.array(labels_list,  dtype=np.int64),
+        tab_arr,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Feature loading dispatcher
 # ---------------------------------------------------------------------------
 
@@ -431,90 +334,48 @@ def _load_features(
     extra_data: dict = {}
 
     if dataset_cfg.dataset == "butterfly":
-        train_ds = ButterflyPatchDataset(features_dir, split="train", dtype=dtype)
-        test_ds  = ButterflyPatchDataset(features_dir, split="test",  dtype=dtype)
-        train_patches = train_ds.features.numpy()
-        train_labels  = train_ds.labels.numpy()
-        test_patches  = test_ds.features.numpy()
-        test_labels   = test_ds.labels.numpy()
+        butterfly_module_dir = "/project/aip-rahulgk/image_icl_project/butterfly"
+        if butterfly_module_dir not in sys.path:
+            sys.path.insert(0, butterfly_module_dir)
+        from butterfly_dataset import ButterflyDataset  # type: ignore
 
-        # idx_to_class from feature labels (class indices 0..C-1)
-        n_cls = int(train_labels.max()) + 1
-        idx_to_class: dict[int, str] = {i: str(i) for i in range(n_cls)}
+        ds = ButterflyDataset()
+        train_idx, test_idx = ds.default_split()
 
-        # CLS features (optional)
-        cls_train: Optional[np.ndarray] = None
-        cls_test:  Optional[np.ndarray] = None
-        cls_pt_train = features_dir / "butterfly_train_dinov3_features.pt"
-        cls_pt_test  = features_dir / "butterfly_test_dinov3_features.pt"
-        if cls_pt_train.exists() and cls_pt_test.exists():
-            _ct = torch.load(cls_pt_train, map_location="cpu", weights_only=False)
-            _cv = torch.load(cls_pt_test,  map_location="cpu", weights_only=False)
-            cls_train = _ct["features"].float().numpy()
-            cls_test  = _cv["features"].float().numpy()
-        else:
-            print(f"[warn] CLS feature files not found; skipping CLS baseline "
-                  f"(expected {cls_pt_train} and {cls_pt_test})")
+        train_patches, cls_train, train_labels, _ = _collect_h5_dataset(
+            ds, train_idx, desc="Loading Butterfly (train)")
+        test_patches, cls_test, test_labels, _ = _collect_h5_dataset(
+            ds, test_idx, desc="Loading Butterfly (test)")
+
+        idx_to_class: dict[int, str] = {i: name for i, name in enumerate(ds.class_names)}
+        extra_data["butterfly_train_idx"] = train_idx
+        extra_data["butterfly_test_idx"]  = test_idx
+
+        print(f"[info] Butterfly (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] Butterfly (test):  N={len(test_labels)}")
 
     elif dataset_cfg.dataset == "rsna":
-        backbone_tag = dataset_cfg.backbone.replace("-", "_")
-        pt_train = features_dir / f"rsna_train_{backbone_tag}_features.pt"
-        pt_test  = features_dir / f"rsna_test_{backbone_tag}_features.pt"
-        for p in (pt_train, pt_test):
-            if not p.exists():
-                raise FileNotFoundError(
-                    f"RSNA feature file not found: {p}. "
-                    "Run feature_extraction/extract_rsna_features.py first."
-                )
+        rsna_module_dir = "/project/aip-rahulgk/image_icl_project/rsna"
+        if rsna_module_dir not in sys.path:
+            sys.path.insert(0, rsna_module_dir)
+        from rsna_dataset import RSNADataset  # type: ignore
 
-        # Use memory-mapped loading (PyTorch >= 2.1) so only accessed pages are
-        # paged in from disk — critical when n_train << N since we slice before
-        # materialising the full patch tensor.
-        _load_kwargs: dict = dict(map_location="cpu", weights_only=False)
-        try:
-            ck_train = torch.load(pt_train, mmap=True,  **_load_kwargs)
-            ck_test  = torch.load(pt_test,  mmap=True,  **_load_kwargs)
-        except TypeError:
-            ck_train = torch.load(pt_train, **_load_kwargs)
-            ck_test  = torch.load(pt_test,  **_load_kwargs)
+        ds = RSNADataset()
+        train_idx, test_idx = ds.default_split()
 
-        # Read lightweight tensors (labels, CLS) first — these are always small.
-        train_labels  = ck_train["labels"].numpy().astype(np.int64)
-        test_labels   = ck_test ["labels"].numpy().astype(np.int64)
-        class_to_idx  = ck_train["class_to_idx"]
-        idx_to_class  = {v: k for k, v in class_to_idx.items()}
+        train_patches, cls_train, train_labels, _ = _collect_h5_dataset(
+            ds, train_idx, desc="Loading RSNA (train)")
+        test_patches, cls_test, test_labels, _ = _collect_h5_dataset(
+            ds, test_idx, desc="Loading RSNA (test)")
 
-        # Determine n_train subsample indices BEFORE touching the patch tensor so
-        # that with mmap loading we only page in the selected rows.
-        if n_train is not None and n_train < len(train_labels):
-            n_orig  = len(train_labels)
-            rng     = np.random.RandomState(seed)
-            sub_idx = rng.choice(n_orig, size=n_train, replace=False)
-            sub_idx.sort()
-            train_sub_idx = sub_idx
-            train_labels  = train_labels[sub_idx]
-            # Slice the torch tensor before .numpy() — avoids materialising the
-            # full [N, P, D] array in RAM (critical for large datasets).
-            train_patches = ck_train["patch_features"][sub_idx].numpy()   # float16
-            cls_train     = ck_train["cls_features"][sub_idx].float().numpy()
-            print(f"[info] RSNA (train): N={n_train}/{n_orig} (subsampled)  "
-                  f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
-        else:
-            # Load full training set — keep as float16 to halve RAM vs float32.
-            train_patches = ck_train["patch_features"].numpy()            # float16
-            cls_train     = ck_train["cls_features"].float().numpy()
-            print(f"[info] RSNA (train): N={len(train_labels)}  "
-                  f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        idx_to_class = {i: name for i, name in enumerate(ds.class_names)}
+        extra_data["rsna_train_idx"] = train_idx
+        extra_data["rsna_test_idx"]  = test_idx
 
-        del ck_train   # release checkpoint; patch tensor is now a numpy array
-
-        test_patches = ck_test["patch_features"].numpy()                  # float16
-        cls_test     = ck_test["cls_features"].float().numpy()
-        del ck_test
+        print(f"[info] RSNA (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] RSNA (test):  N={len(test_labels)}")
-
-        # n_train subsampling already applied above — skip the general block below.
-        n_train = None
 
     elif dataset_cfg.dataset == "petfinder":
         petfinder_dir = Path(dataset_cfg.dataset_path)
@@ -650,9 +511,11 @@ def _load_features(
             tab_arr = np.stack(tab_feat, axis=0) if with_tabular else None
             return np.stack(patches, axis=0), np.stack(cls_emb, axis=0), np.array(labels, dtype=np.int64), sub_idx, tab_arr
 
-        # We merge train + val for support set, similar to Petfinder
+        # We merge train + val for support set, similar to Petfinder.
+        # For float fractions, pass None so the generic block below resolves the count.
+        _dvm_n_train = n_train if isinstance(n_train, int) else None
         train_patches, cls_train, train_labels, train_sub_idx, tab_train_dvm = get_dvm_subset(
-            [train_ds, val_ds], n_train, desc="Loading DVM (train+val)", with_tabular=load_tabular
+            [train_ds, val_ds], _dvm_n_train, desc="Loading DVM (train+val)", with_tabular=load_tabular
         )
 
         # Test set
@@ -670,8 +533,10 @@ def _load_features(
               f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] DVM (test): N={len(test_labels)}")
         
-        # we mark n_train as None so that generic subsampling is skipped
-        n_train = None
+        # Mark n_train as None so the generic block is skipped (subsampling already done above).
+        # For float fractions the generic block handles it, so only skip for int counts.
+        if isinstance(n_train, int):
+            n_train = None
 
     elif dataset_cfg.dataset == "pad-ufes":
         pad_ufes_dir = Path(dataset_cfg.dataset_path)
@@ -818,9 +683,10 @@ def _load_features(
             sys.path.insert(0, imdb_module_dir)
         from imdb_dataset import load_imdb_dataset  # type: ignore
 
+        _max_train = dataset_cfg.n_train if isinstance(dataset_cfg.n_train, int) else None
         train_loader, _val_loader, test_loader, metadata = load_imdb_dataset(
             use_token_embeddings=True,
-            max_train=dataset_cfg.n_train,
+            max_train=_max_train,
             max_val=0,       # val split is unused; skip to avoid loading ~3.9 GB of token embeddings
             max_test=dataset_cfg.n_test,
             num_workers=0,
@@ -903,8 +769,10 @@ def _load_features(
               f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] IMDB (test):  N={len(test_labels)}")
 
-        # n_train subsampling already handled by load_imdb_dataset(max_train=...).
-        n_train = None
+        # n_train subsampling already handled by load_imdb_dataset(max_train=...) for int counts.
+        # For float fractions, defer to the generic block below.
+        if isinstance(dataset_cfg.n_train, int):
+            n_train = None
 
     elif dataset_cfg.dataset == "20news":
         news_module_dir = "/project/aip-rahulgk/image_icl_project/20news"
@@ -914,9 +782,10 @@ def _load_features(
         news_module = importlib.import_module("20news_dataset")  # type: ignore
         load_20news_dataset = news_module.load_20news_dataset
 
+        _max_train = dataset_cfg.n_train if isinstance(dataset_cfg.n_train, int) else None
         train_loader, _val_loader, test_loader, metadata = load_20news_dataset(
             use_token_embeddings=True,
-            max_train=dataset_cfg.n_train,
+            max_train=_max_train,
             max_val=0,       # val split is unused; skip to avoid loading ~3.9 GB of token embeddings
             max_test=dataset_cfg.n_test,
             num_workers=0,
@@ -994,8 +863,10 @@ def _load_features(
               f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] 20NEWS (test):  N={len(test_labels)}")
 
-        # n_train subsampling already handled by load_20news_dataset(max_train=...).
-        n_train = None
+        # n_train subsampling already handled by load_20news_dataset(max_train=...) for int counts.
+        # For float fractions, defer to the generic block below.
+        if isinstance(dataset_cfg.n_train, int):
+            n_train = None
 
     elif dataset_cfg.dataset == "ag_news":
         ag_news_module_dir = "/project/aip-rahulgk/image_icl_project/ag_news"
@@ -1003,9 +874,10 @@ def _load_features(
             sys.path.insert(0, ag_news_module_dir)
         from ag_news_dataset import load_ag_news_dataset  # type: ignore
 
+        _max_train = dataset_cfg.n_train if isinstance(dataset_cfg.n_train, int) else None
         train_loader, _val_loader, test_loader, metadata = load_ag_news_dataset(
             use_token_embeddings=True,
-            max_train=dataset_cfg.n_train,
+            max_train=_max_train,
             max_val=0,
             max_test=dataset_cfg.n_test,
             num_workers=0,
@@ -1082,7 +954,8 @@ def _load_features(
               f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] AG News (test):  N={len(test_labels)}")
 
-        n_train = None
+        if isinstance(dataset_cfg.n_train, int):
+            n_train = None
 
     elif dataset_cfg.dataset == "yelp":
         yelp_module_dir = "/project/aip-rahulgk/image_icl_project/yelp"
@@ -1090,9 +963,10 @@ def _load_features(
             sys.path.insert(0, yelp_module_dir)
         from yelp_dataset import load_yelp_dataset  # type: ignore
 
+        _max_train = dataset_cfg.n_train if isinstance(dataset_cfg.n_train, int) else None
         train_loader, _val_loader, test_loader, metadata = load_yelp_dataset(
             use_token_embeddings=True,
-            max_train=dataset_cfg.n_train,
+            max_train=_max_train,
             max_val=0,
             max_test=dataset_cfg.n_test,
             num_workers=0,
@@ -1169,7 +1043,8 @@ def _load_features(
               f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] Yelp (test):  N={len(test_labels)}")
 
-        n_train = None
+        if isinstance(dataset_cfg.n_train, int):
+            n_train = None
 
     elif dataset_cfg.dataset == "airbnb":
         airbnb_dir = str(Path(dataset_cfg.dataset_path))
@@ -1353,6 +1228,143 @@ def _load_features(
               f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] {dataset_cfg.dataset} (test):  N={len(test_labels)}")
 
+    elif dataset_cfg.dataset == "aircrafts":
+        aircrafts_module_dir = "/project/aip-rahulgk/image_icl_project/aircrafts"
+        if aircrafts_module_dir not in sys.path:
+            sys.path.insert(0, aircrafts_module_dir)
+        from aircrafts_dataset import AircraftsDataset  # type: ignore
+
+        ds = AircraftsDataset(raw_data_dir=Path(dataset_cfg.dataset_path))
+
+        # Merge train + val into the support set; keep test as the query set.
+        flags = np.array(ds._split_flags)
+        train_idx = np.where((flags == "train") | (flags == "val"))[0]
+        test_idx  = np.where(flags == "test")[0]
+
+        train_patches, cls_train, train_labels, _ = _collect_h5_dataset(
+            ds, train_idx, desc="Loading Aircrafts (train+val)")
+        test_patches, cls_test, test_labels, _ = _collect_h5_dataset(
+            ds, test_idx, desc="Loading Aircrafts (test)")
+
+        idx_to_class = {i: name for i, name in enumerate(ds.class_names)}
+
+        print(f"[info] Aircrafts (train+val): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] Aircrafts (test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "ham10000":
+        ham_module_dir = "/project/aip-rahulgk/image_icl_project/HAM10000"
+        if ham_module_dir not in sys.path:
+            sys.path.insert(0, ham_module_dir)
+        from ham10000_dataset import HAM10000Dataset  # type: ignore
+
+        ds = HAM10000Dataset(raw_data_dir=Path(dataset_cfg.dataset_path))
+        train_idx, test_idx = ds.default_split()
+
+        train_patches, cls_train, train_labels, tab_train_ham = _collect_h5_dataset(
+            ds, train_idx, with_tabular=load_tabular, desc="Loading HAM10000 (train)")
+        test_patches, cls_test, test_labels, tab_test_ham = _collect_h5_dataset(
+            ds, test_idx, with_tabular=load_tabular, desc="Loading HAM10000 (test)")
+
+        if load_tabular:
+            extra_data["tab_train"] = tab_train_ham
+            extra_data["tab_test"]  = tab_test_ham
+
+        idx_to_class = {i: name for i, name in enumerate(ds.class_names)}
+
+        print(f"[info] HAM10000 (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] HAM10000 (test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "oxford-flowers":
+        flowers_module_dir = "/project/aip-rahulgk/image_icl_project/oxford_flowers"
+        if flowers_module_dir not in sys.path:
+            sys.path.insert(0, flowers_module_dir)
+        from oxford_flowers_dataset import OxfordFlowersDataset  # type: ignore
+
+        ds = OxfordFlowersDataset(raw_data_dir=Path(dataset_cfg.dataset_path))
+        # train/ → support set; valid/ → query set (test/ has no labels)
+        train_idx, test_idx = ds.default_split()
+
+        train_patches, cls_train, train_labels, _ = _collect_h5_dataset(
+            ds, train_idx, desc="Loading Oxford Flowers (train)")
+        test_patches, cls_test, test_labels, _ = _collect_h5_dataset(
+            ds, test_idx, desc="Loading Oxford Flowers (valid)")
+
+        idx_to_class = {i: name for i, name in enumerate(ds.class_names)}
+
+        print(f"[info] Oxford Flowers (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] Oxford Flowers (valid/test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "dtd":
+        dtd_module_dir = "/project/aip-rahulgk/image_icl_project/DTD"
+        if dtd_module_dir not in sys.path:
+            sys.path.insert(0, dtd_module_dir)
+        from dtd_dataset import DTDDataset  # type: ignore
+
+        ds = DTDDataset(raw_data_dir=Path(dataset_cfg.dataset_path))
+        # default_split() already merges train+val into the support set
+        train_idx, test_idx = ds.default_split()
+
+        train_patches, cls_train, train_labels, _ = _collect_h5_dataset(
+            ds, train_idx, desc="Loading DTD (train+val)")
+        test_patches, cls_test, test_labels, _ = _collect_h5_dataset(
+            ds, test_idx, desc="Loading DTD (test)")
+
+        idx_to_class = {i: name for i, name in enumerate(ds.class_names)}
+
+        print(f"[info] DTD (train+val): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] DTD (test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "coco":
+        coco_module_dir = "/project/aip-rahulgk/image_icl_project/coco"
+        if coco_module_dir not in sys.path:
+            sys.path.insert(0, coco_module_dir)
+        from coco_dataset import COCODataset  # type: ignore
+
+        ds = COCODataset(coco_dir=Path(dataset_cfg.dataset_path))
+        # default_split() returns (train, val, test); use train as support, val as test
+        train_idx, val_idx, test_idx = ds.default_split()
+
+        train_patches, cls_train, train_labels, _ = _collect_h5_dataset(
+            ds, train_idx, desc="Loading COCO (train)")
+        test_patches, cls_test, test_labels, _ = _collect_h5_dataset(
+            ds, val_idx, desc="Loading COCO (val)")
+
+        idx_to_class = {i: name for i, name in enumerate(ds.class_names)}
+        # Store original dataset indices so visualization can call ds.get_image(idx)
+        extra_data["coco_train_idx"] = train_idx
+        extra_data["coco_test_idx"]  = val_idx
+
+        print(f"[info] COCO (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] COCO (val/test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "open-images":
+        oi_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/open_images"
+        if oi_module_dir not in sys.path:
+            sys.path.insert(0, oi_module_dir)
+        from open_images_dataset import OpenImagesDataset  # type: ignore
+
+        ds = OpenImagesDataset(img_dir=Path(dataset_cfg.dataset_path) / "images")
+        train_idx, test_idx = ds.default_split()
+
+        train_patches, cls_train, train_labels, _ = _collect_h5_dataset(
+            ds, train_idx, desc="Loading Open Images (train)")
+        test_patches, cls_test, test_labels, _ = _collect_h5_dataset(
+            ds, test_idx, desc="Loading Open Images (test)")
+
+        idx_to_class = {i: name for i, name in enumerate(ds.class_names)}
+        # Store original dataset indices so visualization can call ds.get_image(idx)
+        extra_data["open_images_train_idx"] = train_idx
+        extra_data["open_images_test_idx"]  = test_idx
+
+        print(f"[info] Open Images (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] Open Images (test):  N={len(test_labels)}")
+
     elif dataset_cfg.dataset in IMAGENET_SUBSETS:
         synsets = IMAGENET_SUBSETS[dataset_cfg.dataset]
         embeddings_root = Path(dataset_cfg.dataset_path)
@@ -1391,26 +1403,30 @@ def _load_features(
                          f"Choices: butterfly, rsna, petfinder, dvm, pad-ufes, "
                          f"cbis-ddsm-mass, cbis-ddsm-calc, imdb, 20news, ag_news, yelp, "
                          f"clothing, salary, airbnb, fake-jobs, jigsaw, "
-                         f"product-sentiment, wine-reviews, " +
-                         f", ".join(sorted(IMAGENET_SUBSETS)))
+                         f"product-sentiment, wine-reviews, "
+                         f"aircrafts, ham10000, oxford-flowers, dtd, coco, open-images, " +
+                         ", ".join(sorted(IMAGENET_SUBSETS)))
 
-    # --- Optional n_train subsampling for non-RSNA/DVM datasets ---
-    if dataset_cfg.n_train is not None and dataset_cfg.n_train < len(train_labels):
-        n_orig  = len(train_labels)
-        rng     = np.random.RandomState(seed)
-        sub_idx = rng.choice(n_orig, size=n_train, replace=False)
-        sub_idx.sort()
-        train_sub_idx = sub_idx
-        train_patches = train_patches[sub_idx]
-        train_labels  = train_labels[sub_idx]
-        if cls_train is not None:
-            cls_train = cls_train[sub_idx]
-        if "tab_train" in extra_data and extra_data["tab_train"] is not None:
-            extra_data["tab_train"] = extra_data["tab_train"][sub_idx]
-        for k in ["text_train", "text_train_token_ids", "text_train_attn_mask", "text_cls_train"]:
-            if k in extra_data and extra_data[k] is not None:
-                extra_data[k] = extra_data[k][sub_idx]
-        print(f"[info] Training set subsampled: {n_train} / {n_orig} images")
+    # --- Optional n_train subsampling ---
+    if dataset_cfg.n_train is not None:
+        n_orig = len(train_labels)
+        _spec  = dataset_cfg.n_train
+        n_train_count = int(round(_spec * n_orig)) if isinstance(_spec, float) else _spec
+        if n_train_count < n_orig:
+            rng     = np.random.RandomState(seed)
+            sub_idx = rng.choice(n_orig, size=n_train_count, replace=False)
+            sub_idx.sort()
+            train_sub_idx = sub_idx
+            train_patches = train_patches[sub_idx]
+            train_labels  = train_labels[sub_idx]
+            if cls_train is not None:
+                cls_train = cls_train[sub_idx]
+            if "tab_train" in extra_data and extra_data["tab_train"] is not None:
+                extra_data["tab_train"] = extra_data["tab_train"][sub_idx]
+            for k in ["text_train", "text_train_token_ids", "text_train_attn_mask", "text_cls_train"]:
+                if k in extra_data and extra_data[k] is not None:
+                    extra_data[k] = extra_data[k][sub_idx]
+            print(f"[info] Training set subsampled: {n_train_count} / {n_orig} images")
 
     # --- Optional n_test subsampling ---
     if dataset_cfg.n_test is not None and dataset_cfg.n_test < len(test_labels):

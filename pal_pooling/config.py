@@ -20,6 +20,12 @@ FAKE_JOBS_DATASET_PATH         = Path("/project/6101781/image_icl_project/fake-j
 JIGSAW_DATASET_PATH            = Path("/project/6101781/image_icl_project/jigsaw")
 PRODUCT_SENTIMENT_DATASET_PATH = Path("/project/6101781/image_icl_project/product-sentiment")
 WINE_REVIEWS_DATASET_PATH      = Path("/project/6101781/image_icl_project/wine-reviews")
+AIRCRAFTS_DATASET_PATH         = Path("/scratch/hermanb/temp_datasets/aircrafts")
+HAM10000_DATASET_PATH          = Path("/scratch/hermanb/temp_datasets/HAM10000")
+OXFORD_FLOWERS_DATASET_PATH    = Path("/scratch/hermanb/temp_datasets/oxford_flowers")
+DTD_DATASET_PATH               = Path("/scratch/hermanb/temp_datasets/DTD")
+COCO_DATASET_PATH              = Path("/scratch/hermanb/temp_datasets/coco")
+OPEN_IMAGES_DATASET_PATH       = Path("/scratch/hermanb/temp_datasets/open_images")
 FEATURES_DIR            = Path("/scratch/hermanb/temp_datasets/extracted_features")
 IMAGENET_EMBEDDINGS_PATH = Path("/project/aip-rahulgk/image_icl_project/imagenet_embeddings_dinov3")
 IMAGENET_IMAGES_PATH     = Path("/datasets/imagenet")
@@ -61,6 +67,12 @@ MODALITY_MAP: Dict[str, str] = {
     "jigsaw":           "text",
     "product-sentiment":"text",
     "wine-reviews":     "text",
+    "aircrafts":        "image",
+    "ham10000":         "image",
+    "oxford-flowers":   "image",
+    "dtd":              "image",
+    "coco":             "image",
+    "open-images":      "image",
     **{name: "image" for name in IMAGENET_SUBSETS},
 }
 
@@ -81,7 +93,7 @@ class DatasetConfig:
     backbone: str
     features_dir: Path
     dataset_path: Path
-    n_train: Optional[int]
+    n_train: Optional[Union[int, float]]
     n_test: Optional[int]
     n_val: Optional[int]
     n_sample: int
@@ -188,6 +200,18 @@ class ExperimentConfig:
     device: str = "auto"
     cli_args: Optional[Dict[str, Any]] = field(default=None)
 
+def _n_train_type(v: str) -> Union[int, float]:
+    """Accept an integer count or a float fraction in (0, 1) for --n-train."""
+    if '.' in v:
+        f = float(v)
+        if not (0.0 < f < 1.0):
+            raise argparse.ArgumentTypeError(
+                f"--n-train: float fraction must be strictly between 0 and 1, got {f}"
+            )
+        return f
+    return int(v)
+
+
 def parse_args() -> ExperimentConfig:
     p = argparse.ArgumentParser(description="Patch quality evaluation with TabICL")
     _imagenet_choices = sorted(IMAGENET_SUBSETS.keys())
@@ -195,22 +219,23 @@ def parse_args() -> ExperimentConfig:
                    choices=["butterfly", "rsna", "petfinder", "dvm", "pad-ufes",
                             "cbis-ddsm-mass", "cbis-ddsm-calc", "imdb", "20news",
                             "ag_news", "yelp", "clothing", "salary", "airbnb",
-                            "fake-jobs", "jigsaw", "product-sentiment", "wine-reviews"]
+                            "fake-jobs", "jigsaw", "product-sentiment", "wine-reviews",
+                            "aircrafts", "ham10000", "oxford-flowers", "dtd", "coco", "open-images"]
                            + _imagenet_choices,
                    help="Which dataset to run on")
     p.add_argument("--backbone",      type=str,   default=None,
-                   choices=["rad-dino", "dinov3", "mae", "ijepa", "electra"],
+                   choices=["dinov3", "mae", "ijepa", "electra"],
                    help="Which backbone's features to load. "
-                        "Defaults to 'dinov3' for image datasets and 'electra' for text datasets. "
-                        "For RSNA the default is 'rad-dino'.")
+                        "Defaults to 'dinov3' for image datasets and 'electra' for text datasets.")
     p.add_argument("--features-dir",  type=Path,  default=FEATURES_DIR)
     p.add_argument("--dataset-path",  type=Path,  default=None,
                    help="Root path of the raw dataset (images + labels). "
                         "Defaults: butterfly → butterfly-image-classification, "
                         "rsna → rsna-pneumonia, petfinder → petfinder, dvm → DVM_Dataset")
     p.add_argument("--n-sample",      type=int,   default=0)
-    p.add_argument("--n-train",       type=int,   default=None,
-                   help="Limit the support set to this many training images (random subsample)")
+    p.add_argument("--n-train",       type=_n_train_type,   default=None,
+                   help="Limit the support set to this many training examples (integer count) "
+                        "or a fraction of the training set (float in (0, 1), e.g. 0.2 = 20%%)")
     p.add_argument("--n-test",        type=int,   default=None,
                    help="Limit the test set to this many testing images (random subsample, only DVM)")
     p.add_argument("--n-val",         type=int,   default=None,
@@ -378,18 +403,19 @@ def parse_args() -> ExperimentConfig:
         "jigsaw":            JIGSAW_DATASET_PATH,
         "product-sentiment": PRODUCT_SENTIMENT_DATASET_PATH,
         "wine-reviews":      WINE_REVIEWS_DATASET_PATH,
+        "aircrafts":         AIRCRAFTS_DATASET_PATH,
+        "ham10000":          HAM10000_DATASET_PATH,
+        "oxford-flowers":    OXFORD_FLOWERS_DATASET_PATH,
+        "dtd":               DTD_DATASET_PATH,
+        "coco":              COCO_DATASET_PATH,
+        "open-images":       OPEN_IMAGES_DATASET_PATH,
         **{name: IMAGENET_EMBEDDINGS_PATH for name in IMAGENET_SUBSETS},
     }
     dataset_path = args.dataset_path or _dataset_defaults[args.dataset]
 
     # Resolve backbone default based on modality when not explicitly supplied.
     modality = get_modality(args.dataset)
-    if args.backbone is not None:
-        backbone = args.backbone
-    elif args.dataset == "rsna":
-        backbone = "rad-dino"
-    else:
-        backbone = DEFAULT_BACKBONE[modality]
+    backbone = args.backbone if args.backbone is not None else DEFAULT_BACKBONE[modality]
 
     pca_dim = None if args.no_pca else args.pca_dim
 

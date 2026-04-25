@@ -647,27 +647,42 @@ def group_patches(patches: np.ndarray, patch_group_size: int) -> np.ndarray:
             .mean(axis=(2, 4))          # [N, new_n_side, new_n_side, D]
         ).reshape(N, new_n_side * new_n_side, D)
     else:
-        # Pad spatial dims to next multiple of group_side, then average only
-        # valid elements (ceil_mode equivalent — boundary groups are smaller).
-        import warnings
-        warnings.warn(
-            f"Padding employed during patch grouping: grid side {n_side} is not cleanly divisible "
-            f"by group_side {group_side}. Padding added to reach size {new_n_side * group_side}."
-        )
-        
-        pad = new_n_side * group_side - n_side
+        # Handle interior and boundary groups separately — avoids np.pad on the
+        # full [N, n_side, n_side, D] array, which is the dominant memory cost.
         x = patches.astype(np.float32).reshape(N, n_side, n_side, D)
-        x = np.pad(x, ((0, 0), (0, pad), (0, pad), (0, 0)), mode="constant", constant_values=0.0)
-        # Count valid patches per output cell (shared across N and D)
-        valid = np.ones((n_side, n_side), dtype=np.float32)
-        valid = np.pad(valid, ((0, pad), (0, pad)), mode="constant", constant_values=0.0)
-        counts = valid.reshape(new_n_side, group_side, new_n_side, group_side).sum(axis=(1, 3))  # [new_n_side, new_n_side]
-        # Sum within each group then divide by valid count
-        grouped_sum = (
-            x.reshape(N, new_n_side, group_side, new_n_side, group_side, D)
-            .sum(axis=(2, 4))           # [N, new_n_side, new_n_side, D]
-        )
-        grouped = (grouped_sum / counts[None, :, :, None]).reshape(N, new_n_side * new_n_side, D)
+        int_side = (n_side // group_side) * group_side  # largest multiple ≤ n_side
+        n_int = int_side // group_side                  # complete groups per dim
+
+        grouped = np.empty((N, new_n_side, new_n_side, D), dtype=np.float32)
+
+        # Interior block: exact-divisibility fast path, no allocation overhead
+        if n_int > 0:
+            grouped[:, :n_int, :n_int, :] = (
+                x[:, :int_side, :int_side, :]
+                .reshape(N, n_int, group_side, n_int, group_side, D)
+                .mean(axis=(2, 4))
+            )
+
+        # Right boundary column (interior rows, partial col)
+        if n_int > 0:
+            grouped[:, :n_int, n_int, :] = (
+                x[:, :int_side, int_side:, :]           # [N, int_side, rem, D]
+                .reshape(N, n_int, group_side, -1, D)
+                .mean(axis=(2, 3))
+            )
+
+        # Bottom boundary row (partial row, interior cols)
+        if n_int > 0:
+            grouped[:, n_int, :n_int, :] = (
+                x[:, int_side:, :int_side, :]           # [N, rem, int_side, D]
+                .reshape(N, -1, n_int, group_side, D)
+                .mean(axis=(1, 3))
+            )
+
+        # Corner (partial row × partial col)
+        grouped[:, n_int, n_int, :] = x[:, int_side:, int_side:, :].mean(axis=(1, 2))
+
+        grouped = grouped.reshape(N, new_n_side * new_n_side, D)
 
     if single:
         grouped = grouped[0]

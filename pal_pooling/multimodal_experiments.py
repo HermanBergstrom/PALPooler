@@ -31,7 +31,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -139,7 +139,7 @@ def _vectorize_tabular(
 def _load_dataset(
     dataset_name: str,
     dataset_path: Path,
-    n_train: Optional[int],
+    n_train: Optional[Union[int, float]],
     max_train: Optional[int],
     max_test: Optional[int],
     seed: int,
@@ -198,18 +198,20 @@ def _load_dataset(
     extra_data["tab_test"]  = tab_test
 
     # Optional post-hoc n_train subsampling (separate from max_train loading limit).
-    if n_train is not None and n_train < len(train_labels):
-        rng = np.random.RandomState(seed)
-        idx = rng.choice(len(train_labels), size=n_train, replace=False)
-        idx.sort()
-        train_patches = train_patches[idx]
-        train_labels  = train_labels[idx]
-        cls_train     = cls_train[idx]
-        tab_train     = tab_train[idx]
-        for k in ["text_train", "text_train_token_ids", "text_train_attn_mask", "text_cls_train",
-                  "train_attention_mask", "train_token_ids"]:
-            if extra_data.get(k) is not None:
-                extra_data[k] = extra_data[k][idx]
+    if n_train is not None:
+        _n = int(round(n_train * len(train_labels))) if isinstance(n_train, float) else n_train
+        if _n < len(train_labels):
+            rng = np.random.RandomState(seed)
+            idx = rng.choice(len(train_labels), size=_n, replace=False)
+            idx.sort()
+            train_patches = train_patches[idx]
+            train_labels  = train_labels[idx]
+            cls_train     = cls_train[idx]
+            tab_train     = tab_train[idx]
+            for k in ["text_train", "text_train_token_ids", "text_train_attn_mask", "text_cls_train",
+                      "train_attention_mask", "train_token_ids"]:
+                if extra_data.get(k) is not None:
+                    extra_data[k] = extra_data[k][idx]
 
     return (
         train_patches, train_labels,

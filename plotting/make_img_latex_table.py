@@ -42,6 +42,8 @@ DATASET_LABELS: dict[str, str] = {
 }
 
 DEFAULT_PAL_VARIANT = "tvf_ms"
+DEFAULT_PAL_VARIANTS = ["tvf_ms", "tvf_ms_ds"]
+DEFAULT_RUN_LABELS   = ["Full", "DS"]
 
 
 def _load(path: Path) -> dict:
@@ -256,18 +258,18 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate LaTeX table for image PAL pooling results")
     p.add_argument(
         "--results-dirs", nargs="+", type=Path,
-        default=[Path("results/img_pal_pooling")],
+        default=[Path("results/img_pal_pooling")] * len(DEFAULT_PAL_VARIANTS),
         help="One or more results directories (one per run variant)",
     )
     p.add_argument(
         "--pal-variants", nargs="+", default=None,
-        help=f"PAL variant suffix per run (default: {DEFAULT_PAL_VARIANT} for all). "
+        help=f"PAL variant suffix per run (default: {DEFAULT_PAL_VARIANTS}). "
              "Use when runs share the same directory but differ by suffix, "
              f"e.g. --pal-variants tvf_ms notvf_ms",
     )
     p.add_argument(
         "--run-labels", nargs="+", default=None,
-        help="Display label for each run (default: TVF, No-TVF, ...)",
+        help=f"Display label for each run (default: {DEFAULT_RUN_LABELS})",
     )
     p.add_argument("--datasets", nargs="+", default=DATASETS)
     p.add_argument("--metric", choices=["acc", "auroc"], default="acc")
@@ -288,11 +290,12 @@ if __name__ == "__main__":
             )
         labels = args.run_labels
     else:
-        default_labels = ["TVF", "No-TVF", "Run3", "Run4", "Run5"]
-        labels = default_labels[:n_runs]
+        labels = (DEFAULT_RUN_LABELS + ["Run3", "Run4", "Run5"])[:n_runs]
 
     pal_variants = args.pal_variants
-    if pal_variants is not None and len(pal_variants) != n_runs:
+    if pal_variants is None:
+        pal_variants = (DEFAULT_PAL_VARIANTS + [DEFAULT_PAL_VARIANT] * 3)[:n_runs]
+    elif len(pal_variants) != n_runs:
         raise SystemExit(
             f"--pal-variants ({len(pal_variants)}) must match "
             f"--results-dirs ({n_runs})"

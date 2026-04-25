@@ -46,13 +46,10 @@ from pal_pooling.patch_visualisation import summary_figure, visualise_image
 from pal_pooling.text_visualisation import visualise_text_batch, visualise_text
 from pal_pooling.config import DatasetConfig, ImagePALConfig, TextPALConfig, AttentionPoolConfig, RunConfig, ExperimentConfig, parse_args, IMAGENET_SUBSETS
 from pal_pooling.data_loading import (
-    _get_image_paths,
-    _dicom_to_pil,
     _get_petfinder_image_paths,
     _get_dvm_image_paths,
     _get_pad_ufes_image_paths,
     _get_cbis_ddsm_image_paths,
-    _get_rsna_image_paths,
     _get_imagenet_image_paths,
     _load_features,
     _balance_classes,
@@ -1363,12 +1360,23 @@ def run_pal_experiment(
     open_image: Optional[Callable] = None
     if cfg.dataset.n_sample > 0:
         if cfg.dataset.dataset == "butterfly":
-            train_image_paths, _, idx_to_class = _get_image_paths(cfg.dataset.dataset_path, split="train", seed=cfg.seed)
-            test_image_paths,  _, _            = _get_image_paths(cfg.dataset.dataset_path, split="test",  seed=cfg.seed)
+            butterfly_module_dir = "/project/aip-rahulgk/image_icl_project/butterfly"
+            if butterfly_module_dir not in sys.path:
+                sys.path.insert(0, butterfly_module_dir)
+            from butterfly_dataset import ButterflyDataset as _ButterflyDataset  # type: ignore
+            _bf_ds = _ButterflyDataset()
+            train_image_paths = list(extra_data.get("butterfly_train_idx", []))
+            test_image_paths  = list(extra_data.get("butterfly_test_idx",  []))
+            open_image = _bf_ds.get_image
         elif cfg.dataset.dataset == "rsna":
-            train_image_paths, _, _ = _get_rsna_image_paths(cfg.dataset.dataset_path, cfg.dataset.features_dir, split="train", backbone=cfg.dataset.backbone)
-            test_image_paths,  _, _ = _get_rsna_image_paths(cfg.dataset.dataset_path, cfg.dataset.features_dir, split="test",  backbone=cfg.dataset.backbone)
-            open_image = _dicom_to_pil
+            rsna_module_dir = "/project/aip-rahulgk/image_icl_project/rsna"
+            if rsna_module_dir not in sys.path:
+                sys.path.insert(0, rsna_module_dir)
+            from rsna_dataset import RSNADataset as _RSNADataset  # type: ignore
+            _rsna_ds = _RSNADataset()
+            train_image_paths = list(extra_data.get("rsna_train_idx", []))
+            test_image_paths  = list(extra_data.get("rsna_test_idx",  []))
+            open_image = _rsna_ds.get_image
         elif cfg.dataset.dataset == "petfinder":
             train_image_paths, test_image_paths = _get_petfinder_image_paths(cfg.dataset.dataset_path)
         elif cfg.dataset.dataset == "dvm":
@@ -1380,6 +1388,26 @@ def run_pal_experiment(
             train_image_paths, test_image_paths = _get_cbis_ddsm_image_paths(cfg.dataset.dataset_path, kind=kind)
         elif cfg.dataset.dataset in IMAGENET_SUBSETS:
             train_image_paths, test_image_paths = _get_imagenet_image_paths(cfg.dataset.dataset)
+        elif cfg.dataset.dataset == "coco":
+            coco_module_dir = "/project/aip-rahulgk/image_icl_project/coco"
+            if coco_module_dir not in sys.path:
+                sys.path.insert(0, coco_module_dir)
+            from coco_dataset import COCODataset as _COCODataset  # type: ignore
+            _coco_ds = _COCODataset(coco_dir=Path(cfg.dataset.dataset_path))
+            # Store original dataset indices as "paths"; open_image maps int → PIL
+            train_image_paths = list(extra_data.get("coco_train_idx", []))
+            test_image_paths  = list(extra_data.get("coco_test_idx",  []))
+            open_image = _coco_ds.get_image
+        elif cfg.dataset.dataset == "open-images":
+            oi_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/open_images"
+            if oi_module_dir not in sys.path:
+                sys.path.insert(0, oi_module_dir)
+            from open_images_dataset import OpenImagesDataset as _OIDataset  # type: ignore
+            _oi_ds = _OIDataset(img_dir=Path(cfg.dataset.dataset_path) / "images")
+            # Store original dataset indices as "paths"; open_image maps int → PIL
+            train_image_paths = list(extra_data.get("open_images_train_idx", []))
+            test_image_paths  = list(extra_data.get("open_images_test_idx",  []))
+            open_image = _oi_ds.get_image
 
         # Keep train_image_paths aligned with train_patches by applying the same
         # index selections that _load_features and _balance_classes applied.
