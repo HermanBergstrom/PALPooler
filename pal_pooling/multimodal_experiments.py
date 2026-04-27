@@ -49,7 +49,7 @@ from pal_pooling.config import (
     DVM_DATASET_PATH, FAKE_JOBS_DATASET_PATH, FEATURES_DIR, JIGSAW_DATASET_PATH,
     PAD_UFES_DATASET_PATH, PETFINDER_DATASET_PATH,
     ImagePALConfig, PRODUCT_SENTIMENT_DATASET_PATH, SALARY_INDIA_DATASET_PATH,
-    TextPALConfig, WINE_REVIEWS_DATASET_PATH, get_modality,
+    TextPALConfig, WINE_REVIEWS_DATASET_PATH, WIKIART_DATASET_PATH, get_modality,
 )
 from pal_pooling.data_loading import _load_features
 from pal_pooling.pal_pooler import IterativePALPooler, pooler_factory
@@ -211,7 +211,10 @@ def _load_dataset(
             for k in ["text_train", "text_train_token_ids", "text_train_attn_mask", "text_cls_train",
                       "train_attention_mask", "train_token_ids"]:
                 if extra_data.get(k) is not None:
-                    extra_data[k] = extra_data[k][idx]
+                    if isinstance(extra_data[k], np.ndarray):
+                        extra_data[k] = extra_data[k][idx]
+                    elif isinstance(extra_data[k], list):
+                        extra_data[k] = [extra_data[k][i] for i in idx]
 
     return (
         train_patches, train_labels,
@@ -283,6 +286,19 @@ def _run_single_seed(
     n_classes = len(idx_to_class)
     pca_dim = None if args.no_pca else args.pca_dim
 
+    # Indices used when fitting poolers (may be a subset of [0, N_train)).
+    if args.max_pooling_samples is not None and args.max_pooling_samples < N_train:
+        rng_pool = np.random.RandomState(seed)
+        pool_idx = rng_pool.choice(N_train, size=args.max_pooling_samples, replace=False)
+        pool_idx.sort()
+        print(f"[pooler-fit] Subsampling {args.max_pooling_samples}/{N_train} training samples for pooler fitting")
+    else:
+        pool_idx = None
+
+    run_image = (not is_text_primary) and (args.modalities in ("all", "image"))
+    run_text  = has_text and (args.modalities in ("all", "text"))
+    pal_pca   = None  # set inside image block; referenced in record dict
+
     _counts = np.bincount(train_labels.astype(np.int64), minlength=n_classes)
     _test_counts = np.bincount(test_labels.astype(np.int64), minlength=n_classes)
     print("[class balance]")
@@ -319,7 +335,7 @@ def _run_single_seed(
     print("\n--- tabular_only ---")
     _eval("tabular_only", tab_train, tab_test)
 
-    if not is_text_primary:
+    if run_image:
         # ── Baseline: mean-pool image only ───────────────────────────────────
         print("\n--- mean_pool_img ---")
         mean_train_raw = train_patches.astype(np.float32).mean(axis=1)  # [N, D]
@@ -344,8 +360,8 @@ def _run_single_seed(
               _concat_tabular(cls_train_proj, tab_train),
               _concat_tabular(cls_test_proj,  tab_test))
 
-    # ── Text conditions (gated on has_text) ────────────────────────────────
-    if has_text:
+    # ── Text conditions (gated on run_text) ────────────────────────────────
+    if run_text:
         # ── Baseline: text mean-pool (exclude CLS at pos 0) -────────────────
         print("\n--- mean_pool_text ---")
         counts_tr = (text_train_attn.sum(axis=1, keepdims=True) - text_train_attn[:, 0:1]).clip(min=1)
@@ -390,10 +406,14 @@ def _run_single_seed(
 
         # ── Fit text PAL pooler (no tabular context) ──────────────────────────
         print("\n--- Fitting text IterativePALPooler (text-only) ---")
+        _pi = pool_idx
         pooler_text = pooler_factory(refinement_cfg=text_refinement_cfg, seed=seed, modality="text")
-        pooler_text.fit(text_train, train_labels,
-                        token_ids=text_train_tok_ids,
-                        attention_mask=text_train_attn)
+        pooler_text.fit(
+            text_train if _pi is None else text_train[_pi],
+            train_labels if _pi is None else train_labels[_pi],
+            token_ids=text_train_tok_ids if _pi is None else text_train_tok_ids[_pi],
+            attention_mask=text_train_attn if _pi is None else text_train_attn[_pi],
+        )
         pal_text_tr_raw = pooler_text.transform(text_train, token_ids=text_train_tok_ids, attention_mask=text_train_attn)
         pal_text_te_raw = pooler_text.transform(text_test,  token_ids=text_test_tok_ids,  attention_mask=text_test_attn)
         best_stage_txt  = pooler_text.stages_[pooler_text.best_stage_idx_]
@@ -410,10 +430,13 @@ def _run_single_seed(
         # ── Fit text PAL pooler (tabular context) ────────────────────────────
         print("\n--- Fitting text IterativePALPooler (tabular context) ---")
         pooler_text_ctx = pooler_factory(refinement_cfg=text_refinement_cfg, seed=seed, modality="text")
-        pooler_text_ctx.fit(text_train, train_labels,
-                            token_ids=text_train_tok_ids,
-                            attention_mask=text_train_attn,
-                            context_features=tab_train)
+        pooler_text_ctx.fit(
+            text_train if _pi is None else text_train[_pi],
+            train_labels if _pi is None else train_labels[_pi],
+            token_ids=text_train_tok_ids if _pi is None else text_train_tok_ids[_pi],
+            attention_mask=text_train_attn if _pi is None else text_train_attn[_pi],
+            context_features=tab_train if _pi is None else tab_train[_pi],
+        )
         pal_ctx_text_tr_raw = pooler_text_ctx.transform(text_train, token_ids=text_train_tok_ids, attention_mask=text_train_attn)
         pal_ctx_text_te_raw = pooler_text_ctx.transform(text_test,  token_ids=text_test_tok_ids,  attention_mask=text_test_attn)
         best_stage_txt_ctx  = pooler_text_ctx.stages_[pooler_text_ctx.best_stage_idx_]
@@ -427,7 +450,7 @@ def _run_single_seed(
         _eval("pal_context_text",     pal_ctx_text_tr, pal_ctx_text_te)
         _eval("pal_context_text+tab", _concat_tabular(pal_ctx_text_tr, tab_train), _concat_tabular(pal_ctx_text_te, tab_test))
 
-    if not is_text_primary:
+    if run_image:
         # ── PALPool: fit on image patches only ───────────────────────────────
         print("\n--- Fitting IterativePALPooler (image-only) ---")
         refinement_cfg = ImagePALConfig(
@@ -453,9 +476,13 @@ def _run_single_seed(
             train_val_fraction=args.train_val_fraction,
         )
 
+        _pi = pool_idx
         pooler = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
         t_fit = time.perf_counter()
-        pooler.fit(train_patches, train_labels)
+        pooler.fit(
+            train_patches if _pi is None else train_patches[_pi],
+            train_labels  if _pi is None else train_labels[_pi],
+        )
         fit_time_s = time.perf_counter() - t_fit
         print(f"[pal] Pooler fit in {fit_time_s:.1f}s")
 
@@ -486,12 +513,16 @@ def _run_single_seed(
         t_fit_ctx = time.perf_counter()
 
         ctx_features_train = tab_train
-        if has_text and args.image_context_text:
+        if run_text and args.image_context_text:
             print("[info] Using text+tabular as context for image pooler (text fitted with tabular context)")
             text_pool_pca_tr, text_pool_pca_te, _ = _pca_project(pal_ctx_text_tr_raw, pal_ctx_text_te_raw, pca_dim, seed)
             ctx_features_train = np.concatenate([text_pool_pca_tr, tab_train], axis=1)
 
-        pooler_ctx.fit(train_patches, train_labels, context_features=ctx_features_train)
+        pooler_ctx.fit(
+            train_patches if _pi is None else train_patches[_pi],
+            train_labels  if _pi is None else train_labels[_pi],
+            context_features=ctx_features_train if _pi is None else ctx_features_train[_pi],
+        )
         fit_time_ctx_s = time.perf_counter() - t_fit_ctx
         print(f"[pal_ctx] Pooler fit in {fit_time_ctx_s:.1f}s")
 
@@ -517,7 +548,7 @@ def _run_single_seed(
               _concat_tabular(pal_ctx_test_proj,  tab_test))
 
     # ── Combined image + text conditions (only when both modalities present) ──
-    if has_text and not is_text_primary:
+    if run_image and run_text:
         print("\n--- Combined image + text conditions ---")
         # mean+mean
         _eval("mean_pool_img+mean_pool_text",
@@ -565,6 +596,8 @@ def _run_single_seed(
             "ridge_alpha":        args.ridge_alpha,
             "weight_method":      args.weight_method,
             "text_weight_method": args.text_weight_method or args.weight_method,
+            "max_pooling_samples":  args.max_pooling_samples,
+            "modalities":           args.modalities,
             "image_context_text":   args.image_context_text,
             "train_val_fraction":   args.train_val_fraction,
             "seed":                 seed,
@@ -576,7 +609,7 @@ def _run_single_seed(
             "embed_dim": int(D),
             "tab_dim":   int(tab_train.shape[1]),
             "n_classes": int(n_classes),
-            "pca_dim":   int(pal_pca.n_components_) if (not is_text_primary and pal_pca is not None) else None,
+            "pca_dim":   int(pal_pca.n_components_) if (run_image and pal_pca is not None) else None,
         },
         "results": results,
     }
@@ -604,6 +637,7 @@ def run_multimodal_experiment(args: argparse.Namespace) -> None:
             "jigsaw":            JIGSAW_DATASET_PATH,
             "product-sentiment": PRODUCT_SENTIMENT_DATASET_PATH,
             "wine-reviews":      WINE_REVIEWS_DATASET_PATH,
+            "wikiart":           WIKIART_DATASET_PATH,
         }[args.dataset]
 
     output_dir = Path(args.output_dir) if args.output_dir is not None else Path("results/multimodal") / args.dataset
@@ -662,7 +696,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dataset",        type=str,   default="petfinder",
                    choices=["petfinder", "dvm", "pad-ufes", "cbis-ddsm-mass", "cbis-ddsm-calc",
                             "clothing", "salary", "airbnb", "fake-jobs", "jigsaw",
-                            "product-sentiment", "wine-reviews"],
+                            "product-sentiment", "wine-reviews", "wikiart"],
                    help="Dataset to run multimodal experiment on")
     p.add_argument("--dataset-path",   type=Path,  default=None,
                    help="Root directory of the dataset (defaults to config value)")
@@ -672,6 +706,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Load at most this many train+val images (fast initial subset)")
     p.add_argument("--max-test",       type=int,   default=None,
                    help="Load at most this many test images")
+    p.add_argument("--max-pooling-samples", type=int, default=None,
+                   help="If set, fit poolers on a random subset of this many training samples. "
+                        "The full training set is still used for final evaluation.")
     p.add_argument("--n-estimators",   type=int,   default=1,
                    help="TabICL ensemble size (default: 1)")
     p.add_argument("--pca-dim",        type=int,   default=128,
@@ -723,6 +760,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--train-val-fraction", type=float, default=None,
                    help="Fraction of training data held out as validation inside each PAL pooler "
                         "stage (e.g. 0.2). If None (default) no internal split is performed.")
+    p.add_argument("--modalities",      type=str,   default="all",
+                   choices=["all", "image", "text"],
+                   help="Which non-tabular modalities to evaluate: 'all' (default), "
+                        "'image' (image+tabular conditions only), or "
+                        "'text' (text+tabular conditions only). "
+                        "tabular_only is always evaluated.")
     p.add_argument("--image-context-text", action="store_true",
                    help="When fitting image PAL pooler with context, include text+tabular features "
                         "(only for datasets with text support, e.g., petfinder)")

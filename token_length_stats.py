@@ -33,6 +33,7 @@ ELECTRA_PT: dict[str, Path] = {
     "airbnb":            Path("/project/6101781/image_icl_project/airbnb-melbourne/airbnb_melbourne_electra_text_features.pt"),
     "product-sentiment": Path("/project/6101781/image_icl_project/product-sentiment/product-sentiment_electra_text_features.pt"),
     "wine-reviews":      Path("/project/6101781/image_icl_project/wine-reviews/wine-reviews_electra_text_features.pt"),
+    "petfinder":         Path("/project/6101781/image_icl_project/petfinder/petfinder_electra_text_features.pt"),
 }
 
 # ---------------------------------------------------------------------------

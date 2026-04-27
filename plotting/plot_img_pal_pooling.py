@@ -1,9 +1,9 @@
 """Plot image PAL pooling results from results/img_pal_pooling.
 
 One subplot per dataset.  Within each subplot, bars are grouped by training-set
-size (Full vs DS).  Each group contains:
+fraction (20% vs 100%).  Each group contains:
 
-    [CLS token | Mean pool | PAL TVF | PAL No-TVF]
+    [CLS token | Mean pool | PAL pgs16 (16-4-1) | PAL pgs1 (1-1-1)]
 
 Bars show mean across seeds; error bars show ±1 std.
 A best-val-iteration tick (mean across seeds) is overlaid on every PAL bar.
@@ -14,7 +14,7 @@ Usage
     python plotting/plot_img_pal_pooling.py
     python plotting/plot_img_pal_pooling.py --results-dir results/img_pal_pooling
     python plotting/plot_img_pal_pooling.py --metric auroc --output my_plot.png
-    python plotting/plot_img_pal_pooling.py --datasets butterfly
+    python plotting/plot_img_pal_pooling.py --datasets butterfly rsna
 """
 
 from __future__ import annotations
@@ -29,21 +29,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-DATASETS = ["butterfly", "rsna"]
+DATASETS = ["butterfly", "rsna", "coco", "open-images"]
 DATASET_LABELS: dict[str, str] = {
-    "butterfly": "Butterfly",
-    "rsna":      "RSNA",
+    "butterfly":   "Butterfly",
+    "rsna":        "RSNA",
+    "coco":        "COCO",
+    "open-images": "Open Images",
 }
 
 # (group_label, [(variant_suffix, bar_label, color, hatch), ...])
+# variant_suffix is appended to "{dataset}_" to form the experiment directory name
 GROUPS: list[tuple[str, list[tuple[str, str, str, str]]]] = [
-    ("Full", [
-        ("tvf_ms",    "PAL\nTVF",     "#55a868", ""),
-        ("notvf_ms",  "PAL\nNo-TVF",  "#4c72b0", ""),
+    ("20%", [
+        ("pgs16_n02", "PAL\n16-4-1", "#55a868", ""),
+        ("pgs1_n02",  "PAL\n1-1-1",  "#4c72b0", ""),
     ]),
-    ("DS", [
-        ("tvf_ms_ds",   "PAL\nTVF",    "#55a868", "///"),
-        ("notvf_ms_ds", "PAL\nNo-TVF", "#4c72b0", "///"),
+    ("100%", [
+        ("pgs16_nfull", "PAL\n16-4-1", "#55a868", "///"),
+        ("pgs1_nfull",  "PAL\n1-1-1",  "#4c72b0", "///"),
     ]),
 ]
 
@@ -288,8 +291,7 @@ def plot_img_pal_pooling(
         bbox_to_anchor=(0.5, -0.02),
     )
 
-    metric_label = "Accuracy" if metric == "acc" else "AUROC"
-    fig.suptitle(f"Image PAL Pooling — {metric_label}", fontsize=14)
+    fig.suptitle("Image PAL Pooling", fontsize=14)
     fig.tight_layout(rect=[0, 0.04, 1, 1])
 
     if output_path is None:

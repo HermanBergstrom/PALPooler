@@ -26,6 +26,8 @@ OXFORD_FLOWERS_DATASET_PATH    = Path("/scratch/hermanb/temp_datasets/oxford_flo
 DTD_DATASET_PATH               = Path("/scratch/hermanb/temp_datasets/DTD")
 COCO_DATASET_PATH              = Path("/scratch/hermanb/temp_datasets/coco")
 OPEN_IMAGES_DATASET_PATH       = Path("/scratch/hermanb/temp_datasets/open_images")
+WIKIART_DATASET_PATH           = Path("/project/6101781/image_icl_project/wikiart")
+MM_IMDB_DATASET_PATH           = Path("/project/6101781/image_icl_project/mm-imdb")
 FEATURES_DIR            = Path("/scratch/hermanb/temp_datasets/extracted_features")
 IMAGENET_EMBEDDINGS_PATH = Path("/project/aip-rahulgk/image_icl_project/imagenet_embeddings_dinov3")
 IMAGENET_IMAGES_PATH     = Path("/datasets/imagenet")
@@ -73,6 +75,8 @@ MODALITY_MAP: Dict[str, str] = {
     "dtd":              "image",
     "coco":             "image",
     "open-images":      "image",
+    "wikiart":          "image",
+    "mm-imdb":          "image",
     **{name: "image" for name in IMAGENET_SUBSETS},
 }
 
@@ -220,7 +224,8 @@ def parse_args() -> ExperimentConfig:
                             "cbis-ddsm-mass", "cbis-ddsm-calc", "imdb", "20news",
                             "ag_news", "yelp", "clothing", "salary", "airbnb",
                             "fake-jobs", "jigsaw", "product-sentiment", "wine-reviews",
-                            "aircrafts", "ham10000", "oxford-flowers", "dtd", "coco", "open-images"]
+                            "aircrafts", "ham10000", "oxford-flowers", "dtd", "coco", 
+                            "open-images", "wikiart", "mm-imdb"]
                            + _imagenet_choices,
                    help="Which dataset to run on")
     p.add_argument("--backbone",      type=str,   default=None,
@@ -409,6 +414,8 @@ def parse_args() -> ExperimentConfig:
         "dtd":               DTD_DATASET_PATH,
         "coco":              COCO_DATASET_PATH,
         "open-images":       OPEN_IMAGES_DATASET_PATH,
+        "wikiart":           WIKIART_DATASET_PATH,
+        "mm-imdb":           MM_IMDB_DATASET_PATH,
         **{name: IMAGENET_EMBEDDINGS_PATH for name in IMAGENET_SUBSETS},
     }
     dataset_path = args.dataset_path or _dataset_defaults[args.dataset]

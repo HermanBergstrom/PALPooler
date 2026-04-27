@@ -37,7 +37,9 @@ from pal_pooling.config import (
     PETFINDER_DATASET_PATH,
     PRODUCT_SENTIMENT_DATASET_PATH,
     SALARY_INDIA_DATASET_PATH,
+    MM_IMDB_DATASET_PATH,
     WINE_REVIEWS_DATASET_PATH,
+    WIKIART_DATASET_PATH,
     YELP_DATASET_PATH,
     DatasetConfig,
 )
@@ -378,82 +380,83 @@ def _load_features(
         print(f"[info] RSNA (test):  N={len(test_labels)}")
 
     elif dataset_cfg.dataset == "petfinder":
-        petfinder_dir = Path(dataset_cfg.dataset_path)
-        if str(petfinder_dir) not in sys.path:
-            sys.path.insert(0, str(petfinder_dir))
-        from petfinder_dataset_with_dinov3 import load_petfinder_dataset  # type: ignore
+        petfinder_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/petfinder"
+        if petfinder_module_dir not in sys.path:
+            sys.path.insert(0, petfinder_module_dir)
+        from petfinder_dataset import PetFinderDataset  # type: ignore
+        from tqdm import tqdm
 
-        backbone = dataset_cfg.backbone
-        train_loader, val_loader, test_loader, metadata = load_petfinder_dataset(
-            #processed_dir=petfinder_dir / "extracted_features" / f"preprocessed_{backbone}",
-            feature_source=backbone,
-            use_patches=True,
-            use_images=True,
-            use_local_text=load_text,
-            num_workers=0,
-        )
+        #ds = PetFinderDataset(data_dir=Path(dataset_cfg.dataset_path), image_resize=256)
+        ds = PetFinderDataset(image_resize=256)
+        train_idx, test_idx = ds.default_split()
 
-        # Access Dataset objects directly to avoid DataLoader iteration overhead.
-        train_ds = train_loader.dataset
-        val_ds   = val_loader.dataset
-        test_ds  = test_loader.dataset
+        def _collect_petfinder(ds, indices, desc: str, with_tabular: bool = False, with_text: bool = False):
+            patches_list, cls_list, labels_list, tab_list, text_list = [], [], [], [], []
+            _warned_registers = False
+            for i in tqdm(indices, desc=desc):
+                sample = ds[int(i)]
+                emb = sample["image"]   # (201, 768)
+                if not _warned_registers:
+                    print(
+                        f"[info] PetFinder image embeddings have shape {tuple(emb.shape)} — "
+                        "removing 4 register tokens (rows 1-4); these are likely DINOv2 features."
+                    )
+                    _warned_registers = True
+                cls_list.append(emb[0].float().numpy())
+                patches_list.append(emb[5:].float().numpy())
+                labels_list.append(sample["target"].item())
+                if with_tabular:
+                    tab_list.append(sample["tabular"].float().numpy())
+                if with_text and "electra_text" in sample:
+                    text_list.append(sample["electra_text"])
 
-        # Merge train + val as the support set (petfinder split: 50% / 10% / 40%).
-        train_patches = np.concatenate([
-            train_ds.patch_embeddings.float().numpy(),
-            val_ds.patch_embeddings.float().numpy(),
-        ], axis=0)
-        train_labels = np.concatenate([
-            train_ds.targets.numpy(),
-            val_ds.targets.numpy(),
-        ], axis=0).astype(np.int64)
-        cls_train = np.concatenate([
-            train_ds.image_embeddings.float().numpy(),
-            val_ds.image_embeddings.float().numpy(),
-        ], axis=0)
+            patches = np.stack(patches_list, axis=0)
+            cls_emb = np.stack(cls_list,     axis=0)
+            labels  = np.array(labels_list,  dtype=np.int64)
+            tab_arr = np.stack(tab_list, axis=0) if tab_list else None
 
-        test_patches = test_ds.patch_embeddings.float().numpy()
-        test_labels  = test_ds.targets.numpy().astype(np.int64)
-        cls_test     = test_ds.image_embeddings.float().numpy()
-
-        if load_tabular:
-            extra_data["tab_train"] = np.concatenate([
-                train_ds.tabular.float().numpy(),
-                val_ds.tabular.float().numpy(),
-            ], axis=0)
-            extra_data["tab_test"] = test_ds.tabular.float().numpy()
-
-        if load_text:
-            def _to_text_arrays(embs_t, first_pad_t):
-                embs = embs_t.float().numpy()      # [N, T, D]
-                first_pad = first_pad_t.numpy()    # [N]
-                N_, T = embs.shape[:2]
-                # Synthetic token_ids: pos 0 = 101 ([CLS]), pos 1..fp-1 = 1, pos fp.. = 0
-                # This lets group_text_tokens correctly exclude [CLS] and padding.
-                tok_ids = np.ones((N_, T), dtype=np.int32)
+            text_arr = tok_ids = attn_mask = text_cls = None
+            if text_list:
+                first_pads = [ds._electra_first_pad[int(i)] for i in indices]
+                max_len = max(first_pads)
+                D_t = text_list[0].shape[-1]
+                N = len(indices)
+                text_arr = np.zeros((N, max_len, D_t), dtype=np.float32)
+                for j, (e, fp) in enumerate(zip(text_list, first_pads)):
+                    e_np = e.float().numpy()
+                    text_arr[j, :len(e_np)] = e_np
+                fp_arr   = np.array(first_pads, dtype=np.int32)
+                tok_ids  = np.ones((N, max_len), dtype=np.int32)
                 tok_ids[:, 0] = 101  # [CLS]
-                for i in range(N_):
-                    tok_ids[i, first_pad[i]:] = 0  # padding
-                attn_mask = (np.arange(T)[None, :] < first_pad[:, None])
-                return embs, tok_ids, attn_mask
+                for j, fp in enumerate(first_pads):
+                    tok_ids[j, fp:] = 0
+                attn_mask = np.arange(max_len)[None, :] < fp_arr[:, None]
+                text_cls  = text_arr[:, 0, :].copy()
 
-            tr_embs, tr_tok, tr_mask = _to_text_arrays(train_ds.local_text_embeddings, train_ds.local_text_first_pad)
-            va_embs, va_tok, va_mask = _to_text_arrays(val_ds.local_text_embeddings, val_ds.local_text_first_pad)
-            te_embs, te_tok, te_mask = _to_text_arrays(test_ds.local_text_embeddings, test_ds.local_text_first_pad)
+            return patches, cls_emb, labels, tab_arr, text_arr, tok_ids, attn_mask, text_cls
 
-            text_train_arr = np.concatenate([tr_embs, va_embs], axis=0)
-            extra_data["text_train"]          = text_train_arr
-            extra_data["text_train_token_ids"]= np.concatenate([tr_tok, va_tok], axis=0)
-            extra_data["text_train_attn_mask"]= np.concatenate([tr_mask, va_mask], axis=0)
-            extra_data["text_cls_train"]      = text_train_arr[:, 0, :].copy()  # [CLS] embedding
+        (train_patches, cls_train, train_labels, tab_train_pf,
+         text_train, train_tok_ids, train_attn_mask, text_cls_train) = _collect_petfinder(
+            ds, train_idx, "Loading PetFinder (train+val)", with_tabular=load_tabular, with_text=load_text)
+        (test_patches, cls_test, test_labels, tab_test_pf,
+         text_test, test_tok_ids, test_attn_mask, text_cls_test) = _collect_petfinder(
+            ds, test_idx, "Loading PetFinder (test)", with_tabular=load_tabular, with_text=load_text)
 
-            extra_data["text_test"]           = te_embs
-            extra_data["text_test_token_ids"] = te_tok
-            extra_data["text_test_attn_mask"] = te_mask
-            extra_data["text_cls_test"]       = te_embs[:, 0, :].copy()
+        if load_tabular and tab_train_pf is not None:
+            extra_data["tab_train"] = tab_train_pf
+            extra_data["tab_test"]  = tab_test_pf
 
-        target_encoder = metadata["target_encoder"]
-        idx_to_class = {i: str(cls) for i, cls in enumerate(target_encoder.classes_)}
+        if text_train is not None:
+            extra_data["text_train"]           = text_train
+            extra_data["text_train_token_ids"] = train_tok_ids
+            extra_data["text_train_attn_mask"] = train_attn_mask
+            extra_data["text_cls_train"]       = text_cls_train
+            extra_data["text_test"]            = text_test
+            extra_data["text_test_token_ids"]  = test_tok_ids
+            extra_data["text_test_attn_mask"]  = test_attn_mask
+            extra_data["text_cls_test"]        = text_cls_test
+
+        idx_to_class = {i: str(i) for i in range(ds.n_classes)}
 
         print(
             f"[info] PetFinder (train+val): N={len(train_labels)}  "
@@ -1365,6 +1368,137 @@ def _load_features(
               f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] Open Images (test):  N={len(test_labels)}")
 
+    elif dataset_cfg.dataset == "mm-imdb":
+        mmimdb_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/mm-imdb"
+        if mmimdb_module_dir not in sys.path:
+            sys.path.insert(0, mmimdb_module_dir)
+        from mmimdb_dataset import MMIMDbDataset  # type: ignore
+        from tqdm import tqdm
+
+        ds = MMIMDbDataset(data_dir=Path(dataset_cfg.dataset_path))
+        train_idx, test_idx = ds.default_split()
+
+        def _collect_mmimdb(ds, indices, desc: str):
+            patches_list, cls_list, labels_list = [], [], []
+            text_list, first_pad_list = [], []
+            _warned_registers = False
+            for i in tqdm(indices, desc=desc):
+                sample = ds[int(i)]
+                emb = sample["image"]   # (201, 768)
+                if not _warned_registers:
+                    print(
+                        f"[info] MM-IMDb image embeddings have shape {tuple(emb.shape)} — "
+                        "removing 4 register tokens (rows 1-4); these are likely DINOv2 features."
+                    )
+                    _warned_registers = True
+                cls_list.append(emb[0].float().numpy())
+                patches_list.append(emb[5:].float().numpy())
+                labels_list.append(sample["target"].item())
+                if "electra_text" in sample:
+                    text_list.append(sample["electra_text"])
+            patches = np.stack(patches_list, axis=0)
+            cls_emb = np.stack(cls_list,     axis=0)
+            labels  = np.array(labels_list,  dtype=np.int64)
+
+            text_arr = tok_ids = attn_mask = text_cls = None
+            if text_list:
+                first_pads = [ds._electra_first_pad[int(i)] for i in indices]
+                max_len = max(first_pads)
+                D_t = text_list[0].shape[-1]
+                N = len(indices)
+                text_arr = np.zeros((N, max_len, D_t), dtype=np.float32)
+                for j, (e, fp) in enumerate(zip(text_list, first_pads)):
+                    e_np = e.float().numpy()
+                    text_arr[j, :len(e_np)] = e_np
+                fp_arr  = np.array(first_pads, dtype=np.int32)
+                tok_ids = np.ones((N, max_len), dtype=np.int32)
+                tok_ids[:, 0] = 101  # [CLS]
+                for j, fp in enumerate(first_pads):
+                    tok_ids[j, fp:] = 0
+                attn_mask = np.arange(max_len)[None, :] < fp_arr[:, None]
+                text_cls  = text_arr[:, 0, :].copy()
+
+            return patches, cls_emb, labels, text_arr, tok_ids, attn_mask, text_cls
+
+        (train_patches, cls_train, train_labels,
+         text_train, train_tok_ids, train_attn_mask, text_cls_train) = _collect_mmimdb(
+            ds, train_idx, "Loading MM-IMDb (train)")
+        (test_patches, cls_test, test_labels,
+         text_test, test_tok_ids, test_attn_mask, text_cls_test) = _collect_mmimdb(
+            ds, test_idx, "Loading MM-IMDb (test)")
+
+        if text_train is not None:
+            extra_data["text_train"]           = text_train
+            extra_data["text_train_token_ids"] = train_tok_ids
+            extra_data["text_train_attn_mask"] = train_attn_mask
+            extra_data["text_cls_train"]       = text_cls_train
+            extra_data["text_test"]            = text_test
+            extra_data["text_test_token_ids"]  = test_tok_ids
+            extra_data["text_test_attn_mask"]  = test_attn_mask
+            extra_data["text_cls_test"]        = text_cls_test
+
+        idx_to_class = {i: str(i) for i in range(ds.n_classes)}
+
+        print(f"[info] MM-IMDb (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] MM-IMDb (test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "wikiart":
+        wikiart_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/wikiart"
+        if wikiart_module_dir not in sys.path:
+            sys.path.insert(0, wikiart_module_dir)
+        from wikiart_dataset import WikiArtDataset  # type: ignore
+        from tqdm import tqdm
+
+        ds = WikiArtDataset(data_dir=Path(dataset_cfg.dataset_path))
+        train_idx, test_idx = ds.default_split()
+
+        def _collect_wikiart(ds, indices, desc: str, with_tabular: bool = False):
+            patches_list, cls_list, labels_list, tab_list = [], [], [], []
+            _warned_registers = False
+            for i in tqdm(indices, desc=desc):
+                sample = ds[int(i)]
+                emb = sample["image"]   # (201, 768) or (768,)
+                if emb.ndim == 2:
+                    if not _warned_registers:
+                        print(
+                            f"[info] WikiArt embeddings have shape {tuple(emb.shape)} — "
+                            "removing 4 register tokens (rows 1-4); these are likely DINOv2 features."
+                        )
+                        _warned_registers = True
+                    # row 0 = CLS, rows 1-4 = register tokens (dropped), rows 5: = spatial patches
+                    cls_list.append(emb[0].float().numpy())
+                    patches_list.append(emb[5:].float().numpy())
+                else:
+                    # CLS-only fallback — expand to (1, D) so shape is consistent
+                    cls_list.append(emb.float().numpy())
+                    patches_list.append(emb.float().numpy()[None, :])
+                labels_list.append(sample["target"].item())
+                if with_tabular:
+                    tab_list.append(sample["tabular"].float().numpy())
+            tab_arr = np.stack(tab_list, axis=0) if with_tabular else None
+            return (
+                np.stack(patches_list, axis=0),
+                np.stack(cls_list,     axis=0),
+                np.array(labels_list,  dtype=np.int64),
+                tab_arr,
+            )
+
+        train_patches, cls_train, train_labels, tab_train_wa = _collect_wikiart(
+            ds, train_idx, "Loading WikiArt (train)", with_tabular=load_tabular)
+        test_patches,  cls_test,  test_labels,  tab_test_wa  = _collect_wikiart(
+            ds, test_idx,  "Loading WikiArt (test)",  with_tabular=load_tabular)
+
+        if load_tabular:
+            extra_data["tab_train"] = tab_train_wa
+            extra_data["tab_test"]  = tab_test_wa
+
+        idx_to_class = {i: str(i) for i in range(ds.n_classes)}
+
+        print(f"[info] WikiArt (train): N={len(train_labels)}  "
+              f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] WikiArt (test):  N={len(test_labels)}")
+
     elif dataset_cfg.dataset in IMAGENET_SUBSETS:
         synsets = IMAGENET_SUBSETS[dataset_cfg.dataset]
         embeddings_root = Path(dataset_cfg.dataset_path)
@@ -1404,7 +1538,7 @@ def _load_features(
                          f"cbis-ddsm-mass, cbis-ddsm-calc, imdb, 20news, ag_news, yelp, "
                          f"clothing, salary, airbnb, fake-jobs, jigsaw, "
                          f"product-sentiment, wine-reviews, "
-                         f"aircrafts, ham10000, oxford-flowers, dtd, coco, open-images, " +
+                         f"aircrafts, ham10000, oxford-flowers, dtd, coco, open-images, wikiart, mm-imdb, " +
                          ", ".join(sorted(IMAGENET_SUBSETS)))
 
     # --- Optional n_train subsampling ---
@@ -1423,9 +1557,13 @@ def _load_features(
                 cls_train = cls_train[sub_idx]
             if "tab_train" in extra_data and extra_data["tab_train"] is not None:
                 extra_data["tab_train"] = extra_data["tab_train"][sub_idx]
-            for k in ["text_train", "text_train_token_ids", "text_train_attn_mask", "text_cls_train"]:
+            for k in ["text_train", "text_train_token_ids", "text_train_attn_mask", "text_cls_train",
+                      "train_token_ids", "train_attention_mask", "train_texts", "train_token_to_word"]:
                 if k in extra_data and extra_data[k] is not None:
-                    extra_data[k] = extra_data[k][sub_idx]
+                    if isinstance(extra_data[k], np.ndarray):
+                        extra_data[k] = extra_data[k][sub_idx]
+                    elif isinstance(extra_data[k], list):
+                        extra_data[k] = [extra_data[k][i] for i in sub_idx]
             print(f"[info] Training set subsampled: {n_train_count} / {n_orig} images")
 
     # --- Optional n_test subsampling ---
@@ -1441,9 +1579,13 @@ def _load_features(
             cls_test = cls_test[test_sub]
         if "tab_test" in extra_data and extra_data["tab_test"] is not None:
             extra_data["tab_test"] = extra_data["tab_test"][test_sub]
-        for k in ["text_test", "text_test_token_ids", "text_test_attn_mask", "text_cls_test"]:
+        for k in ["text_test", "text_test_token_ids", "text_test_attn_mask", "text_cls_test",
+                  "test_token_ids", "test_attention_mask", "test_texts", "test_token_to_word"]:
             if k in extra_data and extra_data[k] is not None:
-                extra_data[k] = extra_data[k][test_sub]
+                if isinstance(extra_data[k], np.ndarray):
+                    extra_data[k] = extra_data[k][test_sub]
+                elif isinstance(extra_data[k], list):
+                    extra_data[k] = [extra_data[k][i] for i in test_sub]
         print(f"[info] Test set subsampled: {dataset_cfg.n_test} / {n_orig_test} images")
 
     return train_patches, train_labels, test_patches, test_labels, cls_train, cls_test, idx_to_class, train_sub_idx, test_sub_idx, extra_data
