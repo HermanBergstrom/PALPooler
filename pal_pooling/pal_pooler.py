@@ -1417,15 +1417,38 @@ class IterativePALPooler:
         # Compute standard train/val splits (ignored when use_cv is True).
         tvf = getattr(self.refinement_cfg, "train_val_fraction", None)
         splits: Optional[list] = None
-        if not use_cv and tvf is not None and tvf > 0.0:
-            splits = []
-            for _k in range(len(stage_items)):
-                _rng  = np.random.RandomState(self.seed + _k)
-                _n_val = int(N * tvf)
-                _perm  = _rng.permutation(N)
-                splits.append((_perm[_n_val:], _perm[:_n_val]))  # (train_idx, val_idx)
-            print(f"[IterativePALPooler] train_val_fraction={tvf}: "
-                  f"{int(N*tvf)} val / {N - int(N*tvf)} train per stage (fresh split each stage)")
+        eval_val_idx: Optional[np.ndarray] = None  # fixed across all iterations (three-fraction mode)
+        if not use_cv and tvf is not None:
+            if isinstance(tvf, (list, tuple)) and len(tvf) == 3:
+                # Three-fraction mode: eval_val is sampled once and fixed; train/query_val re-split each stage.
+                train_frac, query_val_frac, eval_val_frac = tvf
+                _rng_eval = np.random.RandomState(self.seed)
+                _n_eval = int(N * eval_val_frac)
+                _perm_eval = _rng_eval.permutation(N)
+                eval_val_idx = _perm_eval[:_n_eval]
+                pool_idx = _perm_eval[_n_eval:]
+                n_pool = len(pool_idx)
+                _qvf_of_pool = query_val_frac / (train_frac + query_val_frac) if (train_frac + query_val_frac) > 0 else 0.0
+                _n_qval = int(n_pool * _qvf_of_pool)
+                splits = []
+                for _k in range(len(stage_items)):
+                    _rng = np.random.RandomState(self.seed + 1 + _k)
+                    _perm = _rng.permutation(n_pool)
+                    _q_idx = pool_idx[_perm[:_n_qval]]
+                    _t_idx = pool_idx[_perm[_n_qval:]]
+                    splits.append((_t_idx, _q_idx))  # (train_idx, query_val_idx)
+                print(f"[IterativePALPooler] train_val_fraction={tvf}: "
+                      f"{_n_eval} eval_val (fixed) / {n_pool - _n_qval} train / {_n_qval} query_val per stage "
+                      f"(fresh train/query_val split each stage)")
+            elif float(tvf) > 0.0:
+                splits = []
+                for _k in range(len(stage_items)):
+                    _rng  = np.random.RandomState(self.seed + _k)
+                    _n_val = int(N * float(tvf))
+                    _perm  = _rng.permutation(N)
+                    splits.append((_perm[_n_val:], _perm[:_n_val]))  # (train_idx, val_idx)
+                print(f"[IterativePALPooler] train_val_fraction={tvf}: "
+                      f"{int(N*float(tvf))} val / {N - int(N*float(tvf))} train per stage (fresh split each stage)")
 
         # When splits or CV are active and tabular probs are not user-supplied, compute them
         # per-stage / per-fold inside fit_stage so each fold uses only its 75% as support.
@@ -1507,47 +1530,76 @@ class IterativePALPooler:
                 )
 
             def post_fit(k, stage):
-                """After fitting on the train fold, pool val fold and rebuild full-N support."""
+                """After fitting on the train fold, pool held-out folds and rebuild full-N support."""
                 if splits is None:
                     return
-                train_idx, val_idx = splits[k]
-                val_pooled = stage._transform_subset(data, val_idx, cls_tokens,
-                                                     token_ids=token_ids, attention_mask=attention_mask)
-                val_proj = (
-                    stage._pca_.transform(val_pooled).astype(np.float32)
-                    if stage._pca_ is not None else val_pooled.astype(np.float32)
-                )
                 from sklearn.metrics import roc_auc_score as _roc_auc
-                n_est = getattr(self.tabicl, "n_estimators", 1)
-                sup_for_clf = stage._support_projected_
-                qry_for_clf = val_proj
-                if context_features is not None:
-                    ctx = context_features.astype(np.float32)
-                    sup_for_clf = np.concatenate([sup_for_clf, ctx[train_idx]], axis=1)
-                    qry_for_clf = np.concatenate([qry_for_clf, ctx[val_idx]],   axis=1)
-                _clf = TabICLClassifier(n_estimators=n_est, random_state=self.seed)
-                _clf.fit(sup_for_clf, labels[train_idx])
-                proba = _clf.predict_proba(qry_for_clf)
-                val_acc = float((np.array(_clf.classes_)[np.argmax(proba, axis=1)] == labels[val_idx]).mean())
-                try:
-                    val_auroc = float(
-                        _roc_auc(labels[val_idx], proba[:, 1]) if proba.shape[1] == 2
-                        else _roc_auc(labels[val_idx], proba, multi_class="ovr", average="macro")
-                    )
-                except ValueError:
-                    val_auroc = float("nan")
-                stage._val_accuracy_ = val_acc
-                stage._val_auroc_    = val_auroc
-                _stage_val_accs.append(val_acc)
-                print(
-                    f"[IterativePALPooler] Stage {k} val accuracy: {val_acc:.4f}  "
-                    f"auroc: {val_auroc:.4f}"
-                )
+                train_idx, val_idx = splits[k]
 
-                D_proj = stage._support_projected_.shape[1]
-                full_support = np.empty((N, D_proj), dtype=np.float32)
-                full_support[train_idx] = stage._support_projected_
-                full_support[val_idx]   = val_proj
+                def _project(idx):
+                    pooled = stage._transform_subset(data, idx, cls_tokens,
+                                                     token_ids=token_ids, attention_mask=attention_mask)
+                    return (
+                        stage._pca_.transform(pooled).astype(np.float32)
+                        if stage._pca_ is not None else pooled.astype(np.float32)
+                    )
+
+                def _eval_on(eval_idx, eval_proj, label, sup_proj=None, sup_idx=None, record=True):
+                    # sup_proj / sup_idx allow overriding the default (train-only) support.
+                    # record=False prints the result but does not update stage attributes or _stage_val_accs.
+                    n_est = getattr(self.tabicl, "n_estimators", 1)
+                    _sup_proj   = sup_proj if sup_proj is not None else stage._support_projected_
+                    _sup_idx    = sup_idx  if sup_idx  is not None else train_idx
+                    _sup_labels = labels[_sup_idx]
+                    sup_for_clf = _sup_proj
+                    qry_for_clf = eval_proj
+                    if context_features is not None:
+                        ctx = context_features.astype(np.float32)
+                        sup_for_clf = np.concatenate([sup_for_clf, ctx[_sup_idx]], axis=1)
+                        qry_for_clf = np.concatenate([qry_for_clf, ctx[eval_idx]], axis=1)
+                    _clf = TabICLClassifier(n_estimators=n_est, random_state=self.seed)
+                    _clf.fit(sup_for_clf, _sup_labels)
+                    proba = _clf.predict_proba(qry_for_clf)
+                    acc = float((np.array(_clf.classes_)[np.argmax(proba, axis=1)] == labels[eval_idx]).mean())
+                    try:
+                        auroc = float(
+                            _roc_auc(labels[eval_idx], proba[:, 1]) if proba.shape[1] == 2
+                            else _roc_auc(labels[eval_idx], proba, multi_class="ovr", average="macro")
+                        )
+                    except ValueError:
+                        auroc = float("nan")
+                    if record:
+                        stage._val_accuracy_ = acc
+                        stage._val_auroc_    = auroc
+                        _stage_val_accs.append(acc)
+                    print(f"[IterativePALPooler] Stage {k} {label} accuracy: {acc:.4f}  auroc: {auroc:.4f}")
+
+                val_proj = _project(val_idx)
+
+                if eval_val_idx is not None:
+                    # Three-fraction mode: val_idx = query_val (for Ridge), eval_val_idx = fixed eval set.
+                    # Support for eval = train + query_val (the full pool).
+                    eval_proj = _project(eval_val_idx)
+                    pool_sup     = np.concatenate([stage._support_projected_, val_proj], axis=0)
+                    pool_sup_idx = np.concatenate([train_idx, val_idx])
+                    _eval_on(eval_val_idx, eval_proj, "eval_val",
+                             sup_proj=pool_sup, sup_idx=pool_sup_idx)
+                    if getattr(self.refinement_cfg, "eval_query_val", False):
+                        _eval_on(val_idx, val_proj, "query_val (inspect only)", record=False)
+
+                    D_proj = stage._support_projected_.shape[1]
+                    full_support = np.empty((N, D_proj), dtype=np.float32)
+                    full_support[train_idx]    = stage._support_projected_
+                    full_support[val_idx]      = val_proj
+                    full_support[eval_val_idx] = eval_proj
+                else:
+                    _eval_on(val_idx, val_proj, "val")
+
+                    D_proj = stage._support_projected_.shape[1]
+                    full_support = np.empty((N, D_proj), dtype=np.float32)
+                    full_support[train_idx] = stage._support_projected_
+                    full_support[val_idx]   = val_proj
+
                 stage._support_projected_ = full_support
                 stage.support_labels_     = labels
 

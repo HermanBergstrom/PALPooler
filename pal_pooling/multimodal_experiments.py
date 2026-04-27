@@ -402,6 +402,7 @@ def _run_single_seed(
             model_selection=args.model_selection,
             length_importance_weight_basis=args.length_importance_weight_basis,
             train_val_fraction=args.train_val_fraction,
+            eval_query_val=args.eval_query_val,
         )
 
         # ── Fit text PAL pooler (no tabular context) ──────────────────────────
@@ -474,6 +475,7 @@ def _run_single_seed(
             prior=args.prior,
             model_selection=args.model_selection,
             train_val_fraction=args.train_val_fraction,
+            eval_query_val=args.eval_query_val,
         )
 
         _pi = pool_idx
@@ -757,9 +759,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--length-importance-weight-basis", type=str, default="none",
                    choices=["none", "full_length", "full_length_clip", "sampled_count"],
                    help="Basis for weighting tokens by sequence length in text PAL pooler (default: none)")
-    p.add_argument("--train-val-fraction", type=float, default=None,
-                   help="Fraction of training data held out as validation inside each PAL pooler "
-                        "stage (e.g. 0.2). If None (default) no internal split is performed.")
+    p.add_argument("--train-val-fraction", type=float, nargs='+', default=None,
+                   help="Hold-out fraction(s) inside each PAL pooler stage. Pass one float "
+                        "(e.g. 0.2) for a single val split, or three floats "
+                        "train_frac query_val_frac eval_val_frac (e.g. 0.6 0.2 0.2). "
+                        "With three values, train/query_val are re-split each iteration while "
+                        "eval_val is fixed and used for post-iteration evaluation.")
+    p.add_argument("--eval-query-val", action="store_true",
+                   help="When using three-fraction --train-val-fraction, also print per-iteration "
+                        "accuracy on the query_val split (train support only). "
+                        "For inspection only — model selection always uses eval_val.")
     p.add_argument("--modalities",      type=str,   default="all",
                    choices=["all", "image", "text"],
                    help="Which non-tabular modalities to evaluate: 'all' (default), "
@@ -774,7 +783,20 @@ def _parse_args() -> argparse.Namespace:
                         "Results are saved after every seed. (default: 42)")
     p.add_argument("--output-dir",     type=Path,  default=None,
                    help="Directory to save results (default: results/multimodal/<dataset>)")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.train_val_fraction is not None:
+        tvf = args.train_val_fraction
+        if len(tvf) == 1:
+            args.train_val_fraction = tvf[0]
+        elif len(tvf) == 3:
+            if sum(tvf) > 1.0 + 1e-6:
+                p.error("--train-val-fraction: the three fractions must sum to ≤ 1.0")
+            if any(f < 0 for f in tvf):
+                p.error("--train-val-fraction: all fractions must be non-negative")
+        else:
+            p.error("--train-val-fraction accepts 1 value (val_frac) or 3 values "
+                    "(train_frac query_val_frac eval_val_frac)")
+    return args
 
 
 if __name__ == "__main__":

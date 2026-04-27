@@ -127,9 +127,10 @@ class PALConfig:
     model_selection: str = "last_iteration"
     binary_dist: bool = False
     prior: str = "label_frequency"
-    train_val_fraction: Optional[float] = None
+    train_val_fraction: Optional[Union[float, List[float]]] = None
     cross_validation_cap: Optional[int] = None
     class_normalized_scores: bool = False
+    eval_query_val: bool = False
 
 
 @dataclass(kw_only=True)
@@ -245,8 +246,15 @@ def parse_args() -> ExperimentConfig:
                    help="Limit the test set to this many testing images (random subsample, only DVM)")
     p.add_argument("--n-val",         type=int,   default=None,
                    help="Limit the val set to this many validation images (random subsample, only DVM)")
-    p.add_argument("--train-val-fraction", type=float, default=None,
-                   help="Fraction of the training set to hold out as a validation set for Ridge fitting (e.g. 0.2)")
+    p.add_argument("--train-val-fraction", type=float, nargs='+', default=None,
+                   help="Hold-out fraction(s) for Ridge fitting. Pass one float (e.g. 0.2) to use as a single "
+                        "val split, or three floats train_frac query_val_frac eval_val_frac (e.g. 0.6 0.2 0.2). "
+                        "With three values, train/query_val are re-split each iteration while eval_val is fixed "
+                        "across iterations and used for post-iteration evaluation.")
+    p.add_argument("--eval-query-val", action="store_true",
+                   help="When using three-fraction --train-val-fraction, also print per-iteration "
+                        "accuracy on the query_val split (train support only). "
+                        "For inspection only — model selection always uses eval_val.")
     p.add_argument("--cross-validation-cap", type=int, default=None,
                    help="When the training set size N is at or below this cap, use 4-fold cross-validation "
                         "for Ridge pseudo-label collection instead of the standard single split. "
@@ -389,6 +397,19 @@ def parse_args() -> ExperimentConfig:
     if args.seeds is not None and args.seed != 42:
         p.error("--seeds and --seed are mutually exclusive.")
 
+    if args.train_val_fraction is not None:
+        tvf = args.train_val_fraction
+        if len(tvf) == 1:
+            args.train_val_fraction = tvf[0]
+        elif len(tvf) == 3:
+            if sum(tvf) > 1.0 + 1e-6:
+                p.error("--train-val-fraction: the three fractions must sum to ≤ 1.0")
+            if any(f < 0 for f in tvf):
+                p.error("--train-val-fraction: all fractions must be non-negative")
+        else:
+            p.error("--train-val-fraction accepts 1 value (val_frac) or 3 values "
+                    "(train_frac query_val_frac eval_val_frac)")
+
     _dataset_defaults = {
         "butterfly":      BUTTERFLY_DATASET_PATH,
         "rsna":           RSNA_DATASET_PATH,
@@ -463,6 +484,7 @@ def parse_args() -> ExperimentConfig:
             train_val_fraction=args.train_val_fraction,
             cross_validation_cap=args.cross_validation_cap,
             class_normalized_scores=args.class_normalized_scores,
+            eval_query_val=args.eval_query_val,
         )
     else:
         refinement_cfg = ImagePALConfig(
@@ -489,6 +511,7 @@ def parse_args() -> ExperimentConfig:
             train_val_fraction=args.train_val_fraction,
             cross_validation_cap=args.cross_validation_cap,
             class_normalized_scores=args.class_normalized_scores,
+            eval_query_val=args.eval_query_val,
         )
 
     attention_cfg = AttentionPoolConfig(

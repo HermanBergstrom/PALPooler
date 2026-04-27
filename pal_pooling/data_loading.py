@@ -387,7 +387,8 @@ def _load_features(
         from tqdm import tqdm
 
         #ds = PetFinderDataset(data_dir=Path(dataset_cfg.dataset_path), image_resize=256)
-        ds = PetFinderDataset(image_resize=256)
+        #ds = PetFinderDataset(image_resize=256)
+        ds = PetFinderDataset()
         train_idx, test_idx = ds.default_split()
 
         def _collect_petfinder(ds, indices, desc: str, with_tabular: bool = False, with_text: bool = False):
