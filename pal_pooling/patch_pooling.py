@@ -283,6 +283,23 @@ def compute_patch_pooling_weights(
         Requires *class_prior* (empirical class frequencies, shape [n_classes]).
         Note: *true_label* is not used by this method unless *binary_dist* is True.
 
+    ``"cjs_div"``
+        Cumulative Jensen-Shannon Divergence.  Treats each ordinal threshold as a
+        binary classification problem and sums binary JS divergences across all K-1
+        CDF cut-points:
+
+            CJS(Q, P) = Σ_{k=1}^{K-1} JS_bin(F_Q(k), F_P(k))
+
+        where F_Q(k) = Σ_{c≤k} Q(c) (CDF of Q up to class k) and
+        JS_bin(x, y) = 0.5·KL_bin(x, m) + 0.5·KL_bin(y, m),
+        KL_bin(a, b) = a·ln(a/b) + (1-a)·ln((1-a)/(1-b)), m = (x+y)/2.
+
+        Normalise by (K-1)·ln 2 (the maximum CJS)  →  score_i in [0, 1].
+        Apply log to get a logit, then temperature-scaled softmax.
+
+        Requires *class_prior* (empirical class frequencies, shape [n_classes]).
+        Note: *true_label* is not used by this method unless *binary_dist* is True.
+
     When *binary_dist* is True (and *weight_method* is not ``"correct_class_prob"``),
     the predicted distribution and prior are collapsed to a 2-class representation
     ``[P(correct), P(non-correct)]`` before any distance is computed.  This avoids
@@ -374,6 +391,31 @@ def compute_patch_pooling_weights(
         weights /= weights.sum()
         return weights.astype(np.float32)
 
+    if weight_method == "cjs_div":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='cjs_div'")
+        prior = np.asarray(class_prior, dtype=np.float64).clip(1e-9, 1.0)
+        prior /= prior.sum()
+        q = patch_probs.astype(np.float64)                         # [P, K]
+        K = q.shape[1]
+        cdf_q = np.cumsum(q, axis=1)[:, :-1].clip(1e-9, 1 - 1e-9) # [P, K-1]
+        cdf_p = np.cumsum(prior)[:-1].clip(1e-9, 1 - 1e-9)         # [K-1]
+        m = 0.5 * (cdf_q + cdf_p[None, :])                         # [P, K-1]
+        js_bin = (
+            0.5 * (cdf_q * np.log(cdf_q / m)
+                   + (1 - cdf_q) * np.log((1 - cdf_q) / (1 - m)))
+            + 0.5 * (cdf_p * np.log(cdf_p / m)
+                     + (1 - cdf_p) * np.log((1 - cdf_p) / (1 - m)))
+        )                                                           # [P, K-1]
+        cjs = js_bin.sum(axis=1)                                    # [P]
+        scores = (cjs / ((K - 1) * np.log(2))).clip(1e-7, 1.0)     # [P] in (0, 1]
+        logits = np.log(scores)                                     # [P] in (-inf, 0]
+        logits_scaled = logits / temperature
+        logits_scaled -= logits_scaled.max()                        # numerical stability
+        weights = np.exp(logits_scaled)
+        weights /= weights.sum()
+        return weights.astype(np.float32)
+
     # --- default: correct_class_prob method ---
     true_class_probs = patch_probs[:, true_label].clip(1e-7, 1.0 - 1e-7)  # [P]
     logits = np.log(true_class_probs)
@@ -436,6 +478,8 @@ def compute_patch_quality_logits(
     ``"tvd"``                → log(TVD(Q, P_prior)) / temperature
                                Requires *class_prior* [n_classes].
     ``"js_div"``             → log(JSD(Q, P_prior) / ln2) / temperature
+                               Requires *class_prior* [n_classes].
+    ``"cjs_div"``            → log(CJS(Q, P_prior) / ((K-1)·ln2)) / temperature
                                Requires *class_prior* [n_classes].
 
     When *binary_dist* is True (and *weight_method* is not ``"correct_class_prob"``),
@@ -501,6 +545,26 @@ def compute_patch_quality_logits(
         scores = (jsd / np.log(2)).clip(1e-7, 1.0)                    # [P] normalised to (0, 1]
         return (np.log(scores) / temperature).astype(np.float32)
 
+    if weight_method == "cjs_div":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='cjs_div'")
+        prior = np.asarray(class_prior, dtype=np.float64).clip(1e-9, 1.0)
+        prior /= prior.sum()
+        q = patch_probs.astype(np.float64)                             # [P, K]
+        K = q.shape[1]
+        cdf_q = np.cumsum(q, axis=1)[:, :-1].clip(1e-9, 1 - 1e-9)    # [P, K-1]
+        cdf_p = np.cumsum(prior)[:-1].clip(1e-9, 1 - 1e-9)            # [K-1]
+        m = 0.5 * (cdf_q + cdf_p[None, :])                            # [P, K-1]
+        js_bin = (
+            0.5 * (cdf_q * np.log(cdf_q / m)
+                   + (1 - cdf_q) * np.log((1 - cdf_q) / (1 - m)))
+            + 0.5 * (cdf_p * np.log(cdf_p / m)
+                     + (1 - cdf_p) * np.log((1 - cdf_p) / (1 - m)))
+        )                                                              # [P, K-1]
+        cjs = js_bin.sum(axis=1)                                       # [P]
+        scores = (cjs / ((K - 1) * np.log(2))).clip(1e-7, 1.0)
+        return (np.log(scores) / temperature).astype(np.float32)
+
     # --- default: correct_class_prob method ---
     p = patch_probs[:, true_label].clip(1e-7, 1.0 - 1e-7)
     return (np.log(p) / temperature).astype(np.float32)
@@ -519,7 +583,7 @@ def compute_patch_quality_logits_gpu(
     Accepts and returns ``torch.Tensor`` objects on the same device as
     *patch_probs*.  All operations mirror the numpy version exactly.
     Requires *class_prior* to be a tensor on the same device for the
-    ``kl_div``, ``wasserstein``, ``js_div``, and ``tvd`` methods.
+    ``kl_div``, ``wasserstein``, ``js_div``, ``tvd``, and ``cjs_div`` methods.
 
     When *binary_dist* is True (and *weight_method* is not ``"correct_class_prob"``),
     distributions are collapsed to ``[P(correct), P(non-correct)]`` before the
@@ -588,6 +652,27 @@ def compute_patch_quality_logits_gpu(
         jsd = (0.5 * (q * (q / m).log()).sum(dim=1)
                + 0.5 * (prior * (prior / m).log()).sum(dim=1))          # [P]
         scores = (jsd / math.log(2)).clamp(eps_clip, 1.0)
+        return (scores.log() / temperature).float()
+
+    if weight_method == "cjs_div":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='cjs_div'")
+        prior = class_prior.double().clamp(eps_prob, 1.0)
+        prior = prior / prior.sum()
+        q = patch_probs.double()                                         # [P, K]
+        K = q.shape[1]
+        eps_b = 1e-9
+        cdf_q = q.cumsum(dim=1)[:, :-1].clamp(eps_b, 1 - eps_b)        # [P, K-1]
+        cdf_p = prior.cumsum(dim=0)[:-1].clamp(eps_b, 1 - eps_b)       # [K-1]
+        m = 0.5 * (cdf_q + cdf_p.unsqueeze(0))                         # [P, K-1]
+        js_bin = (
+            0.5 * (cdf_q * (cdf_q / m).log()
+                   + (1 - cdf_q) * ((1 - cdf_q) / (1 - m)).log())
+            + 0.5 * (cdf_p * (cdf_p / m).log()
+                     + (1 - cdf_p) * ((1 - cdf_p) / (1 - m)).log())
+        )                                                                # [P, K-1]
+        cjs = js_bin.sum(dim=1)                                          # [P]
+        scores = (cjs / ((K - 1) * math.log(2))).clamp(eps_clip, 1.0)
         return (scores.log() / temperature).float()
 
     # --- default: correct_class_prob ---
@@ -810,7 +895,7 @@ def refine_dataset_features(
     counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls_local)
     empirical_prior = (counts / counts.sum()).astype(np.float32)
 
-    _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd")
+    _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd", "cjs_div")
     if refinement_cfg.weight_method in _divergence_methods:
         class_prior: Optional[np.ndarray] = empirical_prior
     else:
@@ -1299,7 +1384,7 @@ def collect_pseudo_labels_image(
     counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls)
     empirical_prior = (counts / counts.sum()).astype(np.float32)
 
-    _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd")
+    _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd", "cjs_div")
     class_prior: Optional[np.ndarray] = (
         empirical_prior if refinement_cfg.weight_method in _divergence_methods else None
     )

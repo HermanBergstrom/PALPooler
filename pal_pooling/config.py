@@ -28,6 +28,7 @@ COCO_DATASET_PATH              = Path("/scratch/hermanb/temp_datasets/coco")
 OPEN_IMAGES_DATASET_PATH       = Path("/scratch/hermanb/temp_datasets/open_images")
 WIKIART_DATASET_PATH           = Path("/project/6101781/image_icl_project/wikiart")
 MM_IMDB_DATASET_PATH           = Path("/project/6101781/image_icl_project/mm-imdb")
+CREMA_D_DATASET_PATH           = Path("/project/6101781/image_icl_project/crema_d")
 FEATURES_DIR            = Path("/scratch/hermanb/temp_datasets/extracted_features")
 IMAGENET_EMBEDDINGS_PATH = Path("/project/aip-rahulgk/image_icl_project/imagenet_embeddings_dinov3")
 IMAGENET_IMAGES_PATH     = Path("/datasets/imagenet")
@@ -77,6 +78,7 @@ MODALITY_MAP: Dict[str, str] = {
     "open-images":      "image",
     "wikiart":          "image",
     "mm-imdb":          "image",
+    "crema-d":          "text",
     **{name: "image" for name in IMAGENET_SUBSETS},
 }
 
@@ -191,6 +193,7 @@ class RunConfig:
     show_minority_prob: bool
     show_per_class_probs: bool
     unified_weight_limits: bool
+    use_viz_subset: bool
     per_class_accuracy: bool
     n_train_sweep: Optional[List[int]]
     seeds: Optional[List[int]] = None
@@ -204,6 +207,7 @@ class ExperimentConfig:
     seed: int
     device: str = "auto"
     cli_args: Optional[Dict[str, Any]] = field(default=None)
+    info: bool = False
 
 def _n_train_type(v: str) -> Union[int, float]:
     """Accept an integer count or a float fraction in (0, 1) for --n-train."""
@@ -226,7 +230,7 @@ def parse_args() -> ExperimentConfig:
                             "ag_news", "yelp", "clothing", "salary", "airbnb",
                             "fake-jobs", "jigsaw", "product-sentiment", "wine-reviews",
                             "aircrafts", "ham10000", "oxford-flowers", "dtd", "coco", 
-                            "open-images", "wikiart", "mm-imdb"]
+                            "open-images", "wikiart", "mm-imdb", "crema-d"]
                            + _imagenet_choices,
                    help="Which dataset to run on")
     p.add_argument("--backbone",      type=str,   default=None,
@@ -281,7 +285,7 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--batch-size",     type=int,   default=1000,
                    help="Number of images per TabICL call during refinement")
     p.add_argument("--weight-method",  type=str,   default="correct_class_prob",
-                   choices=["correct_class_prob", "entropy", "kl_div", "wasserstein", "js_div", "tvd"],
+                   choices=["correct_class_prob", "entropy", "kl_div", "wasserstein", "js_div", "tvd", "cjs_div"],
                    help="How to derive patch pooling weights from TabICL probabilities.")
     p.add_argument("--ridge-alpha",  type=float, nargs="+",  default=[1.0],
                    help="Regularisation strength for the Ridge quality model.")
@@ -373,6 +377,9 @@ def parse_args() -> ExperimentConfig:
                    help="Add a P(minority class) panel with image-local colour scale to visualisation figures.")
     p.add_argument("--per-class-probs-viz", action="store_true",
                    help="Add one P(class k) heatmap panel per class (only when n_classes <= 10).")
+    p.add_argument("--use-viz-subset", action="store_true",
+                   help="Limit weight visualisations to: Original Image, Correct-class-prob weights, "
+                        "Entropy weights, JS-div weights; also removes the figure title.")
     p.add_argument("--unified-weight-limits", action="store_true",
                    help="Use shared vmin/vmax across all sampled images for each weight panel, "
                         "instead of per-image auto-scaling.")
@@ -389,6 +396,9 @@ def parse_args() -> ExperimentConfig:
                         "s~_i = (s_i - mu_c) / sigma_c where c is the class of sample i. "
                         "Preserves relative within-class variation even when classes have "
                         "systematically different score levels.")
+    p.add_argument("--info", action="store_true",
+                   help="Print dataset sizes and class distribution then exit (no experiment run). "
+                        "n_train / n_test limits are ignored so the full dataset sizes are reported.")
 
     args = p.parse_args()
 
@@ -437,6 +447,7 @@ def parse_args() -> ExperimentConfig:
         "open-images":       OPEN_IMAGES_DATASET_PATH,
         "wikiart":           WIKIART_DATASET_PATH,
         "mm-imdb":           MM_IMDB_DATASET_PATH,
+        "crema-d":           CREMA_D_DATASET_PATH,
         **{name: IMAGENET_EMBEDDINGS_PATH for name in IMAGENET_SUBSETS},
     }
     dataset_path = args.dataset_path or _dataset_defaults[args.dataset]
@@ -535,6 +546,7 @@ def parse_args() -> ExperimentConfig:
         show_minority_prob=args.minority_prob_viz,
         show_per_class_probs=args.per_class_probs_viz,
         unified_weight_limits=args.unified_weight_limits,
+        use_viz_subset=args.use_viz_subset,
         per_class_accuracy=args.per_class_accuracy,
         n_train_sweep=args.n_train_sweep,
         seeds=args.seeds,
@@ -547,4 +559,5 @@ def parse_args() -> ExperimentConfig:
         run=run_cfg,
         seed=args.seed,
         device=args.device,
+        info=args.info,
     )

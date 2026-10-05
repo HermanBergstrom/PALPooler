@@ -179,6 +179,7 @@ def _run_visual_eval(
     use_attn_masking:  bool = False,
     binary_dist:       bool = False,
     unified_weight_limits: bool = False,
+    viz_subset:        bool = False,
 ) -> dict[str, float]:
     """Run the patch-quality visual evaluation for one support set variant.
 
@@ -308,6 +309,7 @@ def _run_visual_eval(
                 show_per_class_probs=show_per_class_probs,
                 binary_dist=binary_dist,
                 weight_limits=weight_limits,
+                viz_subset=viz_subset,
             )
             out_path = (
                 split_out_dir
@@ -817,6 +819,7 @@ def _make_stage_callback(
                 use_attn_masking=cfg.refinement.use_attn_masking,
                 binary_dist=cfg.refinement.binary_dist,
                 unified_weight_limits=cfg.run.unified_weight_limits,
+                viz_subset=cfg.run.use_viz_subset,
             )
         else:
             iter_mean_probs = {}
@@ -851,6 +854,7 @@ def _make_stage_callback(
                 use_attn_masking=cfg.refinement.use_attn_masking,
                 binary_dist=cfg.refinement.binary_dist,
                 unified_weight_limits=cfg.run.unified_weight_limits,
+                viz_subset=cfg.run.use_viz_subset,
             )
 
         # Pool test queries with Ridge and evaluate accuracy.
@@ -1468,6 +1472,7 @@ def run_pal_experiment(
             use_attn_masking=cfg.refinement.use_attn_masking,
             binary_dist=cfg.refinement.binary_dist,
             unified_weight_limits=cfg.run.unified_weight_limits,
+            viz_subset=cfg.run.use_viz_subset,
         )
     else:
         baseline_mean_probs = {}
@@ -1547,6 +1552,7 @@ def run_pal_experiment(
             use_attn_masking=cfg.refinement.use_attn_masking,
             binary_dist=cfg.refinement.binary_dist,
             unified_weight_limits=cfg.run.unified_weight_limits,
+            viz_subset=cfg.run.use_viz_subset,
         )
 
     total_time_s = time.perf_counter() - experiment_start
@@ -1758,9 +1764,44 @@ def run_seed_sweep(cfg: ExperimentConfig) -> None:
     print(f"[seed-sweep] Results → {sweep_path}")
 
 
+def _print_dataset_info(cfg: ExperimentConfig) -> None:
+    """Load dataset ignoring n_train/n_test limits and print sizes + class distribution."""
+    import copy
+    info_cfg = copy.deepcopy(cfg)
+    info_cfg.dataset.n_train = None
+    info_cfg.dataset.n_test  = None
+    info_cfg.dataset.n_val   = None
+
+    (train_patches, train_labels, test_patches, test_labels,
+     _cls_train, _cls_test, idx_to_class, *_rest) = _load_features(
+        dataset_cfg=info_cfg.dataset, seed=cfg.seed,
+    )
+    n_classes = len(idx_to_class)
+    tr_counts = np.bincount(train_labels.astype(np.int64), minlength=n_classes)
+    te_counts = np.bincount(test_labels.astype(np.int64),  minlength=n_classes)
+
+    print(f"\nDataset : {cfg.dataset.dataset}")
+    print(f"Train   : {len(train_labels):,}  |  Test: {len(test_labels):,}")
+    print(f"Patches : {train_patches.shape[1]}  |  Embed dim: {train_patches.shape[2]}")
+    print(f"Classes : {n_classes}")
+    print(f"\n  {'class':<20} {'train':>8} {'train%':>8} {'test':>8} {'test%':>8}")
+    print(f"  {'-'*56}")
+    for i in range(n_classes):
+        print(
+            f"  {str(idx_to_class[i]):<20} {tr_counts[i]:>8,} "
+            f"{100*tr_counts[i]/tr_counts.sum():>7.1f}% "
+            f"{te_counts[i]:>8,} "
+            f"{100*te_counts[i]/te_counts.sum():>7.1f}%"
+        )
+
+
 if __name__ == "__main__":
     sys.stdout.reconfigure(line_buffering=True)
     cfg = parse_args()
+
+    if cfg.info:
+        _print_dataset_info(cfg)
+        sys.exit(0)
 
     if cfg.run.n_train_sweep is not None and cfg.dataset.n_train is not None:
         raise SystemExit("error: --n-train-sweep and --n-train are mutually exclusive")

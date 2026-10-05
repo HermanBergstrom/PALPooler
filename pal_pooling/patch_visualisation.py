@@ -67,12 +67,13 @@ def visualise_image(
     show_per_class_probs: bool = False,               # add one P(class k) panel per class (only when n_classes <= 10)
     binary_dist:       bool  = False,                 # collapse non-correct classes before computing weights
     weight_limits: Optional[dict[str, tuple[float, float]]] = None,  # shared vmin/vmax per method across images
+    viz_subset:        bool  = False,                 # limit to Original/CCP/Entropy/JS-div panels; no suptitle
 ) -> plt.Figure:
     """Figure with overlay panels showing per-patch softmax quality scores.
 
-    Panels: original | P(true) | ccp weights | entropy weights | kl_div weights | wasserstein weights | js_div weights | tvd weights
+    Panels: original | P(true) | ccp weights | entropy weights | kl_div weights | wasserstein weights | js_div weights | tvd weights | cjs_div weights
             [+ Ridge weights when ridge_pred_logits is provided]
-    kl_div, wasserstein, js_div, and tvd panels are only shown when class_prior is provided.
+    kl_div, wasserstein, js_div, tvd, and cjs_div panels are only shown when class_prior is provided.
     The panel corresponding to weight_method is marked with ★ in its title.
     """
     P      = len(patch_probs)
@@ -99,9 +100,9 @@ def visualise_image(
     def _dist_panels(dist: np.ndarray, label: str) -> list[tuple[str, Optional[np.ndarray], dict]]:
         """Build overlay panels for a [P, n_classes] distribution.
 
-        Panels: original | P(true) | ccp weights | entropy weights | kl_div weights | wasserstein weights | js_div weights | tvd weights.
+        Panels: original | P(true) | ccp weights | entropy weights | kl_div weights | wasserstein weights | js_div weights | tvd weights | cjs_div weights.
         The panel whose method matches weight_method is marked with ★.
-        kl_div, wasserstein, js_div, and tvd panels are shown when class_prior is provided.
+        kl_div, wasserstein, js_div, tvd, and cjs_div panels are shown when class_prior is provided.
         """
         p_true    = dist[:, true_label]
         def _lim(method: str, arr: np.ndarray) -> tuple[float, float]:
@@ -113,6 +114,22 @@ def visualise_image(
         w_entropy = compute_patch_pooling_weights(dist, true_label, temperature, "entropy", binary_dist=binary_dist)
         ccp_lo, ccp_hi   = _lim("correct_class_prob", w_ccp)
         ent_lo,  ent_hi  = _lim("entropy", w_entropy)
+        if viz_subset:
+            panels = [
+                (f"Original image\n[{label}]", None, {}),
+                (_mark("Correct-class-prob weights", "correct_class_prob"),
+                 w_ccp, {"vmin": ccp_lo, "vmax": ccp_hi}),
+                (_mark("Entropy weights", "entropy"),
+                 w_entropy, {"vmin": ent_lo, "vmax": ent_hi}),
+            ]
+            if class_prior is not None:
+                w_js = compute_patch_pooling_weights(
+                    dist, true_label, temperature, "js_div", class_prior, binary_dist=binary_dist
+                )
+                js_lo, js_hi = _lim("js_div", w_js)
+                panels.append((_mark("JS-div weights", "js_div"),
+                               w_js, {"vmin": js_lo, "vmax": js_hi}))
+            return panels
         panels = [
             (f"Original image\n[{label}]", None, {}),
             (f"P(true class)  (mean={p_true.mean():.3f})",
@@ -147,6 +164,12 @@ def visualise_image(
             tvd_lo, tvd_hi = _lim("tvd", w_tvd)
             panels.append((_mark("TVD weights", "tvd"),
                            w_tvd, {"vmin": tvd_lo, "vmax": tvd_hi}))
+            w_cjs = compute_patch_pooling_weights(
+                dist, true_label, temperature, "cjs_div", class_prior, binary_dist=binary_dist
+            )
+            cjs_lo, cjs_hi = _lim("cjs_div", w_cjs)
+            panels.append((_mark("CJS-div weights", "cjs_div"),
+                           w_cjs, {"vmin": cjs_lo, "vmax": cjs_hi}))
         if show_pred_label:
             pred_vals = dist.argmax(axis=1).astype(float)
             class_names = [idx_to_class[i] for i in range(n_classes)]
@@ -199,13 +222,14 @@ def visualise_image(
                              figsize=(n_cols * 4.5, len(all_rows) * 5),
                              squeeze=False)
 
-    fig.suptitle(
-        f"True class: {idx_to_class[true_label]!r}  |  "
-        f"mean P(true): {mean_correct_prob:.3f}  |  "
-        f"modal pred: {idx_to_class[modal_class]!r} ({consensus_frac:.0%})  |  "
-        f"mean entropy: {mean_entropy:.3f}",
-        fontsize=11,
-    )
+    if not viz_subset:
+        fig.suptitle(
+            f"True class: {idx_to_class[true_label]!r}  |  "
+            f"mean P(true): {mean_correct_prob:.3f}  |  "
+            f"modal pred: {idx_to_class[modal_class]!r} ({consensus_frac:.0%})  |  "
+            f"mean entropy: {mean_entropy:.3f}",
+            fontsize=11,
+        )
 
     for row_idx, row_panels in enumerate(all_rows):
         for col_idx, (title, vals, kwargs) in enumerate(row_panels):

@@ -383,7 +383,7 @@ def refine_text_features(
     counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls)
     empirical_prior = (counts / counts.sum()).astype(np.float32)
 
-    _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd")
+    _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd", "cjs_div")
     class_prior: Optional[np.ndarray] = (
         empirical_prior if refinement_cfg.weight_method in _divergence_methods else None
     )
@@ -726,7 +726,7 @@ def collect_pseudo_labels_text(
     counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls)
     empirical_prior = (counts / counts.sum()).astype(np.float32)
 
-    _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd")
+    _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd", "cjs_div")
     class_prior: Optional[np.ndarray] = (
         empirical_prior if refinement_cfg.weight_method in _divergence_methods else None
     )

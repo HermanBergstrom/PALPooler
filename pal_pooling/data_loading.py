@@ -37,6 +37,7 @@ from pal_pooling.config import (
     PETFINDER_DATASET_PATH,
     PRODUCT_SENTIMENT_DATASET_PATH,
     SALARY_INDIA_DATASET_PATH,
+    CREMA_D_DATASET_PATH,
     MM_IMDB_DATASET_PATH,
     WINE_REVIEWS_DATASET_PATH,
     WIKIART_DATASET_PATH,
@@ -91,7 +92,7 @@ def _get_petfinder_image_paths(
     Each path points to the lowest-numbered image for the pet (typically ``-1.jpg``).
     """
     petfinder_dir = Path(dataset_path)
-    processed_dir = petfinder_dir / "extracted_features" / "preprocessed_dinov3_local"
+    processed_dir = petfinder_dir / "preprocessed"
     images_dir    = petfinder_dir / "petfinder-adoption-prediction" / "train_images"
 
     index = _build_petfinder_image_index(images_dir)
@@ -1377,6 +1378,7 @@ def _load_features(
         from tqdm import tqdm
 
         ds = MMIMDbDataset(data_dir=Path(dataset_cfg.dataset_path))
+        #ds = MMIMDbDataset(image_resize=256)
         train_idx, test_idx = ds.default_split()
 
         def _collect_mmimdb(ds, indices, desc: str):
@@ -1443,6 +1445,100 @@ def _load_features(
         print(f"[info] MM-IMDb (train): N={len(train_labels)}  "
               f"num_patches={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
         print(f"[info] MM-IMDb (test):  N={len(test_labels)}")
+
+    elif dataset_cfg.dataset == "crema-d":
+        cremad_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/crema_d"
+        if cremad_module_dir not in sys.path:
+            sys.path.insert(0, cremad_module_dir)
+        from crema_d_dataset import CREMADDataset  # type: ignore
+        from tqdm import tqdm
+
+        ds = CREMADDataset(data_dir=Path(dataset_cfg.dataset_path), load_video=False)
+        train_idx, test_idx = ds.default_split(random_state=seed)
+
+        def _collect_cremad(ds, indices, desc: str, with_tabular: bool = False, with_text: bool = False):
+            patches_list, cls_list, labels_list, tab_list, text_list = [], [], [], [], []
+            for i in tqdm(indices, desc=desc):
+                sample = ds[int(i)]
+                audio = sample["audio"].float()   # (T, 768)
+                cls_list.append(audio[0].numpy())
+                patches_list.append(audio.numpy())
+                labels_list.append(sample["target"].item())
+                if with_tabular:
+                    tab_list.append(sample["tabular"].float().numpy())
+                if with_text and "electra_text" in sample:
+                    text_list.append(sample["electra_text"])
+
+            seq_lens = [p.shape[0] for p in patches_list]
+            max_len  = max(seq_lens)
+            D        = patches_list[0].shape[-1]
+            N        = len(indices)
+
+            patches = np.zeros((N, max_len, D), dtype=np.float32)
+            for j, p in enumerate(patches_list):
+                patches[j, :p.shape[0]] = p
+
+            cls_emb      = np.stack(cls_list, axis=0)
+            labels       = np.array(labels_list, dtype=np.int64)
+            tab_arr      = np.stack(tab_list, axis=0) if tab_list else None
+            seq_lens_arr = np.array(seq_lens, dtype=np.int32)
+            token_ids    = np.ones((N, max_len), dtype=np.int32)
+            for j, sl in enumerate(seq_lens):
+                token_ids[j, sl:] = 0
+            attn_mask = np.arange(max_len)[None, :] < seq_lens_arr[:, None]
+
+            text_arr = tok_text_ids = attn_text_mask = text_cls = None
+            if text_list:
+                first_pads    = [ds._electra_first_pad[int(i)] for i in indices]
+                max_text_len  = max(first_pads)
+                D_t           = text_list[0].shape[-1]
+                text_arr      = np.zeros((N, max_text_len, D_t), dtype=np.float32)
+                for j, (e, fp) in enumerate(zip(text_list, first_pads)):
+                    e_np = e.float().numpy()
+                    text_arr[j, :len(e_np)] = e_np
+                fp_arr        = np.array(first_pads, dtype=np.int32)
+                tok_text_ids  = np.ones((N, max_text_len), dtype=np.int32)
+                tok_text_ids[:, 0] = 101  # [CLS]
+                for j, fp in enumerate(first_pads):
+                    tok_text_ids[j, fp:] = 0
+                attn_text_mask = np.arange(max_text_len)[None, :] < fp_arr[:, None]
+                text_cls       = text_arr[:, 0, :].copy()
+
+            return patches, cls_emb, labels, tab_arr, token_ids, attn_mask, text_arr, tok_text_ids, attn_text_mask, text_cls
+
+        (train_patches, cls_train, train_labels, tab_train_cr,
+         train_token_ids, train_attn_mask,
+         text_train, train_text_tok_ids, train_text_attn_mask, text_cls_train) = _collect_cremad(
+            ds, train_idx, "Loading CREMA-D (train)", with_tabular=load_tabular, with_text=load_text)
+        (test_patches, cls_test, test_labels, tab_test_cr,
+         test_token_ids, test_attn_mask,
+         text_test, test_text_tok_ids, test_text_attn_mask, text_cls_test) = _collect_cremad(
+            ds, test_idx, "Loading CREMA-D (test)", with_tabular=load_tabular, with_text=load_text)
+
+        extra_data = {
+            "train_token_ids":      train_token_ids,
+            "train_attention_mask": train_attn_mask,
+            "test_token_ids":       test_token_ids,
+            "test_attention_mask":  test_attn_mask,
+        }
+        if load_tabular and tab_train_cr is not None:
+            extra_data["tab_train"] = tab_train_cr
+            extra_data["tab_test"]  = tab_test_cr
+        if text_train is not None:
+            extra_data["text_train"]           = text_train
+            extra_data["text_train_token_ids"] = train_text_tok_ids
+            extra_data["text_train_attn_mask"] = train_text_attn_mask
+            extra_data["text_cls_train"]       = text_cls_train
+            extra_data["text_test"]            = text_test
+            extra_data["text_test_token_ids"]  = test_text_tok_ids
+            extra_data["text_test_attn_mask"]  = test_text_attn_mask
+            extra_data["text_cls_test"]        = text_cls_test
+
+        idx_to_class = {i: name for i, name in enumerate(ds.classes)}
+
+        print(f"[info] CREMA-D (train): N={len(train_labels)}  "
+              f"max_length={train_patches.shape[1]}  embed_dim={train_patches.shape[2]}")
+        print(f"[info] CREMA-D (test):  N={len(test_labels)}")
 
     elif dataset_cfg.dataset == "wikiart":
         wikiart_module_dir = "/home/hermanb/projects/aip-rahulgk/image_icl_project/wikiart"
@@ -1539,7 +1635,7 @@ def _load_features(
                          f"cbis-ddsm-mass, cbis-ddsm-calc, imdb, 20news, ag_news, yelp, "
                          f"clothing, salary, airbnb, fake-jobs, jigsaw, "
                          f"product-sentiment, wine-reviews, "
-                         f"aircrafts, ham10000, oxford-flowers, dtd, coco, open-images, wikiart, mm-imdb, " +
+                         f"aircrafts, ham10000, oxford-flowers, dtd, coco, open-images, wikiart, mm-imdb, crema-d, " +
                          ", ".join(sorted(IMAGENET_SUBSETS)))
 
     # --- Optional n_train subsampling ---

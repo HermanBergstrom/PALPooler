@@ -393,7 +393,9 @@ def _run_single_seed(
             max_query_rows=args.max_query_rows,
             use_random_subsampling=True,
             gpu_ridge=args.gpu_ridge,
+            #tabicl_n_estimators=1,
             tabicl_n_estimators=args.n_estimators,
+            #tabicl_pca_dim=128,
             tabicl_pca_dim=pca_dim,
             append_cls=False,
             use_global_prior=args.use_global_prior,
@@ -429,27 +431,28 @@ def _run_single_seed(
         _eval("pal_text+tab", _concat_tabular(pal_text_tr, tab_train), _concat_tabular(pal_text_te, tab_test))
 
         # ── Fit text PAL pooler (tabular context) ────────────────────────────
-        print("\n--- Fitting text IterativePALPooler (tabular context) ---")
-        pooler_text_ctx = pooler_factory(refinement_cfg=text_refinement_cfg, seed=seed, modality="text")
-        pooler_text_ctx.fit(
-            text_train if _pi is None else text_train[_pi],
-            train_labels if _pi is None else train_labels[_pi],
-            token_ids=text_train_tok_ids if _pi is None else text_train_tok_ids[_pi],
-            attention_mask=text_train_attn if _pi is None else text_train_attn[_pi],
-            context_features=tab_train if _pi is None else tab_train[_pi],
-        )
-        pal_ctx_text_tr_raw = pooler_text_ctx.transform(text_train, token_ids=text_train_tok_ids, attention_mask=text_train_attn)
-        pal_ctx_text_te_raw = pooler_text_ctx.transform(text_test,  token_ids=text_test_tok_ids,  attention_mask=text_test_attn)
-        best_stage_txt_ctx  = pooler_text_ctx.stages_[pooler_text_ctx.best_stage_idx_]
-        pal_ctx_text_pca    = best_stage_txt_ctx._pca_
-        if pal_ctx_text_pca is not None:
-            pal_ctx_text_tr = pal_ctx_text_pca.transform(pal_ctx_text_tr_raw).astype(np.float32)
-            pal_ctx_text_te = pal_ctx_text_pca.transform(pal_ctx_text_te_raw).astype(np.float32)
-        else:
-            pal_ctx_text_tr = pal_ctx_text_tr_raw.astype(np.float32)
-            pal_ctx_text_te = pal_ctx_text_te_raw.astype(np.float32)
-        _eval("pal_context_text",     pal_ctx_text_tr, pal_ctx_text_te)
-        _eval("pal_context_text+tab", _concat_tabular(pal_ctx_text_tr, tab_train), _concat_tabular(pal_ctx_text_te, tab_test))
+        if not args.no_context:
+            print("\n--- Fitting text IterativePALPooler (tabular context) ---")
+            pooler_text_ctx = pooler_factory(refinement_cfg=text_refinement_cfg, seed=seed, modality="text")
+            pooler_text_ctx.fit(
+                text_train if _pi is None else text_train[_pi],
+                train_labels if _pi is None else train_labels[_pi],
+                token_ids=text_train_tok_ids if _pi is None else text_train_tok_ids[_pi],
+                attention_mask=text_train_attn if _pi is None else text_train_attn[_pi],
+                context_features=tab_train if _pi is None else tab_train[_pi],
+            )
+            pal_ctx_text_tr_raw = pooler_text_ctx.transform(text_train, token_ids=text_train_tok_ids, attention_mask=text_train_attn)
+            pal_ctx_text_te_raw = pooler_text_ctx.transform(text_test,  token_ids=text_test_tok_ids,  attention_mask=text_test_attn)
+            best_stage_txt_ctx  = pooler_text_ctx.stages_[pooler_text_ctx.best_stage_idx_]
+            pal_ctx_text_pca    = best_stage_txt_ctx._pca_
+            if pal_ctx_text_pca is not None:
+                pal_ctx_text_tr = pal_ctx_text_pca.transform(pal_ctx_text_tr_raw).astype(np.float32)
+                pal_ctx_text_te = pal_ctx_text_pca.transform(pal_ctx_text_te_raw).astype(np.float32)
+            else:
+                pal_ctx_text_tr = pal_ctx_text_tr_raw.astype(np.float32)
+                pal_ctx_text_te = pal_ctx_text_te_raw.astype(np.float32)
+            _eval("pal_context_text",     pal_ctx_text_tr, pal_ctx_text_te)
+            _eval("pal_context_text+tab", _concat_tabular(pal_ctx_text_tr, tab_train), _concat_tabular(pal_ctx_text_te, tab_test))
 
     if run_image:
         # ── PALPool: fit on image patches only ───────────────────────────────
@@ -467,7 +470,8 @@ def _run_single_seed(
             aoe_class=None,
             aoe_handling="filter",
             gpu_ridge=args.gpu_ridge,
-            tabicl_n_estimators=args.n_estimators,
+            #tabicl_n_estimators=args.n_estimators,
+            tabicl_n_estimators=4,
             tabicl_pca_dim=pca_dim,
             append_cls=False,
             use_global_prior=args.use_global_prior,
@@ -510,44 +514,45 @@ def _run_single_seed(
               _concat_tabular(pal_test_proj,  tab_test))
 
         # ── Context-aware image PALPool ───────────────────────────────────────
-        print("\n--- Fitting IterativePALPooler (tabular context) ---")
-        pooler_ctx = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
-        t_fit_ctx = time.perf_counter()
+        if not args.no_context:
+            print("\n--- Fitting IterativePALPooler (tabular context) ---")
+            pooler_ctx = pooler_factory(refinement_cfg=refinement_cfg, seed=seed)
+            t_fit_ctx = time.perf_counter()
 
-        ctx_features_train = tab_train
-        if run_text and args.image_context_text:
-            print("[info] Using text+tabular as context for image pooler (text fitted with tabular context)")
-            text_pool_pca_tr, text_pool_pca_te, _ = _pca_project(pal_ctx_text_tr_raw, pal_ctx_text_te_raw, pca_dim, seed)
-            ctx_features_train = np.concatenate([text_pool_pca_tr, tab_train], axis=1)
+            ctx_features_train = tab_train
+            if run_text and args.image_context_text:
+                print("[info] Using text+tabular as context for image pooler (text fitted with tabular context)")
+                text_pool_pca_tr, text_pool_pca_te, _ = _pca_project(pal_ctx_text_tr_raw, pal_ctx_text_te_raw, pca_dim, seed)
+                ctx_features_train = np.concatenate([text_pool_pca_tr, tab_train], axis=1)
 
-        pooler_ctx.fit(
-            train_patches if _pi is None else train_patches[_pi],
-            train_labels  if _pi is None else train_labels[_pi],
-            context_features=ctx_features_train if _pi is None else ctx_features_train[_pi],
-        )
-        fit_time_ctx_s = time.perf_counter() - t_fit_ctx
-        print(f"[pal_ctx] Pooler fit in {fit_time_ctx_s:.1f}s")
+            pooler_ctx.fit(
+                train_patches if _pi is None else train_patches[_pi],
+                train_labels  if _pi is None else train_labels[_pi],
+                context_features=ctx_features_train if _pi is None else ctx_features_train[_pi],
+            )
+            fit_time_ctx_s = time.perf_counter() - t_fit_ctx
+            print(f"[pal_ctx] Pooler fit in {fit_time_ctx_s:.1f}s")
 
-        pal_ctx_train_raw = pooler_ctx.transform(train_patches)
-        pal_ctx_test_raw  = pooler_ctx.transform(test_patches)
+            pal_ctx_train_raw = pooler_ctx.transform(train_patches)
+            pal_ctx_test_raw  = pooler_ctx.transform(test_patches)
 
-        best_stage_ctx = pooler_ctx.stages_[pooler_ctx.best_stage_idx_]
-        pal_ctx_pca = best_stage_ctx._pca_
+            best_stage_ctx = pooler_ctx.stages_[pooler_ctx.best_stage_idx_]
+            pal_ctx_pca = best_stage_ctx._pca_
 
-        if pal_ctx_pca is not None:
-            pal_ctx_train_proj = pal_ctx_pca.transform(pal_ctx_train_raw).astype(np.float32)
-            pal_ctx_test_proj  = pal_ctx_pca.transform(pal_ctx_test_raw).astype(np.float32)
-        else:
-            pal_ctx_train_proj = pal_ctx_train_raw.astype(np.float32)
-            pal_ctx_test_proj  = pal_ctx_test_raw.astype(np.float32)
+            if pal_ctx_pca is not None:
+                pal_ctx_train_proj = pal_ctx_pca.transform(pal_ctx_train_raw).astype(np.float32)
+                pal_ctx_test_proj  = pal_ctx_pca.transform(pal_ctx_test_raw).astype(np.float32)
+            else:
+                pal_ctx_train_proj = pal_ctx_train_raw.astype(np.float32)
+                pal_ctx_test_proj  = pal_ctx_test_raw.astype(np.float32)
 
-        print("\n--- pal_context_img ---")
-        _eval("pal_context_img", pal_ctx_train_proj, pal_ctx_test_proj)
+            print("\n--- pal_context_img ---")
+            _eval("pal_context_img", pal_ctx_train_proj, pal_ctx_test_proj)
 
-        print("\n--- pal_context_img+tab ---")
-        _eval("pal_context_img+tab",
-              _concat_tabular(pal_ctx_train_proj, tab_train),
-              _concat_tabular(pal_ctx_test_proj,  tab_test))
+            print("\n--- pal_context_img+tab ---")
+            _eval("pal_context_img+tab",
+                  _concat_tabular(pal_ctx_train_proj, tab_train),
+                  _concat_tabular(pal_ctx_test_proj,  tab_test))
 
     # ── Combined image + text conditions (only when both modalities present) ──
     if run_image and run_text:
@@ -574,12 +579,13 @@ def _run_single_seed(
               _concat_tabular(np.concatenate([pal_train_proj, pal_text_tr], axis=1), tab_train),
               _concat_tabular(np.concatenate([pal_test_proj,  pal_text_te], axis=1), tab_test))
         # pal_context+pal_context
-        _eval("pal_context_img+pal_context_text",
-              np.concatenate([pal_ctx_train_proj, pal_ctx_text_tr], axis=1),
-              np.concatenate([pal_ctx_test_proj,  pal_ctx_text_te], axis=1))
-        _eval("pal_context_img+pal_context_text+tab",
-              _concat_tabular(np.concatenate([pal_ctx_train_proj, pal_ctx_text_tr], axis=1), tab_train),
-              _concat_tabular(np.concatenate([pal_ctx_test_proj,  pal_ctx_text_te], axis=1), tab_test))
+        if not args.no_context:
+            _eval("pal_context_img+pal_context_text",
+                  np.concatenate([pal_ctx_train_proj, pal_ctx_text_tr], axis=1),
+                  np.concatenate([pal_ctx_test_proj,  pal_ctx_text_te], axis=1))
+            _eval("pal_context_img+pal_context_text+tab",
+                  _concat_tabular(np.concatenate([pal_ctx_train_proj, pal_ctx_text_tr], axis=1), tab_train),
+                  _concat_tabular(np.concatenate([pal_ctx_test_proj,  pal_ctx_text_te], axis=1), tab_test))
 
     total_time_s = time.perf_counter() - t_start
     record = {
@@ -728,11 +734,11 @@ def _parse_args() -> argparse.Namespace:
                    help="Ridge regularisation strength(s) (default: [1.0])")
     p.add_argument("--weight-method",  type=str,   default="correct_class_prob",
                    choices=["correct_class_prob", "entropy", "kl_div",
-                            "wasserstein", "js_div", "tvd"],
+                            "wasserstein", "js_div", "tvd", "cjs_div"],
                    help="Patch quality weight method (default: correct_class_prob)")
     p.add_argument("--text-weight-method", type=str, default=None,
                    choices=["correct_class_prob", "entropy", "kl_div",
-                            "wasserstein", "js_div", "tvd"],
+                            "wasserstein", "js_div", "tvd", "cjs_div"],
                    help="Weight method for text PAL pooler (default: same as --weight-method)")
     p.add_argument("--normalize-features", action="store_true",
                    help="Fit a StandardScaler on patches before Ridge fitting")
@@ -778,6 +784,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--image-context-text", action="store_true",
                    help="When fitting image PAL pooler with context, include text+tabular features "
                         "(only for datasets with text support, e.g., petfinder)")
+    p.add_argument("--no-context", action="store_true",
+                   help="Skip all contextual PAL pooler conditions (pal_context_*). "
+                        "Only the context-free PAL and baseline conditions are evaluated.")
     p.add_argument("--seeds",          type=int,   nargs="+", default=[42],
                    help="One or more random seeds, e.g. --seeds 42 123 456. "
                         "Results are saved after every seed. (default: 42)")

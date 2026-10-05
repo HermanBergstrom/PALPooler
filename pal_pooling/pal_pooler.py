@@ -1232,7 +1232,7 @@ class IterativePALPooler:
 
         if (context_features is not None
                 and self.refinement_cfg.weight_method in (
-                    "kl_div", "wasserstein", "js_div", "tvd")
+                    "kl_div", "wasserstein", "js_div", "tvd", "cjs_div")
                 and not getattr(self.refinement_cfg, "use_global_prior", False)):
             print("[IterativePALPooler] Computing tabular-only P(Y|X_tab) ...")
             _clf_tab = TabICLClassifier(
@@ -1457,7 +1457,7 @@ class IterativePALPooler:
             (splits is not None or use_cv)
             and tabular_probs is None
             and context_features is not None
-            and self.refinement_cfg.weight_method in ("kl_div", "wasserstein", "js_div", "tvd")
+            and self.refinement_cfg.weight_method in ("kl_div", "wasserstein", "js_div", "tvd", "cjs_div")
             and not getattr(self.refinement_cfg, "use_global_prior", False)
         )
 
@@ -1700,7 +1700,7 @@ class IterativePALPooler:
             stage.group_mask_ = all_group_mask
             stage.embed_dim_ = data.shape[-1]
 
-        _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd")
+        _divergence_methods = ("kl_div", "wasserstein", "js_div", "tvd", "cjs_div")
         _needs_per_fold_tab = (
             tabular_probs is None
             and context_features is not None
